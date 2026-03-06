@@ -12,6 +12,7 @@ use std::{
 use tokio::{sync::Mutex, time::sleep};
 
 use crate::config::Config;
+use crate::network_telemetry;
 use crate::offer::OfferPayload;
 
 use super::types::{SimultaneousOpenRequest, SimultaneousOpenResponse};
@@ -75,6 +76,11 @@ pub(crate) async fn handle_connect_sync(
     }
 
     if sync_circuit_is_open().await {
+        network_telemetry::record_fallback_event(
+            "sync",
+            "circuit_open",
+            Some("sync temporarily unavailable".to_string()),
+        );
         return Ok(Json(SimultaneousOpenResponse {
             success: false,
             offset_ms: None,
@@ -155,6 +161,11 @@ pub(crate) async fn handle_connect_sync(
                 }));
             }
             Err(e) => {
+                network_telemetry::record_fallback_event(
+                    "sync",
+                    "coordination_attempt_failed",
+                    Some(format!("attempt={} err={}", attempt + 1, e)),
+                );
                 last_error = Some(e.to_string());
                 let next_attempt = attempt + 1;
                 if next_attempt < SYNC_RETRY_BUDGET {

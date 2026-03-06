@@ -6,6 +6,7 @@ pub mod config;
 pub mod crypto;
 pub mod derive;
 pub mod discovery;
+pub mod network_telemetry;
 pub mod offer;
 pub mod onion;
 pub mod phrase;

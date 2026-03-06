@@ -18,6 +18,7 @@ use tokio::{
 use super::connect_helpers;
 use super::types::{ConnectionRequest, ConnectionResponse};
 use super::{ApiError, ApiState, Streams};
+use crate::network_telemetry;
 use crate::transport::assist_inbox::{AssistInbox, AssistInboxRequest};
 use crate::{
     config::{Config, ProductMode, TorRole, WanMode, DEFAULT_CHANNEL_CAPACITY},
@@ -75,6 +76,11 @@ async fn record_connect_failure(context: &'static str) {
     let circuit = connect_circuit();
     let mut guard = circuit.lock().await;
     guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+    network_telemetry::record_fallback_event(
+        "connect",
+        "operation_failed",
+        Some(context.to_string()),
+    );
     if guard.consecutive_failures >= CONNECT_CIRCUIT_FAILURE_THRESHOLD {
         guard.open_until =
             Some(Instant::now() + Duration::from_secs(CONNECT_CIRCUIT_COOLDOWN_SECS));

@@ -1,4 +1,4 @@
-﻿# SOTA.MD - Analisi Modulo-per-Modulo (Rete + Supporto)
+# SOTA.MD - Analisi Modulo-per-Modulo (Rete + Supporto)
 
 ## Executive Verdict
 
@@ -19,6 +19,31 @@ Non e ancora una dichiarazione SOTA pienamente difendibile per tre motivi princi
 ### Motivazione sintetica
 - **Punti da top-tier engineering:** design del path selection, Assist V5, session layer, difese replay/rate/time, pipeline CI estesa.
 - **Gap verso SOTA difendibile:** maturita runtime disomogenea, telemetria/KPI operativi incompleti, validazione esterna ancora assente.
+
+## Aggiornamento Operativo (2026-03-06)
+
+### Completato oggi (codice + verifica)
+- **Dandelion differenziato**: `LowLatency` e `HighSecurity` con policy diverse (delay/batch) e override runtime via env con clamping bounds.
+- **Capabilities matrix**: endpoint `/v1/capabilities` esteso con `dandelion_mode`, policy effettiva e flag runtime rilevanti.
+- **NAT/STUN data-driven**:
+  - telemetria runtime in memoria (`src/network_telemetry.rs`),
+  - fallback reasons tracciati lungo connect/sync/transport,
+  - bias runtime delle priorita strategy in `transport/mod.rs`.
+- **STUN ranking dinamico**: score per server con success/fail, avg RTT, freshness (`last_used_ms`) e snapshot ordinato.
+- **Diagnostica rete**:
+  - `/v1/connect/fallbacks` (ring buffer motivi fallback),
+  - `/v1/network/nat-metrics` (snapshot NAT + score STUN).
+- **Qualita**: `cargo fmt`, `cargo clippy -- -D warnings`, `CI=1 cargo test --locked` verdi.
+
+### Cosa manca (prossima ripartenza)
+- **Multipath Tranche A (priorita massima)**: sequencing/header, ACK/SACK, reorder buffer, health monitor, fallback single-path robusto, test e2e loss/reorder/failover.
+- **Session layer refactor** (`session_noise.rs`): riduzione complessita e separazione componenti senza regressioni.
+- **Pluggable transports**: separazione chiara `stable` vs `experimental`.
+- **Validazione esterna SOTA**: benchmark comparativi + audit indipendente.
+
+### Nota di stato
+Questo aggiornamento supera parte dei gap P1 originari (Dandelion differenziato, NAT/STUN data-driven e diagnostica fallback di base), che ora passano da "mancante" a "implementato, da consolidare con dati reali".
+
 
 ## Metodo e Rubrica
 
@@ -287,15 +312,15 @@ Non e ancora una dichiarazione SOTA pienamente difendibile per tre motivi princi
 | Densita del session layer (manutenibilita) | Alto | Media | P0 |
 | Tuning empirico security controls su carico reale | Alto | Media | P0 |
 | Coerenza semantics in simultaneous coordination | Alto | Media | P0 |
-| Dandelion mode non pienamente differenziato | Medio-Alto | Media | P1 |
-| NAT/STUN policy tuning data-driven | Medio-Alto | Media | P1 |
-| Capability matrix config vs runtime | Medio | Bassa-Media | P1 |
+| Dandelion differenziato da consolidare su reti reali (tuning empirico) | Medio | Media | P1 |
+| NAT/STUN data-driven da consolidare con auto-tuning basato su dati reali | Medio | Media | P1 |
+| Diagnostica runtime da estendere (persistenza/export metriche) | Medio | Bassa-Media | P1 |
 | Maturita pluggable transports disomogenea | Medio | Alta | P2 |
 | Evidenza esterna (audit+bench) assente | Molto alto | Alta | P1/P2 |
 
 ## Roadmap P0/P1/P2 (90 giorni)
 
-## P0 (settimane 1-4): stabilita core e coerenza runtime
+## P0 (settimane 1-4): stabilita core e coerenza runtime (focus attuale)
 - Completare multipath path I/O reale con failover misurabile.
 - Refactor tecnico del session layer in componenti piu isolati.
 - Hardening coordination path con semantica temporale separata.
@@ -307,10 +332,10 @@ Non e ancora una dichiarazione SOTA pienamente difendibile per tre motivi princi
 - zero regressioni nei flussi base (offer/qr/target/guaranteed).
 
 ## P1 (settimane 5-8): adattivita e osservabilita
-- Dandelion mode realmente differenziato per profilo.
-- Policy NAT/STUN basata su metriche runtime.
-- Estensione diagnostica API per motivo fallback/error.
-- Capability matrix chiara tra config e stato runtime.
+- [Completato] Dandelion mode differenziato per profilo + override runtime.
+- [Completato] Policy NAT/STUN basata su metriche runtime + bias strategy.
+- [Completato] Diagnostica API fallback/NAT (`/v1/connect/fallbacks`, `/v1/network/nat-metrics`).
+- [Completato] Capability matrix estesa tra config e stato runtime (`/v1/capabilities`).
 
 **KPI P1**
 - diminuzione fallback non necessari del 20%.
@@ -338,3 +363,4 @@ Non e ancora una dichiarazione SOTA pienamente difendibile per tre motivi princi
 - Questo documento non modifica API o tipi pubblici.
 - Le proposte di cambiamento sono raccomandazioni operative priorizzate.
 - Claim SOTA raccomandato solo dopo evidenza esterna (audit + benchmark + metriche runtime ripetibili).
+

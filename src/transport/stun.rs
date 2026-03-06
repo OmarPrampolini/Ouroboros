@@ -3,6 +3,7 @@
 //! RFC 5389 Binding Request/Response (XOR-MAPPED-ADDRESS).
 
 use rand::RngCore;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, OnceLock};
@@ -11,6 +12,7 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
+use crate::network_telemetry;
 use crate::transport::nat_detection::{NatDetector, NatType};
 
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
@@ -46,7 +48,30 @@ type Result<T> = std::result::Result<T, StunError>;
 struct StunServerStat {
     successes: u64,
     failures: u64,
+    total_rtt_ms: u64,
     last_rtt_ms: u64,
+    last_used_ms: u64,
+}
+
+impl StunServerStat {
+    fn avg_rtt_ms(&self) -> u64 {
+        if self.successes == 0 {
+            self.last_rtt_ms
+        } else {
+            self.total_rtt_ms / self.successes
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StunServerScore {
+    pub addr: String,
+    pub success_count: u64,
+    pub fail_count: u64,
+    pub avg_rtt_ms: u64,
+    pub last_rtt_ms: u64,
+    pub last_used_ms: u64,
+    pub score: i64,
 }
 
 type ServerStatsCache = Arc<Mutex<HashMap<SocketAddr, StunServerStat>>>;
@@ -61,13 +86,38 @@ fn server_stats() -> ServerStatsCache {
 fn score_server(server: &SocketAddr, stats: &HashMap<SocketAddr, StunServerStat>) -> i64 {
     match stats.get(server) {
         Some(s) => {
-            let success_bias = (s.successes as i64) * 20;
-            let failure_penalty = (s.failures as i64) * 15;
-            let rtt_penalty = (s.last_rtt_ms.min(2000) as i64) / 20;
-            success_bias - failure_penalty - rtt_penalty
+            let success_bias = (s.successes as i64) * 25;
+            let failure_penalty = (s.failures as i64) * 20;
+            let rtt_penalty = (s.avg_rtt_ms().min(3000) as i64) / 25;
+            let freshness_penalty = if s.last_used_ms == 0 {
+                30
+            } else {
+                let age_ms = network_telemetry::now_ms().saturating_sub(s.last_used_ms);
+                (age_ms.min(300_000) / 10_000) as i64
+            };
+            success_bias - failure_penalty - rtt_penalty - freshness_penalty
         }
         None => 0,
     }
+}
+
+pub async fn stun_server_scores_snapshot() -> Vec<StunServerScore> {
+    let cache = server_stats();
+    let stats = cache.lock().await;
+    let mut out: Vec<StunServerScore> = stats
+        .iter()
+        .map(|(addr, s)| StunServerScore {
+            addr: addr.to_string(),
+            success_count: s.successes,
+            fail_count: s.failures,
+            avg_rtt_ms: s.avg_rtt_ms(),
+            last_rtt_ms: s.last_rtt_ms,
+            last_used_ms: s.last_used_ms,
+            score: score_server(addr, &stats),
+        })
+        .collect();
+    out.sort_by(|a, b| b.score.cmp(&a.score));
+    out
 }
 
 pub struct StunClient {
@@ -125,7 +175,9 @@ impl StunClient {
         let mut stats = cache.lock().await;
         let entry = stats.entry(server).or_default();
         entry.successes = entry.successes.saturating_add(1);
+        entry.total_rtt_ms = entry.total_rtt_ms.saturating_add(rtt_ms);
         entry.last_rtt_ms = rtt_ms;
+        entry.last_used_ms = network_telemetry::now_ms();
     }
 
     async fn mark_server_failure(&self, server: SocketAddr) {
@@ -133,6 +185,7 @@ impl StunClient {
         let mut stats = cache.lock().await;
         let entry = stats.entry(server).or_default();
         entry.failures = entry.failures.saturating_add(1);
+        entry.last_used_ms = network_telemetry::now_ms();
     }
 
     pub async fn discover(&self, local_port: u16) -> Result<StunDiscovery> {
@@ -213,6 +266,11 @@ impl StunClient {
             });
         }
 
+        network_telemetry::record_fallback_event(
+            "stun",
+            "discovery_exhausted",
+            Some("all servers failed".to_string()),
+        );
         Err(StunError::DiscoveryFailedExhausted)
     }
 
@@ -399,7 +457,9 @@ mod tests {
             StunServerStat {
                 successes: 10,
                 failures: 1,
+                total_rtt_ms: 400,
                 last_rtt_ms: 40,
+                last_used_ms: 0,
             },
         );
         stats.insert(
@@ -407,7 +467,9 @@ mod tests {
             StunServerStat {
                 successes: 1,
                 failures: 6,
+                total_rtt_ms: 500,
                 last_rtt_ms: 500,
+                last_used_ms: 0,
             },
         );
 

@@ -17,6 +17,7 @@ use crate::{
     protocol::Control,
     protocol_assist::{compute_assist_mac, AssistGo, AssistRequest, TargetRef},
     transport::{
+        dandelion::{derive_dandelion_tag, DandelionMode},
         framing, lan,
         wan::{wan_direct, wan_tor},
     },
@@ -154,14 +155,27 @@ async fn coordinate_with_relay(
         let obf_key = derive_obfuscation_key_v5(&params.key_enc, params.tag16)?;
         let blinded =
             make_blinded_candidates_v5_shuffled(&my_udp_candidates, &obf_key, &request_id)?;
+        let dandelion_mode = DandelionMode::from_env();
+        let dandelion_stem = dandelion_mode.stem_enabled();
+        let dandelion_tag = if dandelion_stem {
+            Some(derive_dandelion_tag(request_id, params.tag16))
+        } else {
+            None
+        };
         let mut request = AssistRequestV5 {
             request_id,
             blinded_candidates: blinded,
             ttl_ms,
-            dandelion_stem: false, // Default: no Dandelion for V5
-            dandelion_tag: None,   // Default: relay generates tag
+            dandelion_stem,
+            dandelion_tag,
             mac: [0u8; 32],
         };
+        if dandelion_stem {
+            tracing::debug!(
+                "WAN Assist V5 outbound dandelion enabled (mode={})",
+                dandelion_mode.as_str()
+            );
+        }
         request.mac = compute_assist_mac_v5(&params.key_enc, &request)?;
         (Control::AssistRequestV5(request), request_id)
     } else {

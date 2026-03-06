@@ -120,12 +120,12 @@ impl AssistInbox {
         request_tx: mpsc::Sender<AssistInboxRequest>,
         mode: DandelionMode,
     ) {
-        let policy = mode.policy();
+        let policy = mode.effective_policy();
         let mut interval = tokio::time::interval(Duration::from_millis(policy.fluff_tick_ms));
 
         tracing::info!(
-            "Dandelion fluff loop started (mode={:?}, tick={}ms)",
-            mode,
+            "Dandelion fluff loop started (mode={}, tick={}ms)",
+            mode.as_str(),
             policy.fluff_tick_ms
         );
 
@@ -223,10 +223,10 @@ impl AssistInbox {
                             .await;
 
                         if is_first {
-                            let policy = self.mode.policy();
+                            let policy = self.mode.effective_policy();
                             tracing::debug!(
-                                "Dandelion: stem queued (mode={:?}, flush {}-{}s or batch>={})",
-                                self.mode,
+                                "Dandelion: stem queued (mode={}, flush {}-{}s or batch>={})",
+                                self.mode.as_str(),
                                 policy.min_delay_secs,
                                 policy.max_delay_secs,
                                 policy.target_batch_size

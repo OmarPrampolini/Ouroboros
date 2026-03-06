@@ -75,7 +75,7 @@ impl DandelionAggregator {
         mode: DandelionMode,
     ) -> bool {
         let mut batches = self.batches.lock().await;
-        let policy = mode.policy();
+        let policy = mode.effective_policy();
 
         let is_first = !batches.contains_key(&tag);
 
@@ -130,38 +130,66 @@ impl Default for DandelionAggregator {
     }
 }
 
+/// Deterministic dandelion tag from request id + tag16 context.
+pub fn derive_dandelion_tag(request_id: [u8; 8], tag16: u16) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"dandelion-tag/v1");
+    hasher.update(&request_id);
+    hasher.update(&tag16.to_be_bytes());
+    let hash = hasher.finalize();
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&hash.as_bytes()[..8]);
+    tag
+}
+
 /// Generate a dandelion tag from a request or use provided one
 pub fn dandelion_tag_for_request(req: &AssistRequestV5) -> [u8; 8] {
     if let Some(tag) = req.dandelion_tag {
         return tag;
     }
 
-    // Generate deterministic tag from request_id
-    // Use first 8 bytes of SHA256(request_id) for determinism
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(req.request_id);
-    let hash = hasher.finalize();
-    let mut tag = [0u8; 8];
-    tag.copy_from_slice(&hash[..8]);
-    tag
+    derive_dandelion_tag(req.request_id, 0)
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse::<u64>().ok()
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse::<usize>().ok()
 }
 
 /// Configuration for Dandelion mode
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DandelionMode {
     Off,          // No aggregation, immediate forwarding
-    LowLatency,   // 2-5s delay, small batches
-    HighSecurity, // 10-15s delay, larger batches
+    LowLatency,   // short delay, small batches
+    HighSecurity, // long delay, larger batches
 }
 
 impl DandelionMode {
     pub fn from_env() -> Self {
-        match std::env::var("HANDSHACKE_DANDELION_MODE").as_deref() {
-            Ok("high") | Ok("highsecurity") => DandelionMode::HighSecurity,
-            Ok("low") | Ok("lowlatency") => DandelionMode::LowLatency,
-            _ => DandelionMode::Off,
+        match std::env::var("HANDSHACKE_DANDELION_MODE") {
+            Ok(raw) => match raw.to_lowercase().as_str() {
+                "high" | "highsecurity" | "high_security" => DandelionMode::HighSecurity,
+                "low" | "lowlatency" | "low_latency" => DandelionMode::LowLatency,
+                "off" | "0" | "false" => DandelionMode::Off,
+                _ => DandelionMode::Off,
+            },
+            Err(_) => DandelionMode::Off,
         }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DandelionMode::Off => "off",
+            DandelionMode::LowLatency => "low_latency",
+            DandelionMode::HighSecurity => "high_security",
+        }
+    }
+
+    pub fn stem_enabled(self) -> bool {
+        self != DandelionMode::Off
     }
 
     pub fn policy(self) -> DandelionPolicy {
@@ -173,18 +201,51 @@ impl DandelionMode {
                 fluff_tick_ms: 100,
             },
             DandelionMode::LowLatency => DandelionPolicy {
-                min_delay_secs: 2,
-                max_delay_secs: 5,
-                target_batch_size: 4,
-                fluff_tick_ms: 250,
+                min_delay_secs: 1,
+                max_delay_secs: 3,
+                target_batch_size: 3,
+                fluff_tick_ms: 150,
             },
             DandelionMode::HighSecurity => DandelionPolicy {
-                min_delay_secs: 10,
-                max_delay_secs: 15,
-                target_batch_size: 10,
+                min_delay_secs: 8,
+                max_delay_secs: 16,
+                target_batch_size: 12,
                 fluff_tick_ms: 1000,
             },
         }
+    }
+
+    /// Effective policy with optional runtime tuning from env.
+    ///
+    /// Supported overrides:
+    /// - HANDSHACKE_DANDELION_MIN_DELAY_S
+    /// - HANDSHACKE_DANDELION_MAX_DELAY_S
+    /// - HANDSHACKE_DANDELION_BATCH_SIZE
+    /// - HANDSHACKE_DANDELION_TICK_MS
+    pub fn effective_policy(self) -> DandelionPolicy {
+        let mut p = self.policy();
+        if self == DandelionMode::Off {
+            return p;
+        }
+
+        if let Some(v) = env_u64("HANDSHACKE_DANDELION_MIN_DELAY_S") {
+            p.min_delay_secs = v;
+        }
+        if let Some(v) = env_u64("HANDSHACKE_DANDELION_MAX_DELAY_S") {
+            p.max_delay_secs = v;
+        }
+        if let Some(v) = env_usize("HANDSHACKE_DANDELION_BATCH_SIZE") {
+            p.target_batch_size = v;
+        }
+        if let Some(v) = env_u64("HANDSHACKE_DANDELION_TICK_MS") {
+            p.fluff_tick_ms = v;
+        }
+
+        p.min_delay_secs = p.min_delay_secs.clamp(0, 120);
+        p.max_delay_secs = p.max_delay_secs.clamp(p.min_delay_secs, 180);
+        p.target_batch_size = p.target_batch_size.clamp(1, 64);
+        p.fluff_tick_ms = p.fluff_tick_ms.clamp(50, 5000);
+        p
     }
 }
 
@@ -198,7 +259,7 @@ mod tests {
         let tag = [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF];
 
         // Add multiple requests to same batch
-        for i in 0..3 {
+        for i in 0..2 {
             let mut req = AssistRequestV5 {
                 request_id: [i; 8],
                 blinded_candidates: Default::default(),
@@ -230,7 +291,7 @@ mod tests {
         // Now should be ready
         let ready = aggregator.ready_batches().await;
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].0.len(), 3);
+        assert_eq!(ready[0].0.len(), 2);
     }
 
     #[test]
@@ -241,5 +302,15 @@ mod tests {
         assert!(low.max_delay_secs < high.min_delay_secs);
         assert!(low.target_batch_size < high.target_batch_size);
         assert!(low.fluff_tick_ms < high.fluff_tick_ms);
+    }
+
+    #[test]
+    fn test_derive_dandelion_tag_is_deterministic() {
+        let id = [7u8; 8];
+        let a = derive_dandelion_tag(id, 0x1337);
+        let b = derive_dandelion_tag(id, 0x1337);
+        let c = derive_dandelion_tag(id, 0x4242);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

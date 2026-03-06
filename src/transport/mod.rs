@@ -27,12 +27,14 @@ pub use wan::wan_tor;
 
 use crate::config::{Config, WanMode, UDP_MAX_PACKET_SIZE, WAN_ASSIST_GLOBAL_TIMEOUT_SECS};
 use crate::derive::RendezvousParams;
+use crate::network_telemetry;
 use crate::offer::{OfferPayload, RoleHint};
 use crate::resume::ResumeParams;
 use crate::security::early_drop_packet;
 use crate::session_noise::NoiseRole;
 use crate::transport::nat_detection::{
     detect_nat_profile, NatConfidence, NatDetector, NatProfile, NatType, TransportKind,
+    TransportPriority,
 };
 use crate::transport::stun::StunClient;
 use std::net::SocketAddr;
@@ -51,6 +53,31 @@ type TorStreamSplit = (
     Arc<TokioMutex<OwnedWriteHalf>>,
 );
 
+fn strategy_metric_name(kind: &TransportKind) -> &'static str {
+    match kind {
+        TransportKind::Lan => "lan",
+        TransportKind::Upnp => "upnp",
+        TransportKind::Stun => "stun",
+        TransportKind::Relay => "relay",
+        TransportKind::Tor => "tor",
+    }
+}
+
+fn apply_runtime_strategy_bias(strategy: &mut [TransportPriority]) {
+    for step in strategy.iter_mut() {
+        if step.should_skip {
+            continue;
+        }
+
+        let name = strategy_metric_name(&step.kind);
+        let delta = network_telemetry::strategy_priority_delta(name);
+        if delta > 0 {
+            step.priority = step.priority.saturating_add(delta as u32);
+        } else if delta < 0 {
+            step.priority = step.priority.saturating_sub((-delta) as u32);
+        }
+    }
+}
 /// Connection type established by transport layer
 #[derive(Clone)]
 pub enum Connection {
@@ -135,6 +162,11 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
         Ok(profile) => profile,
         Err(e) => {
             tracing::warn!("NAT detection failed, using Unknown strategy: {}", e);
+            network_telemetry::record_fallback_event(
+                "connect",
+                "nat_detection_failed",
+                Some(e.to_string()),
+            );
             NatProfile::new(NatType::Unknown, NatConfidence::Low, 0)
         }
     };
@@ -154,6 +186,11 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
             | crate::transport::nat_detection::NatType::SymetricFirewall
     ) {
         tracing::info!("nat=symmetric -> skipping direct transports (stun/upnp)");
+        network_telemetry::record_fallback_event(
+            "connect",
+            "symmetric_nat_detected",
+            Some(format!("nat_type={}", nat_type)),
+        );
         for step in strategy.iter_mut() {
             match step.kind {
                 TransportKind::Upnp | TransportKind::Stun => {
@@ -165,32 +202,56 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
             }
         }
     }
+    apply_runtime_strategy_bias(&mut strategy);
     strategy.sort_by(|a, b| b.priority.cmp(&a.priority));
 
     for step in strategy {
         if step.should_skip {
             tracing::debug!("Skipping transport {:?} due to NAT strategy", step.kind);
+            network_telemetry::record_fallback_event(
+                "connect",
+                "strategy_skipped",
+                Some(format!("kind={:?}", step.kind)),
+            );
             continue;
         }
 
         match step.kind {
-            TransportKind::Lan => {
-                if let Ok((sock, peer_addr)) = lan::try_lan_broadcast(p.port).await {
+            TransportKind::Lan => match lan::try_lan_broadcast(p.port).await {
+                Ok((sock, peer_addr)) => {
+                    network_telemetry::record_strategy_result("lan", true);
                     tracing::info!("LAN mode active on port: {}", p.port);
                     return Ok(Connection::Lan(Arc::new(sock), peer_addr));
                 }
-            }
+                Err(e) => {
+                    network_telemetry::record_strategy_result("lan", false);
+                    network_telemetry::record_fallback_event(
+                        "connect",
+                        "lan_failed",
+                        Some(e.to_string()),
+                    );
+                }
+            },
             TransportKind::Upnp => {
                 if cfg.wan_mode != WanMode::Tor {
                     match wan::wan_direct::try_direct_port_forward(p.port).await {
                         Ok((sock, ext_addr)) => {
+                            network_telemetry::record_strategy_result("upnp", true);
                             tracing::info!(
                                 "WAN Direct mode active. Port forwarded to {}",
                                 ext_addr
                             );
                             return Ok(Connection::Wan(Arc::new(sock), ext_addr));
                         }
-                        Err(e) => tracing::warn!("WAN Direct failed: {}", e),
+                        Err(e) => {
+                            network_telemetry::record_strategy_result("upnp", false);
+                            network_telemetry::record_fallback_event(
+                                "connect",
+                                "upnp_failed",
+                                Some(e.to_string()),
+                            );
+                            tracing::warn!("WAN Direct failed: {}", e);
+                        }
                     }
                 }
             }
@@ -200,10 +261,19 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
                 if cfg.wan_mode != WanMode::Tor {
                     match wan::wan_direct::try_direct_port_forward(p.port).await {
                         Ok((sock, ext_addr)) => {
+                            network_telemetry::record_strategy_result("stun", true);
                             tracing::info!("STUN path active. Port forwarded to {}", ext_addr);
                             return Ok(Connection::Wan(Arc::new(sock), ext_addr));
                         }
-                        Err(e) => tracing::warn!("STUN path failed: {}", e),
+                        Err(e) => {
+                            network_telemetry::record_strategy_result("stun", false);
+                            network_telemetry::record_fallback_event(
+                                "connect",
+                                "stun_path_failed",
+                                Some(e.to_string()),
+                            );
+                            tracing::warn!("STUN path failed: {}", e);
+                        }
                     }
                 }
             }
@@ -217,6 +287,11 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
                             > Duration::from_secs(WAN_ASSIST_GLOBAL_TIMEOUT_SECS)
                         {
                             tracing::warn!("WAN Assist: global timeout exceeded");
+                            network_telemetry::record_fallback_event(
+                                "connect",
+                                "relay_global_timeout",
+                                Some(format!("attempts={}", attempts)),
+                            );
                             break;
                         }
 
@@ -228,25 +303,63 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
                         .await
                         {
                             Ok(Ok(conn)) => {
+                                network_telemetry::record_strategy_result("relay", true);
                                 tracing::info!("WAN Assist: success after {} attempts", attempts);
                                 return Ok(conn);
                             }
-                            Ok(Err(e)) => tracing::warn!("Relay {} failed: {}", relay, e),
-                            Err(_) => tracing::warn!("Relay {} timeout", relay),
+                            Ok(Err(e)) => {
+                                network_telemetry::record_strategy_result("relay", false);
+                                network_telemetry::record_fallback_event(
+                                    "connect",
+                                    "relay_attempt_failed",
+                                    Some(format!("relay={} err={}", relay, e)),
+                                );
+                                tracing::warn!("Relay {} failed: {}", relay, e)
+                            }
+                            Err(_) => {
+                                network_telemetry::record_strategy_result("relay", false);
+                                network_telemetry::record_fallback_event(
+                                    "connect",
+                                    "relay_attempt_timeout",
+                                    Some(format!("relay={}", relay)),
+                                );
+                                tracing::warn!("Relay {} timeout", relay)
+                            }
                         }
                     }
                     tracing::warn!("WAN Assist: all {} attempts failed, falling back", attempts);
                 } else {
                     tracing::debug!("WAN Assist skipped: no relays configured");
+                    network_telemetry::record_fallback_event(
+                        "connect",
+                        "relay_skipped_no_config",
+                        None,
+                    );
                 }
             }
             TransportKind::Tor => match wan::try_tor_mode(cfg).await {
-                Ok(wan_conn) => return connection_from_wan(wan_conn).await,
-                Err(e) => tracing::warn!("Tor failed: {}", e),
+                Ok(wan_conn) => {
+                    network_telemetry::record_strategy_result("tor", true);
+                    return connection_from_wan(wan_conn).await;
+                }
+                Err(e) => {
+                    network_telemetry::record_strategy_result("tor", false);
+                    network_telemetry::record_fallback_event(
+                        "connect",
+                        "tor_failed",
+                        Some(e.to_string()),
+                    );
+                    tracing::warn!("Tor failed: {}", e)
+                }
             },
         }
     }
 
+    network_telemetry::record_fallback_event(
+        "connect",
+        "strategy_exhausted",
+        Some("no reachable transport found".to_string()),
+    );
     Err(std::io::Error::other(
         "Connection failed: no reachable transport found (NAT strategy exhausted)",
     )
@@ -345,20 +458,40 @@ pub async fn connect_to(
                 from,
                 peer
             );
+            network_telemetry::record_fallback_event(
+                "connect_to",
+                "udp_invalid_response",
+                Some(format!("from={} bytes={}", from, n)),
+            );
             udp_blocked = true;
         }
         Ok(Err(e)) => {
             tracing::debug!("UDP receive error: {}", e);
+            network_telemetry::record_fallback_event(
+                "connect_to",
+                "udp_receive_error",
+                Some(e.to_string()),
+            );
             udp_blocked = true;
         }
         Err(_) => {
             tracing::debug!("UDP receive timeout");
+            network_telemetry::record_fallback_event(
+                "connect_to",
+                "udp_timeout",
+                Some(format!("target={}", target)),
+            );
             udp_blocked = true;
         }
     }
 
     if udp_blocked {
         tracing::info!("udp_blocked -> trying adaptive TCP hole punch");
+        network_telemetry::record_fallback_event(
+            "connect_to",
+            "udp_blocked_fallback_tcp",
+            Some(format!("target={}", target)),
+        );
 
         let tcp_plan = crate::transport::tcp_hole_punch::TcpPunchPlan {
             attempts: (cfg.wan_probe_burst as u8).saturating_add(2).clamp(3, 7),
@@ -386,6 +519,11 @@ pub async fn connect_to(
                     params.port,
                     e
                 );
+                network_telemetry::record_fallback_event(
+                    "connect_to",
+                    "tcp_fixed_port_failed",
+                    Some(format!("port={} err={}", params.port, e)),
+                );
                 let local_ephemeral = if peer.is_ipv6() {
                     SocketAddr::from(([0u16; 8], 0))
                 } else {
@@ -401,6 +539,7 @@ pub async fn connect_to(
 
         match tcp_result {
             Ok(stream) => {
+                network_telemetry::record_strategy_result("tcp_hole_punch", true);
                 let (reader, writer) = stream.into_split();
                 return Ok(Connection::WanTcpStream {
                     reader: Arc::new(TokioMutex::new(reader)),
@@ -409,6 +548,12 @@ pub async fn connect_to(
                 });
             }
             Err(e) => {
+                network_telemetry::record_strategy_result("tcp_hole_punch", false);
+                network_telemetry::record_fallback_event(
+                    "connect_to",
+                    "tcp_hole_punch_exhausted",
+                    Some(e.to_string()),
+                );
                 tracing::warn!("tcp failed -> giving up ({})", e);
                 tracing::warn!(
                     "Direct connect failed behind restrictive NAT/firewall. Suggested: use QR + Tor relay for reliable rendezvous."
@@ -510,6 +655,7 @@ pub async fn establish_connection_from_offer_with_resume(
                         .await
                     {
                         tracing::info!("STUN hole punch successful with {}", peer_public);
+                        network_telemetry::record_strategy_result("stun_offer", true);
                         let conn = Connection::Wan(sock, peer_public);
                         let mode = "stun".to_string();
                         let peer = Some(peer_public.to_string());
@@ -547,10 +693,22 @@ pub async fn establish_connection_from_offer_with_resume(
                             resume_used: resume.map(|_| resume_used),
                         });
                     } else {
+                        network_telemetry::record_fallback_event(
+                            "offer_connect",
+                            "stun_hole_punch_failed",
+                            Some(format!("peer_public={}", peer_public)),
+                        );
                         tracing::warn!("STUN hole punch failed, falling back to ICE");
                     }
                 }
-                Err(e) => tracing::warn!("STUN discovery failed: {}", e),
+                Err(e) => {
+                    network_telemetry::record_fallback_event(
+                        "offer_connect",
+                        "stun_discovery_failed",
+                        Some(e.to_string()),
+                    );
+                    tracing::warn!("STUN discovery failed: {}", e)
+                }
             }
         }
     }

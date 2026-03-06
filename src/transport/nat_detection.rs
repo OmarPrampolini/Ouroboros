@@ -1,3 +1,4 @@
+use crate::network_telemetry;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, OnceLock};
@@ -152,6 +153,7 @@ impl NatDetector {
     pub async fn detect_nat_profile(&self) -> Result<NatProfile> {
         let cache = get_nat_cache();
         let mut cache_lock = cache.lock().await;
+        let started = Instant::now();
 
         // Controlla cache
         if let Some((profile, cached_at)) = *cache_lock {
@@ -164,10 +166,15 @@ impl NatDetector {
         let profile = match self.perform_detection().await {
             Ok(profile) => {
                 *cache_lock = Some((profile, Instant::now()));
+                network_telemetry::record_nat_detection_success(
+                    &profile.nat_type.to_string(),
+                    started.elapsed(),
+                );
                 profile
             }
             Err(e) => {
                 tracing::warn!("NAT detection failed: {}, using fallback Unknown", e);
+                network_telemetry::record_nat_detection_failure(started.elapsed(), &e.to_string());
                 NatProfile::new(NatType::Unknown, NatConfidence::Low, 0)
             }
         };

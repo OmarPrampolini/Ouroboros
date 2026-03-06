@@ -86,6 +86,15 @@ fn build_router(state: Arc<ApiState>, api_token: Option<String>) -> Router {
         .route("/v1/open", post(session::handle_open))
         .route("/v1/disconnect", post(session::handle_disconnect))
         .route("/v1/metrics", get(diagnostics::handle_metrics))
+        .route("/v1/capabilities", get(diagnostics::handle_capabilities))
+        .route(
+            "/v1/connect/fallbacks",
+            get(diagnostics::handle_connect_fallbacks),
+        )
+        .route(
+            "/v1/network/nat-metrics",
+            get(diagnostics::handle_nat_metrics),
+        )
         .route(
             "/v1/pluggable/protocols",
             get(pluggable::handle_pluggable_protocols),
