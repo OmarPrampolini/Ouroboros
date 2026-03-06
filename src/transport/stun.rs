@@ -3,11 +3,13 @@
 //! RFC 5389 Binding Request/Response (XOR-MAPPED-ADDRESS).
 
 use rand::RngCore;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
 
 use crate::transport::nat_detection::{NatDetector, NatType};
 
@@ -39,6 +41,34 @@ pub enum StunError {
 }
 
 type Result<T> = std::result::Result<T, StunError>;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StunServerStat {
+    successes: u64,
+    failures: u64,
+    last_rtt_ms: u64,
+}
+
+type ServerStatsCache = Arc<Mutex<HashMap<SocketAddr, StunServerStat>>>;
+static STUN_SERVER_STATS: OnceLock<ServerStatsCache> = OnceLock::new();
+
+fn server_stats() -> ServerStatsCache {
+    STUN_SERVER_STATS
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
+
+fn score_server(server: &SocketAddr, stats: &HashMap<SocketAddr, StunServerStat>) -> i64 {
+    match stats.get(server) {
+        Some(s) => {
+            let success_bias = (s.successes as i64) * 20;
+            let failure_penalty = (s.failures as i64) * 15;
+            let rtt_penalty = (s.last_rtt_ms.min(2000) as i64) / 20;
+            success_bias - failure_penalty - rtt_penalty
+        }
+        None => 0,
+    }
+}
 
 pub struct StunClient {
     servers: Vec<SocketAddr>,
@@ -78,8 +108,37 @@ impl StunClient {
         self
     }
 
+    async fn ranked_servers(&self) -> Vec<SocketAddr> {
+        let cache = server_stats();
+        let stats = cache.lock().await;
+        let mut ranked = self.servers.clone();
+        ranked.sort_by(|a, b| {
+            let sa = score_server(a, &stats);
+            let sb = score_server(b, &stats);
+            sb.cmp(&sa)
+        });
+        ranked
+    }
+
+    async fn mark_server_success(&self, server: SocketAddr, rtt_ms: u64) {
+        let cache = server_stats();
+        let mut stats = cache.lock().await;
+        let entry = stats.entry(server).or_default();
+        entry.successes = entry.successes.saturating_add(1);
+        entry.last_rtt_ms = rtt_ms;
+    }
+
+    async fn mark_server_failure(&self, server: SocketAddr) {
+        let cache = server_stats();
+        let mut stats = cache.lock().await;
+        let entry = stats.entry(server).or_default();
+        entry.failures = entry.failures.saturating_add(1);
+    }
+
     pub async fn discover(&self, local_port: u16) -> Result<StunDiscovery> {
-        for server in &self.servers {
+        let ranked_servers = self.ranked_servers().await;
+
+        for server in ranked_servers {
             let bind_addr = if server.is_ipv6() {
                 SocketAddr::from(([0u16; 8], local_port))
             } else {
@@ -96,6 +155,7 @@ impl StunClient {
             sock.send_to(&req, server).await?;
 
             let mut buf = vec![0u8; 512];
+            let start = Instant::now();
             let (n, from) = match tokio::time::timeout(
                 Duration::from_millis(self.timeout_ms),
                 sock.recv_from(&mut buf),
@@ -104,25 +164,43 @@ impl StunClient {
             {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
+                    self.mark_server_failure(server).await;
                     tracing::warn!("STUN recv error from {}: {}", server, e);
                     continue;
                 }
                 Err(_) => {
+                    self.mark_server_failure(server).await;
                     tracing::warn!("STUN timeout for {}", server);
                     continue;
                 }
             };
 
-            if from != *server {
+            if from != server {
+                self.mark_server_failure(server).await;
                 tracing::warn!("STUN response from unexpected server {}", from);
                 continue;
             }
 
-            let public_addr = parse_xor_mapped_address(&buf[..n], &tx_id)?;
+            let public_addr = match parse_xor_mapped_address(&buf[..n], &tx_id) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    self.mark_server_failure(server).await;
+                    tracing::warn!("STUN parse error from {}: {}", server, e);
+                    continue;
+                }
+            };
+
+            self.mark_server_success(server, start.elapsed().as_millis() as u64)
+                .await;
+
             let nat_type = if self.servers.len() >= 2 {
                 let detector =
                     NatDetector::new(self.servers.iter().map(|s| s.to_string()).collect());
-                detector.detect_nat_type().await.unwrap_or(NatType::Unknown)
+                detector
+                    .detect_nat_profile()
+                    .await
+                    .map(|p| p.nat_type)
+                    .unwrap_or(NatType::Unknown)
             } else {
                 NatType::Unknown
             };
@@ -130,7 +208,7 @@ impl StunClient {
             return Ok(StunDiscovery {
                 public_addr,
                 nat_type,
-                server_used: *server,
+                server_used: server,
                 socket: sock,
             });
         }
@@ -304,4 +382,35 @@ fn build_probe_payload() -> Vec<u8> {
     v.extend_from_slice(b"HS-STUN-PUNCH");
     v.resize(128, 0u8);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_score_prefers_success_and_low_rtt() {
+        let a: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:3479".parse().unwrap();
+
+        let mut stats = HashMap::new();
+        stats.insert(
+            a,
+            StunServerStat {
+                successes: 10,
+                failures: 1,
+                last_rtt_ms: 40,
+            },
+        );
+        stats.insert(
+            b,
+            StunServerStat {
+                successes: 1,
+                failures: 6,
+                last_rtt_ms: 500,
+            },
+        );
+
+        assert!(score_server(&a, &stats) > score_server(&b, &stats));
+    }
 }

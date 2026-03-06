@@ -5,7 +5,7 @@ use axum::{
 };
 use std::{net::SocketAddr, sync::Arc};
 
-use crate::state::{CircuitBreakerStatus, CircuitState, DebugMetrics};
+use crate::state::{CircuitBreakerStatus, DebugMetrics};
 
 use super::ApiState;
 
@@ -32,13 +32,6 @@ pub(crate) async fn handle_circuit_status(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // For now return placeholder - ConnectionManager integration is next step
-    let placeholder_status = CircuitBreakerStatus {
-        state: CircuitState::Closed,
-        failure_count: 0,
-        success_count: 0,
-        next_attempt_in: None,
-    };
-
-    Ok(Json(placeholder_status))
+    let status = super::connect::get_connect_circuit_status().await;
+    Ok(Json(status))
 }

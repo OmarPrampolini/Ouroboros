@@ -292,7 +292,8 @@ pub async fn spawn_receiver_task_with_stop(
                                     guard.open_packet(&cipher_packet)
                                 };
                                 if let Some(clear_payload) = clear_payload {
-                                    if rw.accept(clear_payload.seq).unwrap_or(false) {
+                                    match rw.accept_classified(clear_payload.seq) {
+                                        crate::crypto::replay::ReplayDecision::Accepted => {
                                         // Handle Control Packet
                                         if let Ok(ctrl) = deserialize_control_limited(&clear_payload.data) {
                                             match ctrl {
@@ -379,6 +380,14 @@ pub async fn spawn_receiver_task_with_stop(
                                                 }
                                             }
                                         }
+                                        }
+                                        crate::crypto::replay::ReplayDecision::Replay => {}
+                                        crate::crypto::replay::ReplayDecision::Overflow => {
+                                            tracing::warn!(
+                                                "Replay window overflow detected on UDP receiver; resetting replay window"
+                                            );
+                                            let _ = rw.recover_after_overflow(clear_payload.seq);
+                                        }
                                     }
                                 }
                             }
@@ -436,7 +445,8 @@ pub async fn spawn_receiver_task_with_stop_io(
                                     guard.open_packet(&cipher_packet)
                                 };
                                 if let Some(clear_payload) = clear_payload {
-                                    if rw.accept(clear_payload.seq).unwrap_or(false) {
+                                    match rw.accept_classified(clear_payload.seq) {
+                                        crate::crypto::replay::ReplayDecision::Accepted => {
                                         if let Ok(ctrl) = deserialize_control_limited(&clear_payload.data) {
                                             match ctrl {
                                                 Control::App(msg) => {
@@ -506,6 +516,14 @@ pub async fn spawn_receiver_task_with_stop_io(
                                                 Control::AssistRequestV5(_) => {}
                                                 Control::AssistGoV5(_) => {}
                                             }
+                                        }
+                                        }
+                                        crate::crypto::replay::ReplayDecision::Replay => {}
+                                        crate::crypto::replay::ReplayDecision::Overflow => {
+                                            tracing::warn!(
+                                                "Replay window overflow detected on guaranteed receiver; resetting replay window"
+                                            );
+                                            let _ = rw.recover_after_overflow(clear_payload.seq);
                                         }
                                     }
                                 }

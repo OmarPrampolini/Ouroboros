@@ -1,10 +1,17 @@
-/// Sliding window su 128-bit per replay protection efficiente  
+/// Sliding window su 128-bit per replay protection efficiente.
 /// Manteniamo `max_seen`; accettiamo seq in (max_seen-128 .. max_seen].
 ///
 /// Layout bit mask: bit 0 = max_seen, bit 1 = max_seen-1, ..., bit 127 = max_seen-127
 pub struct ReplayWindow {
     max_seen: u64,
     mask: u128, // 128-bit per finestra 128 messaggi
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayDecision {
+    Accepted,
+    Replay,
+    Overflow,
 }
 
 /// Threshold for overflow detection - when max_seen is within this distance from u64::MAX
@@ -18,27 +25,36 @@ impl ReplayWindow {
         }
     }
 
-    /// Controlla e accetta una sequenza se non è replay
-    /// SECURITY: Constant-time per evitare timing attacks
-    /// Returns Ok(true) if accepted, Ok(false) if replay, Err(()) if overflow detected
+    /// Controlla e accetta una sequenza se non e replay.
+    /// SECURITY: Constant-time per evitare timing attacks.
+    /// Returns Ok(true) if accepted, Ok(false) if replay, Err(()) if overflow detected.
     #[allow(clippy::result_unit_err)]
     pub fn accept(&mut self, seq: u64) -> Result<bool, ()> {
-        // Check for overflow condition: max_seen is near u64::MAX and new sequence is small
+        match self.accept_classified(seq) {
+            ReplayDecision::Accepted => Ok(true),
+            ReplayDecision::Replay => Ok(false),
+            ReplayDecision::Overflow => Err(()),
+        }
+    }
+
+    /// Versione classificata per call-site che vogliono distinguere overflow e replay.
+    pub fn accept_classified(&mut self, seq: u64) -> ReplayDecision {
+        // Overflow condition: max_seen vicino a u64::MAX e nuova sequence piccola.
         if self.max_seen >= u64::MAX - OVERFLOW_THRESHOLD && seq < OVERFLOW_THRESHOLD {
-            return Err(()); // Signal overflow - key rotation needed
+            return ReplayDecision::Overflow;
         }
 
         if seq == 0 {
-            return Ok(false);
+            return ReplayDecision::Replay;
         }
 
         let delta = seq.wrapping_sub(self.max_seen);
         if delta == 0 {
-            return Ok(false); // Replay del max_seen
+            return ReplayDecision::Replay; // Replay del max_seen
         }
 
         if delta < (1u64 << 63) {
-            // Sequenza più recente (mod 2^64) - shift della finestra
+            // Sequenza piu recente (mod 2^64) - shift della finestra
             let shift = delta;
 
             if shift >= 128 {
@@ -51,33 +67,44 @@ impl ReplayWindow {
             }
 
             self.max_seen = seq;
-            Ok(true)
+            ReplayDecision::Accepted
         } else {
-            // Sequenza più vecchia - controlla se nella finestra
+            // Sequenza piu vecchia - controlla se nella finestra
             let delta_old = self.max_seen.wrapping_sub(seq);
 
             if delta_old >= 128 {
-                return Ok(false); // Troppo vecchia, fuori finestra
+                return ReplayDecision::Replay; // Troppo vecchia, fuori finestra
             }
 
-            // SAFETY: delta < 128, quindi shift è sempre sicuro
+            // SAFETY: delta < 128, quindi shift e sempre sicuro
             let bit_pos = delta_old as usize;
             let bit_mask = 1u128 << bit_pos;
 
             if (self.mask & bit_mask) != 0 {
-                return Ok(false); // Già vista (replay)
+                return ReplayDecision::Replay; // Gia vista (replay)
             }
 
             // Marca come vista
             self.mask |= bit_mask;
-            Ok(true)
+            ReplayDecision::Accepted
         }
     }
 
-    /// Alias per accept (per compatibilità)
-    /// Maintains backward compatibility by returning bool instead of Result
+    /// Recovery best-effort dopo overflow: resetta la finestra e accetta la seq corrente.
+    /// Utile quando il call-site preferisce proseguire in modalita degradate invece di bloccare.
+    pub fn recover_after_overflow(&mut self, seq: u64) -> bool {
+        if seq == 0 {
+            return false;
+        }
+        self.max_seen = seq;
+        self.mask = 1;
+        true
+    }
+
+    /// Alias per accept (per compatibilita)
+    /// Maintains backward compatibility by returning bool instead of Result.
     pub fn check(&mut self, seq: u64) -> bool {
-        self.accept(seq).unwrap_or(false)
+        matches!(self.accept_classified(seq), ReplayDecision::Accepted)
     }
 }
 
@@ -99,7 +126,7 @@ mod tests {
         assert_eq!(window.accept(100), Ok(true));
         // Duplicato - rifiutato
         assert_eq!(window.accept(100), Ok(false));
-        // Sequenza più recente - accettata
+        // Sequenza piu recente - accettata
         assert_eq!(window.accept(101), Ok(true));
         // Sequenza vecchia ma ancora nella finestra - accettata la prima volta
         assert_eq!(window.accept(99), Ok(true));
@@ -115,7 +142,7 @@ mod tests {
         assert_eq!(window.accept(100), Ok(true));
         // Salto grande che causa shift completo
         assert_eq!(window.accept(300), Ok(true));
-        // La vecchia sequenza ora è fuori finestra
+        // La vecchia sequenza ora e fuori finestra
         assert_eq!(window.accept(100), Ok(false));
         // Sequenza nella nuova finestra
         assert_eq!(window.accept(290), Ok(true));
@@ -146,12 +173,12 @@ mod tests {
         assert_eq!(window.accept(300), Ok(true));
         assert_eq!(window.accept(299), Ok(true));
         assert_eq!(window.accept(298), Ok(true));
-        assert_eq!(window.accept(301), Ok(true)); // Più recente
+        assert_eq!(window.accept(301), Ok(true)); // Piu recente
         assert_eq!(window.accept(299), Ok(false)); // Replay
     }
 
     #[test]
-    fn test_replay_window_overflow_protection() {
+    fn test_replay_window_overflow_protection_and_recovery() {
         let mut window = ReplayWindow::new();
 
         // Test vicino a u64::MAX
@@ -160,10 +187,15 @@ mod tests {
         assert_eq!(window.accept(near_max + 50), Ok(true));
         assert_eq!(window.accept(near_max), Ok(false)); // Replay
 
-        // Test sequence number wraparound edge case
-        assert_eq!(window.accept(u64::MAX), Ok(true));
-        // Sequence 1 dopo MAX dovrebbe essere accettata (nuovo ciclo)
-        assert_eq!(window.accept(1), Ok(true));
+        // Overflow rilevato in wrap-around
+        window.max_seen = u64::MAX - 50;
+        window.mask = 1;
+        assert_eq!(window.accept_classified(1), ReplayDecision::Overflow);
+
+        // Recovery best-effort: nuova epoca sequenziale
+        assert!(window.recover_after_overflow(1));
+        assert_eq!(window.accept(2), Ok(true));
+        assert_eq!(window.accept(1), Ok(false));
     }
 
     #[test]

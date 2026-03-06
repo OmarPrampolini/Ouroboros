@@ -4,8 +4,16 @@ use axum::{
     Json,
 };
 use secrecy::SecretString;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::mpsc;
+use std::{
+    future::Future,
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::{mpsc, Mutex},
+    time::sleep,
+};
 
 use super::connect_helpers;
 use super::types::{ConnectionRequest, ConnectionResponse};
@@ -28,6 +36,125 @@ fn connect_err(code: StatusCode, msg: &str) -> ApiError {
         code: code.as_u16(),
         message: msg.to_string(),
     }
+}
+
+const CONNECT_RETRY_BUDGET: usize = 3;
+const CONNECT_RETRY_BACKOFF_MS: u64 = 200;
+const CONNECT_CIRCUIT_FAILURE_THRESHOLD: u32 = 6;
+const CONNECT_CIRCUIT_COOLDOWN_SECS: u64 = 20;
+
+#[derive(Debug, Default)]
+struct ConnectCircuitBreaker {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+}
+
+static CONNECT_CIRCUIT: OnceLock<Arc<Mutex<ConnectCircuitBreaker>>> = OnceLock::new();
+
+fn connect_circuit() -> Arc<Mutex<ConnectCircuitBreaker>> {
+    CONNECT_CIRCUIT
+        .get_or_init(|| Arc::new(Mutex::new(ConnectCircuitBreaker::default())))
+        .clone()
+}
+
+async fn ensure_connect_circuit_closed() -> Result<(), ApiError> {
+    let circuit = connect_circuit();
+    let guard = circuit.lock().await;
+    if let Some(until) = guard.open_until {
+        if Instant::now() < until {
+            return Err(connect_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily unavailable, retry shortly",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn record_connect_failure(context: &'static str) {
+    let circuit = connect_circuit();
+    let mut guard = circuit.lock().await;
+    guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+    if guard.consecutive_failures >= CONNECT_CIRCUIT_FAILURE_THRESHOLD {
+        guard.open_until =
+            Some(Instant::now() + Duration::from_secs(CONNECT_CIRCUIT_COOLDOWN_SECS));
+        tracing::warn!(
+            "connect circuit opened for {}s after {} failures ({})",
+            CONNECT_CIRCUIT_COOLDOWN_SECS,
+            guard.consecutive_failures,
+            context
+        );
+    } else {
+        tracing::warn!(
+            "connect failure #{} ({})",
+            guard.consecutive_failures,
+            context
+        );
+    }
+}
+
+async fn record_connect_success() {
+    let circuit = connect_circuit();
+    let mut guard = circuit.lock().await;
+    guard.consecutive_failures = 0;
+    guard.open_until = None;
+}
+
+pub(super) async fn get_connect_circuit_status() -> crate::state::CircuitBreakerStatus {
+    let circuit = connect_circuit();
+    let guard = circuit.lock().await;
+    let now = Instant::now();
+
+    let (state, next_attempt_in) = match guard.open_until {
+        Some(until) if now < until => (
+            crate::state::CircuitState::Open,
+            Some(until.saturating_duration_since(now)),
+        ),
+        _ if guard.consecutive_failures > 0 => (crate::state::CircuitState::HalfOpen, None),
+        _ => (crate::state::CircuitState::Closed, None),
+    };
+
+    crate::state::CircuitBreakerStatus {
+        state,
+        failure_count: guard.consecutive_failures,
+        success_count: 0,
+        next_attempt_in,
+    }
+}
+
+async fn run_with_retry_budget<T, E, F, Fut>(
+    op_name: &'static str,
+    attempts: usize,
+    base_backoff_ms: u64,
+    mut op: F,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt + 1 >= attempts {
+                    return Err(e);
+                }
+                let backoff_ms = base_backoff_ms.saturating_mul(1u64 << (attempt as u32).min(5));
+                tracing::warn!(
+                    "{} attempt {}/{} failed: {}. retrying in {}ms",
+                    op_name,
+                    attempt + 1,
+                    attempts,
+                    e,
+                    backoff_ms
+                );
+                sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    unreachable!()
 }
 pub(crate) async fn handle_connect(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -113,6 +240,8 @@ pub(crate) async fn handle_connect(
         }
     }
 
+    ensure_connect_circuit_closed().await?;
+
     // Guaranteed mode: relay-backed transport with optional Tor egress.
     if product_mode == ProductMode::Guaranteed {
         if req.offer.is_some() || req.target.is_some() || req.target_onion.is_some() {
@@ -152,6 +281,7 @@ pub(crate) async fn handle_connect(
             Ok(io) => io,
             Err(e) => {
                 tracing::error!("Guaranteed connect failed: {:?}", e);
+                record_connect_failure("guaranteed transport establish").await;
                 return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
             }
         };
@@ -195,6 +325,7 @@ pub(crate) async fn handle_connect(
             Ok(k) => k,
             Err(e) => {
                 tracing::error!("Guaranteed noise handshake failed: {:?}", e);
+                record_connect_failure("guaranteed noise handshake").await;
                 return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
             }
         };
@@ -259,6 +390,7 @@ pub(crate) async fn handle_connect(
         s.status = crate::state::ConnectionStatus::Connected;
         s.peer_address = None;
         app.set_connection_state(s).await;
+        record_connect_success().await;
 
         return Ok(Json(ConnectionResponse {
             status: "connected".into(),
@@ -315,6 +447,7 @@ pub(crate) async fn handle_connect(
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("QR connect failed: {:?}", e);
+                record_connect_failure("offer+resume establish").await;
                 return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
             }
         };
@@ -390,6 +523,7 @@ pub(crate) async fn handle_connect(
             Some(false) => Some("fallback".to_string()),
             None => None,
         };
+        record_connect_success().await;
         return Ok(Json(ConnectionResponse {
             status: "connected".into(),
             port: Some(offer.rendezvous.port),
@@ -428,6 +562,7 @@ pub(crate) async fn handle_connect(
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Offer connect failed: {:?}", e);
+                record_connect_failure("offer establish").await;
                 return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
             }
         };
@@ -497,6 +632,7 @@ pub(crate) async fn handle_connect(
         s.status = crate::state::ConnectionStatus::Connected;
         s.peer_address = peer.clone();
         app.set_connection_state(s).await;
+        record_connect_success().await;
 
         return Ok(Json(ConnectionResponse {
             status: "connected".into(),
@@ -549,10 +685,18 @@ pub(crate) async fn handle_connect(
         }
     }
     if let Some(target) = req.target.clone() {
-        let conn = match transport::connect_to(&target, &params, &cfg).await {
+        let conn = match run_with_retry_budget(
+            "target_connect",
+            CONNECT_RETRY_BUDGET,
+            CONNECT_RETRY_BACKOFF_MS,
+            || transport::connect_to(&target, &params, &cfg),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Target connect failed: {:?}", e);
+                record_connect_failure("target connect").await;
                 return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
             }
         };
@@ -582,6 +726,7 @@ pub(crate) async fn handle_connect(
             Ok(k) => k,
             Err(e) => {
                 tracing::error!("Noise handshake failed: {:?}", e);
+                record_connect_failure("target noise handshake").await;
                 return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
             }
         };
@@ -652,6 +797,7 @@ pub(crate) async fn handle_connect(
         s.status = crate::state::ConnectionStatus::Connected;
         s.peer_address = peer.clone();
         app.set_connection_state(s).await;
+        record_connect_success().await;
 
         return Ok(Json(ConnectionResponse {
             status: "connected".into(),
@@ -662,7 +808,14 @@ pub(crate) async fn handle_connect(
         }));
     }
 
-    match transport::establish_connection(&params, &cfg).await {
+    match run_with_retry_budget(
+        "establish_connection",
+        CONNECT_RETRY_BUDGET,
+        CONNECT_RETRY_BACKOFF_MS,
+        || transport::establish_connection(&params, &cfg),
+    )
+    .await
+    {
         Ok(conn) => {
             let rl_duration = Duration::from_secs(cfg.rate_limit_time_window_s.max(1));
             let rl = RateLimiter::new(
@@ -721,6 +874,7 @@ pub(crate) async fn handle_connect(
                 s.status = crate::state::ConnectionStatus::Connecting;
                 s.peer_address = None;
                 app.set_connection_state(s).await;
+                record_connect_success().await;
 
                 return Ok(Json(ConnectionResponse {
                     status: "listening".into(),
@@ -744,6 +898,7 @@ pub(crate) async fn handle_connect(
                 Ok(k) => k,
                 Err(e) => {
                     tracing::error!("Noise handshake failed: {:?}", e);
+                    record_connect_failure("direct noise handshake").await;
                     return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
                 }
             };
@@ -819,6 +974,7 @@ pub(crate) async fn handle_connect(
             s.status = crate::state::ConnectionStatus::Connected;
             s.peer_address = peer_addr.clone();
             app.set_connection_state(s).await;
+            record_connect_success().await;
 
             Ok(Json(ConnectionResponse {
                 status: "connected".into(),
@@ -834,6 +990,7 @@ pub(crate) async fn handle_connect(
             app.set_connection_state(s).await;
 
             tracing::error!("Connect failed: {:?}", e);
+            record_connect_failure("establish connection").await;
             Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"))
         }
     }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -55,7 +56,51 @@ impl std::fmt::Display for NatType {
     }
 }
 
-/// Priorità di transport in base al tipo di NAT
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl NatConfidence {
+    fn from_samples(samples: usize) -> Self {
+        match samples {
+            n if n >= 3 => NatConfidence::High,
+            2 => NatConfidence::Medium,
+            _ => NatConfidence::Low,
+        }
+    }
+}
+
+impl std::fmt::Display for NatConfidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NatConfidence::Low => write!(f, "low"),
+            NatConfidence::Medium => write!(f, "medium"),
+            NatConfidence::High => write!(f, "high"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NatProfile {
+    pub nat_type: NatType,
+    pub confidence: NatConfidence,
+    pub samples: u8,
+}
+
+impl NatProfile {
+    pub const fn new(nat_type: NatType, confidence: NatConfidence, samples: u8) -> Self {
+        Self {
+            nat_type,
+            confidence,
+            samples,
+        }
+    }
+}
+
+/// Priorita di transport in base al tipo di NAT
 #[derive(Debug, Clone)]
 pub struct TransportPriority {
     pub kind: TransportKind,
@@ -72,13 +117,20 @@ pub enum TransportKind {
     Tor,
 }
 
-type NatCache = Arc<Mutex<Option<(NatType, Instant)>>>;
+type NatCache = Arc<Mutex<Option<(NatProfile, Instant)>>>;
 
-/// Cache globale del tipo di NAT (5 minuti) - Lazy initialization
+/// Cache globale del profilo NAT (5 minuti) - Lazy initialization
 static NAT_CACHE: OnceLock<NatCache> = OnceLock::new();
 
 fn get_nat_cache() -> NatCache {
     NAT_CACHE.get_or_init(|| Arc::new(Mutex::new(None))).clone()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MappedObservation {
+    server: SocketAddr,
+    mapped: SocketAddr,
+    port: u16,
 }
 
 #[derive(Clone)]
@@ -93,94 +145,136 @@ impl NatDetector {
 
     /// Rileva il tipo di NAT con caching per 5 minuti
     pub async fn detect_nat_type(&self) -> Result<NatType> {
+        Ok(self.detect_nat_profile().await?.nat_type)
+    }
+
+    /// Rileva il profilo NAT completo (tipo + confidenza + campioni)
+    pub async fn detect_nat_profile(&self) -> Result<NatProfile> {
         let cache = get_nat_cache();
         let mut cache_lock = cache.lock().await;
 
         // Controlla cache
-        if let Some((nat_type, cached_at)) = *cache_lock {
+        if let Some((profile, cached_at)) = *cache_lock {
             if cached_at.elapsed() < Duration::from_secs(300) {
-                return Ok(nat_type);
+                return Ok(profile);
             }
         }
 
         // Esegui detection
-        let nat_type = match self.perform_detection().await {
-            Ok(nt) => {
-                *cache_lock = Some((nt, Instant::now()));
-                nt
+        let profile = match self.perform_detection().await {
+            Ok(profile) => {
+                *cache_lock = Some((profile, Instant::now()));
+                profile
             }
             Err(e) => {
                 tracing::warn!("NAT detection failed: {}, using fallback Unknown", e);
-                NatType::Unknown
+                NatProfile::new(NatType::Unknown, NatConfidence::Low, 0)
             }
         };
 
-        Ok(nat_type)
+        Ok(profile)
     }
 
     /// Esegue la detection effettiva
-    async fn perform_detection(&self) -> Result<NatType> {
+    async fn perform_detection(&self) -> Result<NatProfile> {
         if self.stun_servers.len() < 2 {
             return Err(NatDetectionError::NeedAtLeastTwoStunServers);
         }
 
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let mut observations: Vec<MappedObservation> = Vec::new();
 
-        // Step 1: Binding su server primario
-        let server1: SocketAddr = self.stun_servers[0].parse()?;
-        let (mapped1, port1) = tokio::time::timeout(
-            Duration::from_secs(3),
-            self.send_stun_binding(&sock, server1),
-        )
-        .await
-        .map_err(|_| NatDetectionError::StunResponseTimeout)??;
+        // Probe fino a 3 server per migliorare confidenza.
+        for server_str in self.stun_servers.iter().take(3) {
+            let server: SocketAddr = server_str.parse()?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                self.send_stun_binding(&sock, server),
+            )
+            .await;
 
-        // Step 2: Binding su server secondario con stessa porta
-        let server2: SocketAddr = self.stun_servers[1].parse()?;
-        let (mapped2, port2) = tokio::time::timeout(
-            Duration::from_secs(3),
-            self.send_stun_binding(&sock, server2),
-        )
-        .await
-        .map_err(|_| NatDetectionError::StunResponseTimeout)??;
-
-        // Step 3: Verifica se l'IP è pubblico (no NAT)
-        if self.is_public_ip(mapped1.ip()) {
-            return Ok(NatType::OpenInternet);
-        }
-
-        // Step 4: Verifica se è Symmetric
-        if mapped1 != mapped2 {
-            // In Symmetric, la porta cambia per ogni destinazione
-            if port1 != port2 {
-                return Ok(NatType::Symmetric);
-            } else {
-                return Ok(NatType::SymetricFirewall);
+            match result {
+                Ok(Ok((mapped, port))) => {
+                    observations.push(MappedObservation {
+                        server,
+                        mapped,
+                        port,
+                    });
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("NAT detect: STUN probe failed on {}: {}", server, e);
+                }
+                Err(_) => {
+                    tracing::debug!("NAT detect: STUN probe timeout on {}", server);
+                }
             }
         }
 
-        // Step 5: Test restriction inviando binding da IP diverso (simulato)
-        // Per semplicità, usiamo un secondo socket per simulare IP diverso
-        let _change_request = self.build_change_request(true, false); // Cambia IP
+        if observations.len() < 2 {
+            return Err(NatDetectionError::StunResponseTimeout);
+        }
 
+        let samples = observations.len();
+        let base_confidence = NatConfidence::from_samples(samples);
+        let first_mapped = observations[0].mapped;
+
+        // Open internet: endpoint pubblico stabile.
+        if self.is_public_ip(first_mapped.ip()) {
+            return Ok(NatProfile::new(
+                NatType::OpenInternet,
+                base_confidence,
+                samples as u8,
+            ));
+        }
+
+        let unique_mapped: HashSet<SocketAddr> = observations.iter().map(|o| o.mapped).collect();
+        let unique_ports: HashSet<u16> = observations.iter().map(|o| o.port).collect();
+
+        // Mapping dipende dalla destinazione: comportamento symmetric-like.
+        if unique_mapped.len() > 1 {
+            let nat_type = if unique_ports.len() > 1 {
+                NatType::Symmetric
+            } else {
+                NatType::SymetricFirewall
+            };
+
+            return Ok(NatProfile::new(nat_type, base_confidence, samples as u8));
+        }
+
+        // Mapping stabile: differenziamo cone/restricted con un test aggiuntivo best-effort.
+        let primary_server = observations[0].server;
+        let unrestricted = self
+            .detect_restriction_with_server(&sock, primary_server)
+            .await
+            .unwrap_or(false);
+
+        let nat_type = if unrestricted {
+            NatType::FullCone
+        } else {
+            NatType::RestrictedCone
+        };
+
+        Ok(NatProfile::new(nat_type, base_confidence, samples as u8))
+    }
+
+    async fn detect_restriction_with_server(
+        &self,
+        sock: &UdpSocket,
+        server: SocketAddr,
+    ) -> Result<bool> {
+        // Test best-effort: invia un nuovo binding e verifica che il server
+        // risponda al socket corrente (stima grossolana di restrizione).
         let mut buf = vec![0u8; 512];
         let tx_id = rand::random::<[u8; 12]>();
         let request = self.build_stun_binding_request(tx_id);
 
-        sock.send_to(&request, server1).await?;
+        sock.send_to(&request, server).await?;
 
-        // Prova a ricevere risposta
         match tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
-            Ok(Ok((_n, from))) if from == server1 => {
-                // Risposta ricevuta = FullCone (non filtra IP sorgente)
-                Ok(NatType::FullCone)
-            }
-            _ => {
-                // Timeout = Restricted (filtra IP sorgente)
-                // Per determinare se PortRestricted, dovremmo testare con porta diversa
-                // Per ora restituiamo RestrictedCone come fallback sicuro
-                Ok(NatType::RestrictedCone)
-            }
+            Ok(Ok((_n, from))) if from == server => Ok(true),
+            Ok(Ok((_n, _))) => Err(NatDetectionError::UnexpectedServer),
+            Ok(Err(e)) => Err(NatDetectionError::Io(e)),
+            Err(_) => Ok(false),
         }
     }
 
@@ -229,32 +323,7 @@ impl NatDetector {
         // Transaction ID (12 bytes)
         req[8..20].copy_from_slice(&tx_id);
 
-        // CHANGE-REQUEST attribute (non richiesto per basic binding)
-
         req
-    }
-
-    /// Costruisce CHANGE-REQUEST attribute
-    fn build_change_request(&self, change_ip: bool, change_port: bool) -> Vec<u8> {
-        let mut attr = vec![0u8; 8];
-
-        // Attribute Type: 0x0003 (CHANGE-REQUEST)
-        attr[0] = 0x00;
-        attr[1] = 0x03;
-
-        // Attribute Length: 4 bytes
-        attr[2] = 0x00;
-        attr[3] = 0x04;
-
-        // Value: flags
-        if change_ip {
-            attr[4] = 0x04; // Change IP flag
-        }
-        if change_port {
-            attr[4] |= 0x02; // Change Port flag
-        }
-
-        attr
     }
 
     /// Parsa STUN response per estrarre Mapped Address
@@ -323,21 +392,25 @@ impl NatDetector {
         Err(NatDetectionError::NoAddressAttribute)
     }
 
-    /// Verifica se un IP è pubblico
+    /// Verifica se un IP e pubblico
     fn is_public_ip(&self, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => {
                 // RFC 1918 private ranges
-                !((ipv4.octets()[0] == 10) ||
-                    (ipv4.octets()[0] == 172 && ipv4.octets()[1] >= 16 && ipv4.octets()[1] <= 31) ||
-                    (ipv4.octets()[0] == 192 && ipv4.octets()[1] == 168) ||
+                !((ipv4.octets()[0] == 10)
+                    || (ipv4.octets()[0] == 172
+                        && ipv4.octets()[1] >= 16
+                        && ipv4.octets()[1] <= 31)
+                    || (ipv4.octets()[0] == 192 && ipv4.octets()[1] == 168)
+                    ||
                     // Link-local
-                    (ipv4.octets()[0] == 169 && ipv4.octets()[1] == 254) ||
+                    (ipv4.octets()[0] == 169 && ipv4.octets()[1] == 254)
+                    ||
                     // Loopback
                     ipv4.is_loopback())
             }
             IpAddr::V6(_) => {
-                // Per IPv6, consideriamo globale se non è link-local o loopback
+                // Per IPv6, consideriamo globale se non e link-local o loopback
                 let is_v4_mapped = match ip {
                     IpAddr::V6(v6) => {
                         let octets = v6.octets();
@@ -407,7 +480,7 @@ impl NatDetector {
                     should_skip: false,
                 },
             ],
-            NatType::RestrictedCone | NatType::PortRestrictedCone => vec![
+            NatType::RestrictedCone | NatType::PortRestrictedCone | NatType::Symmetric => vec![
                 TransportPriority {
                     kind: TransportKind::Lan,
                     priority: 100,
@@ -417,44 +490,17 @@ impl NatDetector {
                     kind: TransportKind::Upnp,
                     priority: 90,
                     should_skip: false,
-                }, // Port forwarding importante
-                TransportPriority {
-                    kind: TransportKind::Stun,
-                    priority: 60,
-                    should_skip: false,
-                }, // Rischioso con restrizioni
-                TransportPriority {
-                    kind: TransportKind::Relay,
-                    priority: 80,
-                    should_skip: false,
-                }, // Più affidabile
-                TransportPriority {
-                    kind: TransportKind::Tor,
-                    priority: 70,
-                    should_skip: false,
                 },
-            ],
-            NatType::Symmetric => vec![
-                TransportPriority {
-                    kind: TransportKind::Lan,
-                    priority: 100,
-                    should_skip: false,
-                },
-                TransportPriority {
-                    kind: TransportKind::Upnp,
-                    priority: 90,
-                    should_skip: false,
-                }, // Prova comunque
                 TransportPriority {
                     kind: TransportKind::Relay,
                     priority: 85,
                     should_skip: false,
-                }, // Alta priorità per relay
+                },
                 TransportPriority {
                     kind: TransportKind::Stun,
                     priority: 30,
                     should_skip: true,
-                }, // Skippa: funziona male con Symmetric
+                },
                 TransportPriority {
                     kind: TransportKind::Tor,
                     priority: 80,
@@ -476,7 +522,7 @@ impl NatDetector {
                     kind: TransportKind::Relay,
                     priority: 90,
                     should_skip: false,
-                }, // Molto affidabile
+                },
                 TransportPriority {
                     kind: TransportKind::Tor,
                     priority: 80,
@@ -486,7 +532,7 @@ impl NatDetector {
                     kind: TransportKind::Stun,
                     priority: 20,
                     should_skip: true,
-                }, // Skippa
+                },
             ],
             NatType::Unknown => vec![
                 TransportPriority {
@@ -517,13 +563,60 @@ impl NatDetector {
             ],
         }
     }
+
+    /// Seleziona strategia adattiva in base a tipo NAT + confidenza detection.
+    pub fn select_strategy_for_profile(profile: NatProfile) -> Vec<TransportPriority> {
+        let mut strategy = Self::select_strategy(profile.nat_type);
+
+        match profile.confidence {
+            NatConfidence::High => {
+                // Mantieni priorita base.
+            }
+            NatConfidence::Medium => {
+                for step in &mut strategy {
+                    match step.kind {
+                        TransportKind::Relay | TransportKind::Tor => {
+                            step.priority = step.priority.saturating_add(5);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            NatConfidence::Low => {
+                for step in &mut strategy {
+                    match step.kind {
+                        TransportKind::Relay | TransportKind::Tor => {
+                            step.priority = step.priority.saturating_add(12);
+                        }
+                        TransportKind::Stun | TransportKind::Upnp => {
+                            step.priority = step.priority.saturating_sub(15);
+                            if profile.nat_type == NatType::Unknown
+                                && step.kind == TransportKind::Stun
+                            {
+                                step.should_skip = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        strategy.sort_by(|a, b| b.priority.cmp(&a.priority));
+        strategy
+    }
 }
 
 /// Wrapper per detection NAT con fallback
 pub async fn detect_nat_type() -> Result<NatType> {
+    Ok(detect_nat_profile().await?.nat_type)
+}
+
+/// Wrapper per detection del profilo NAT completo.
+pub async fn detect_nat_profile() -> Result<NatProfile> {
     let config = crate::config::Config::from_env();
     let detector = NatDetector::new(config.nat_detection_servers);
-    detector.detect_nat_type().await
+    detector.detect_nat_profile().await
 }
 
 #[cfg(test)]
@@ -559,6 +652,24 @@ mod tests {
 
         let strategy = NatDetector::select_strategy(NatType::FullCone);
         assert!(!strategy.iter().any(|p| p.should_skip));
+    }
+
+    #[test]
+    fn test_select_strategy_for_low_confidence_biases_fallback() {
+        let profile = NatProfile::new(NatType::Unknown, NatConfidence::Low, 1);
+        let strategy = NatDetector::select_strategy_for_profile(profile);
+
+        let relay = strategy
+            .iter()
+            .find(|p| p.kind == TransportKind::Relay)
+            .unwrap();
+        let stun = strategy
+            .iter()
+            .find(|p| p.kind == TransportKind::Stun)
+            .unwrap();
+
+        assert!(relay.priority >= stun.priority);
+        assert!(stun.should_skip);
     }
 
     #[test]

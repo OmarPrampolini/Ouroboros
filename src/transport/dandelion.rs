@@ -24,6 +24,28 @@ struct Batch {
 
 type SocketAddr = std::net::SocketAddr;
 
+#[derive(Debug, Clone, Copy)]
+pub struct DandelionPolicy {
+    pub min_delay_secs: u64,
+    pub max_delay_secs: u64,
+    pub target_batch_size: usize,
+    pub fluff_tick_ms: u64,
+}
+
+impl DandelionPolicy {
+    fn jitter_delay_secs(&self) -> u64 {
+        if cfg!(test) {
+            return 1;
+        }
+
+        if self.max_delay_secs <= self.min_delay_secs {
+            return self.min_delay_secs;
+        }
+
+        rand::thread_rng().gen_range(self.min_delay_secs..=self.max_delay_secs)
+    }
+}
+
 impl DandelionAggregator {
     pub fn new() -> Self {
         Self {
@@ -31,31 +53,44 @@ impl DandelionAggregator {
         }
     }
 
-    /// Add request to batch. Returns true if this was the first request in the batch (sets deadline)
+    /// Backward-compatible helper: defaults to low-latency dandelion profile.
     pub async fn add_request(
         &self,
         tag: [u8; 8],
         request: AssistRequestV5,
         from: SocketAddr,
     ) -> bool {
+        self.add_request_with_mode(tag, request, from, DandelionMode::LowLatency)
+            .await
+    }
+
+    /// Add request to batch. Returns true if this was the first request in the batch (sets deadline).
+    ///
+    /// Mode controls delay window and batch size threshold.
+    pub async fn add_request_with_mode(
+        &self,
+        tag: [u8; 8],
+        request: AssistRequestV5,
+        from: SocketAddr,
+        mode: DandelionMode,
+    ) -> bool {
         let mut batches = self.batches.lock().await;
+        let policy = mode.policy();
 
         let is_first = !batches.contains_key(&tag);
 
-        let batch = batches.entry(tag).or_insert_with(|| {
-            // Random delay 5-15 seconds
-            let delay_secs = if cfg!(test) {
-                1
-            } else {
-                rand::thread_rng().gen_range(5..15)
-            };
-            Batch {
-                requests: Vec::new(),
-                deadline: Instant::now() + Duration::from_secs(delay_secs),
-            }
+        let batch = batches.entry(tag).or_insert_with(|| Batch {
+            requests: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(policy.jitter_delay_secs()),
         });
 
         batch.requests.push((request, from));
+
+        // Security mode prefers larger batches; low-latency mode flushes earlier.
+        if batch.requests.len() >= policy.target_batch_size {
+            batch.deadline = Instant::now();
+        }
+
         is_first
     }
 
@@ -128,6 +163,29 @@ impl DandelionMode {
             _ => DandelionMode::Off,
         }
     }
+
+    pub fn policy(self) -> DandelionPolicy {
+        match self {
+            DandelionMode::Off => DandelionPolicy {
+                min_delay_secs: 0,
+                max_delay_secs: 0,
+                target_batch_size: 1,
+                fluff_tick_ms: 100,
+            },
+            DandelionMode::LowLatency => DandelionPolicy {
+                min_delay_secs: 2,
+                max_delay_secs: 5,
+                target_batch_size: 4,
+                fluff_tick_ms: 250,
+            },
+            DandelionMode::HighSecurity => DandelionPolicy {
+                min_delay_secs: 10,
+                max_delay_secs: 15,
+                target_batch_size: 10,
+                fluff_tick_ms: 1000,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -157,7 +215,9 @@ mod tests {
 
             let port = 1000u16 + i as u16;
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            aggregator.add_request(tag, req, addr).await;
+            aggregator
+                .add_request_with_mode(tag, req, addr, DandelionMode::LowLatency)
+                .await;
         }
 
         // Should be empty immediately (not ready)
@@ -165,11 +225,21 @@ mod tests {
         assert!(ready.is_empty());
 
         // Wait for deadline
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Now should be ready
         let ready = aggregator.ready_batches().await;
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0.len(), 3);
+    }
+
+    #[test]
+    fn test_dandelion_mode_policies_are_different() {
+        let low = DandelionMode::LowLatency.policy();
+        let high = DandelionMode::HighSecurity.policy();
+
+        assert!(low.max_delay_secs < high.min_delay_secs);
+        assert!(low.target_batch_size < high.target_batch_size);
+        assert!(low.fluff_tick_ms < high.fluff_tick_ms);
     }
 }

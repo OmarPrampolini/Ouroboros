@@ -73,8 +73,9 @@ impl AssistInbox {
         if self.mode != DandelionMode::Off {
             let aggregator = self.aggregator.clone();
             let tx = self.request_tx.clone();
+            let mode = self.mode;
             tokio::spawn(async move {
-                Self::fluff_loop(aggregator, tx).await;
+                Self::fluff_loop(aggregator, tx, mode).await;
             });
         }
 
@@ -113,12 +114,20 @@ impl AssistInbox {
         }
     }
 
-    /// Fluff loop: periodically check for ready batches and forward them
+    /// Fluff loop: periodically check for ready batches and forward them.
     async fn fluff_loop(
         aggregator: DandelionAggregator,
         request_tx: mpsc::Sender<AssistInboxRequest>,
+        mode: DandelionMode,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let policy = mode.policy();
+        let mut interval = tokio::time::interval(Duration::from_millis(policy.fluff_tick_ms));
+
+        tracing::info!(
+            "Dandelion fluff loop started (mode={:?}, tick={}ms)",
+            mode,
+            policy.fluff_tick_ms
+        );
 
         loop {
             interval.tick().await;
@@ -205,12 +214,22 @@ impl AssistInbox {
                         let tag = dandelion_tag_for_request(&req);
                         let is_first = self
                             .aggregator
-                            .add_request(tag, req, std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+                            .add_request_with_mode(
+                                tag,
+                                req,
+                                std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                                self.mode,
+                            )
                             .await;
 
                         if is_first {
+                            let policy = self.mode.policy();
                             tracing::debug!(
-                                "Dandelion: stem request queued, batch will fluff in 5-15s"
+                                "Dandelion: stem queued (mode={:?}, flush {}-{}s or batch>={})",
+                                self.mode,
+                                policy.min_delay_secs,
+                                policy.max_delay_secs,
+                                policy.target_batch_size
                             );
                         }
                     } else {

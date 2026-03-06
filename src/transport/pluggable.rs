@@ -15,9 +15,23 @@ use crate::config::PluggableTransportMode;
 
 type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T> = std::result::Result<T, AnyError>;
+const MAX_CHANNEL_FRAME_BYTES: usize = crate::crypto::MAX_CLEAR_PAYLOAD_BYTES;
 
 fn any_error(msg: impl Into<String>) -> AnyError {
     std::io::Error::other(msg.into()).into()
+}
+
+fn validate_frame_len(len: usize, channel: &str) -> Result<()> {
+    if len == 0 {
+        return Err(any_error(format!("{} frame length is zero", channel)));
+    }
+    if len > MAX_CHANNEL_FRAME_BYTES {
+        return Err(any_error(format!(
+            "{} frame too large: {} > {}",
+            channel, len, MAX_CHANNEL_FRAME_BYTES
+        )));
+    }
+    Ok(())
 }
 
 pub mod http2_mimic;
@@ -292,6 +306,7 @@ impl TransportChannel for HttpsLikeChannel {
         let mut len_buf = [0u8; 4];
         self.stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
+        validate_frame_len(len, "https_like")?;
 
         let mut msg = vec![0u8; len];
         self.stream.read_exact(&mut msg).await?;
@@ -299,6 +314,7 @@ impl TransportChannel for HttpsLikeChannel {
     }
 
     async fn write_message(&mut self, data: &[u8]) -> Result<()> {
+        validate_frame_len(data.len(), "https_like")?;
         let len = data.len() as u32;
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(data).await?;
@@ -341,6 +357,7 @@ impl TransportChannel for FtpDataChannel {
         let mut len_buf = [0u8; 4];
         self.stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
+        validate_frame_len(len, "ftp_data")?;
 
         let mut msg = vec![0u8; len];
         self.stream.read_exact(&mut msg).await?;
@@ -348,6 +365,7 @@ impl TransportChannel for FtpDataChannel {
     }
 
     async fn write_message(&mut self, data: &[u8]) -> Result<()> {
+        validate_frame_len(data.len(), "ftp_data")?;
         let len = data.len() as u32;
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(data).await?;

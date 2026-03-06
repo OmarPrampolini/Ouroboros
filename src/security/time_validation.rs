@@ -16,11 +16,21 @@ pub enum TimeValidationError {
     SystemTime(String),
     #[error("last_good_offset lock poisoned")]
     LockPoisoned,
+    #[error("last_returned_ms lock poisoned")]
+    LastReturnedLockPoisoned,
     #[error("{0}")]
     Invalid(String),
 }
 
 type Result<T> = std::result::Result<T, TimeValidationError>;
+
+fn apply_signed_offset_ms(base_ms: u64, offset_ms: i64) -> u64 {
+    if offset_ms >= 0 {
+        base_ms.saturating_add(offset_ms as u64)
+    } else {
+        base_ms.saturating_sub(offset_ms.unsigned_abs())
+    }
+}
 
 /// Time validation state with monotonic tracking
 #[derive(Clone)]
@@ -31,6 +41,8 @@ pub struct TimeValidator {
     system_start: SystemTime,
     /// Last known good time offset (system - monotonic)
     last_good_offset: Arc<Mutex<i64>>,
+    /// Last emitted wall-clock in ms (never regresses)
+    last_returned_ms: Arc<Mutex<u64>>,
     #[allow(dead_code)]
     /// NTP time cache for validation (reserved for future use)
     ntp_time_cache: Arc<Mutex<Option<(u64, SystemTime)>>>,
@@ -39,26 +51,32 @@ pub struct TimeValidator {
 impl TimeValidator {
     pub fn new() -> Self {
         let now = SystemTime::now();
+        let now_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         Self {
             monotonic_start: Instant::now(),
             system_start: now,
             last_good_offset: Arc::new(Mutex::new(0)),
+            last_returned_ms: Arc::new(Mutex::new(now_ms)),
             ntp_time_cache: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Get current time with validation against monotonic clock
+    /// Get current time with validation against monotonic clock.
+    /// Output is guaranteed non-decreasing.
     pub fn now_monotonic_validated(&self) -> Result<u64> {
         let now_instant = Instant::now();
         let now_system = SystemTime::now();
 
-        // Calculate elapsed time using monotonic clock
+        // Calculate elapsed time using monotonic clock.
         let monotonic_elapsed = now_instant.duration_since(self.monotonic_start).as_millis() as u64;
 
-        // Calculate expected system time based on monotonic clock
+        // Calculate expected system time based on monotonic clock.
         let expected_system = self.system_start + Duration::from_millis(monotonic_elapsed);
 
-        // Check for significant clock jumps
         let actual_system_ms = now_system
             .duration_since(UNIX_EPOCH)
             .map_err(|e| TimeValidationError::SystemTime(e.to_string()))?
@@ -70,21 +88,39 @@ impl TimeValidator {
 
         let time_diff = actual_system_ms.abs_diff(expected_system_ms);
 
-        // If clock jump is too large, use monotonic-based time
-        if time_diff > MAX_CLOCK_SKEW_MS {
-            tracing::warn!(
-                "Large clock jump detected: {}ms, using monotonic time",
-                time_diff
-            );
-            let mut guard = self
+        let candidate_ms = {
+            let mut offset_guard = self
                 .last_good_offset
                 .lock()
                 .map_err(|_| TimeValidationError::LockPoisoned)?;
-            *guard = (actual_system_ms as i64) - (expected_system_ms as i64);
-            return Ok(expected_system_ms);
+
+            if time_diff > MAX_CLOCK_SKEW_MS {
+                tracing::warn!(
+                    "Large clock jump detected: {}ms, using monotonic+offset fallback",
+                    time_diff
+                );
+                apply_signed_offset_ms(expected_system_ms, *offset_guard)
+            } else {
+                // Trusted sample: refresh offset baseline.
+                *offset_guard = (actual_system_ms as i128 - expected_system_ms as i128)
+                    .clamp(i64::MIN as i128, i64::MAX as i128)
+                    as i64;
+                actual_system_ms
+            }
+        };
+
+        // Monotonicity guarantee for downstream replay/time-window checks.
+        let mut last_returned = self
+            .last_returned_ms
+            .lock()
+            .map_err(|_| TimeValidationError::LastReturnedLockPoisoned)?;
+
+        if candidate_ms < *last_returned {
+            return Ok(*last_returned);
         }
 
-        Ok(actual_system_ms)
+        *last_returned = candidate_ms;
+        Ok(candidate_ms)
     }
 
     /// Validate offer timestamp against current time with multiple checks
@@ -111,7 +147,7 @@ impl TimeValidator {
             )));
         }
 
-        // Additional check: offer shouldn't be too old even if TTL allows
+        // Additional check: offer should not be too old even if TTL allows
         const MAX_AGE_MS: u64 = 3_600_000; // 1 hour maximum
         if age_ms > MAX_AGE_MS {
             return Err(TimeValidationError::Invalid(format!(
@@ -213,5 +249,23 @@ mod tests {
         // Outside window should fail
         let old = now - 10000; // 10 seconds ago with 5 second window
         assert!(validator.validate_time_window(old, 5000).is_err());
+    }
+
+    #[test]
+    fn test_now_monotonic_validated_never_regresses() {
+        let validator = TimeValidator::new();
+        let t1 = validator.now_monotonic_validated().unwrap();
+        let t2 = validator.now_monotonic_validated().unwrap();
+        let t3 = validator.now_monotonic_validated().unwrap();
+
+        assert!(t2 >= t1);
+        assert!(t3 >= t2);
+    }
+
+    #[test]
+    fn test_apply_signed_offset_ms() {
+        assert_eq!(apply_signed_offset_ms(1000, 50), 1050);
+        assert_eq!(apply_signed_offset_ms(1000, -50), 950);
+        assert_eq!(apply_signed_offset_ms(10, -100), 0);
     }
 }

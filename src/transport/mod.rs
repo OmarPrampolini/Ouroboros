@@ -31,7 +31,9 @@ use crate::offer::{OfferPayload, RoleHint};
 use crate::resume::ResumeParams;
 use crate::security::early_drop_packet;
 use crate::session_noise::NoiseRole;
-use crate::transport::nat_detection::{detect_nat_type, NatDetector, TransportKind};
+use crate::transport::nat_detection::{
+    detect_nat_profile, NatConfidence, NatDetector, NatProfile, NatType, TransportKind,
+};
 use crate::transport::stun::StunClient;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -129,16 +131,22 @@ impl Connection {
 pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<Connection> {
     // NAT strategy selection (uses cached detection when available).
     // NOTE: Requires STUN servers configured via config.nat_detection_servers.
-    let nat_type = match detect_nat_type().await {
-        Ok(nt) => nt,
+    let nat_profile = match detect_nat_profile().await {
+        Ok(profile) => profile,
         Err(e) => {
             tracing::warn!("NAT detection failed, using Unknown strategy: {}", e);
-            crate::transport::nat_detection::NatType::Unknown
+            NatProfile::new(NatType::Unknown, NatConfidence::Low, 0)
         }
     };
-    tracing::info!("NAT type detected: {}", nat_type);
+    let nat_type = nat_profile.nat_type;
+    tracing::info!(
+        "NAT profile detected: type={} confidence={} samples={}",
+        nat_profile.nat_type,
+        nat_profile.confidence,
+        nat_profile.samples
+    );
 
-    let mut strategy = NatDetector::select_strategy(nat_type);
+    let mut strategy = NatDetector::select_strategy_for_profile(nat_profile);
     // Fast-path: Symmetric NAT (or Symmetric+Firewall) should skip direct paths.
     if matches!(
         nat_type,
@@ -350,7 +358,19 @@ pub async fn connect_to(
     }
 
     if udp_blocked {
-        tracing::info!("udp_blocked -> trying TCP hole punch");
+        tracing::info!("udp_blocked -> trying adaptive TCP hole punch");
+
+        let tcp_plan = crate::transport::tcp_hole_punch::TcpPunchPlan {
+            attempts: (cfg.wan_probe_burst as u8).saturating_add(2).clamp(3, 7),
+            min_attempt_timeout_ms: cfg.wan_connect_timeout_ms.clamp(600, 3000),
+            max_attempt_timeout_ms: cfg
+                .wan_connect_timeout_ms
+                .saturating_mul(2)
+                .clamp(1500, 7000),
+            base_interval_ms: cfg.wan_probe_interval_ms.clamp(80, 300),
+            max_interval_ms: cfg.wan_probe_interval_ms.saturating_mul(3).clamp(200, 900),
+            jitter_ms: 60,
+        };
 
         let local = if peer.is_ipv6() {
             SocketAddr::from(([0u16; 8], params.port))
@@ -358,11 +378,11 @@ pub async fn connect_to(
             SocketAddr::from(([0, 0, 0, 0], params.port))
         };
 
-        let tcp_result = match TcpHolePunch::punch(local, peer).await {
+        let tcp_result = match TcpHolePunch::punch_with_plan(local, peer, tcp_plan).await {
             Ok(stream) => Ok(stream),
             Err(e) => {
                 tracing::warn!(
-                    "TCP hole punch failed on port {} ({}), retrying ephemeral port",
+                    "TCP hole punch failed on fixed port {} ({}), retrying ephemeral port",
                     params.port,
                     e
                 );
@@ -371,7 +391,11 @@ pub async fn connect_to(
                 } else {
                     SocketAddr::from(([0, 0, 0, 0], 0))
                 };
-                TcpHolePunch::punch(local_ephemeral, peer).await
+                let fallback_plan = crate::transport::tcp_hole_punch::TcpPunchPlan {
+                    attempts: tcp_plan.attempts.saturating_sub(1).max(2),
+                    ..tcp_plan
+                };
+                TcpHolePunch::punch_with_plan(local_ephemeral, peer, fallback_plan).await
             }
         };
 

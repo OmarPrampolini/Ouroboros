@@ -19,6 +19,14 @@ pub enum MultipathError {
     AllPathsFailed(String),
     #[error("Receive timeout on all paths")]
     ReceiveTimeoutAllPaths,
+    #[error("I/O error on path {path_idx}: {message}")]
+    Io { path_idx: usize, message: String },
+    #[error("Buffer too small on path {path_idx}: got {got}, need {need}")]
+    BufferTooSmall {
+        path_idx: usize,
+        got: usize,
+        need: usize,
+    },
 }
 
 type Result<T> = std::result::Result<T, MultipathError>;
@@ -160,11 +168,18 @@ impl MultipathConnection {
 
         // Auto-switch to better path if needed
         if path_idx != self.primary_idx {
-            let primary_score = self.paths[self.primary_idx].metadata().await.score();
-            let new_score = self.paths[path_idx].metadata().await.score();
+            let primary_meta = self.paths[self.primary_idx].metadata().await;
+            let candidate_meta = self.paths[path_idx].metadata().await;
+            let primary_score = primary_meta.score();
+            let candidate_score = candidate_meta.score();
+            let rtt_gain_ms = primary_meta.rtt_ms.saturating_sub(candidate_meta.rtt_ms);
+            let loss_gain = (primary_meta.loss_rate - candidate_meta.loss_rate).max(0.0);
 
-            // Switch if significantly better
-            if new_score > primary_score * 1.2 {
+            // Switch when the candidate is objectively better and crosses
+            // a configurable RTT/loss threshold.
+            if candidate_score > primary_score
+                && (rtt_gain_ms >= self.switch_threshold_ms || loss_gain >= 0.05)
+            {
                 tracing::info!(
                     "Switching primary path from {} to {}",
                     self.primary_idx,
@@ -189,40 +204,72 @@ impl MultipathConnection {
         }
 
         match self.scheduler {
-            SchedulerPolicy::Redundant => {
-                match routing {
-                    RoutingPolicy::All => {
-                        // Send to all active paths
-                        let mut futures = Vec::new();
-                        for (idx, path) in self.paths.iter().enumerate() {
-                            let meta = path.metadata().await;
-                            if meta.active {
-                                futures.push(self.send_single_path(idx, data));
-                            }
-                        }
-
-                        // Wait for at least one success
-                        let results = futures::future::join_all(futures).await;
-                        if let Some(Ok(_)) = results.iter().find(|r| r.is_ok()) {
-                            Ok(())
-                        } else {
-                            Err(MultipathError::AllPathsFailed(format!("{:?}", results)))
+            SchedulerPolicy::Redundant => match routing {
+                RoutingPolicy::All => {
+                    // Send to all active paths
+                    let mut futures = Vec::new();
+                    for (idx, path) in self.paths.iter().enumerate() {
+                        let meta = path.metadata().await;
+                        if meta.active {
+                            futures.push(self.send_single_path(idx, data));
                         }
                     }
-                    _ => {
-                        // Default to primary
-                        self.send_single_path(self.primary_idx, data).await
+
+                    // Wait for at least one success
+                    let results = futures::future::join_all(futures).await;
+                    if let Some(Ok(_)) = results.iter().find(|r| r.is_ok()) {
+                        Ok(())
+                    } else {
+                        Err(MultipathError::AllPathsFailed(format!("{:?}", results)))
                     }
                 }
-            }
+                _ => {
+                    // Default to primary
+                    self.send_single_path(self.primary_idx, data).await
+                }
+            },
             SchedulerPolicy::Split => self.send_split(data, routing).await,
         }
     }
 
     /// Send to a single path
     async fn send_single_path(&self, path_idx: usize, data: &[u8]) -> Result<()> {
-        // Placeholder - in real implementation, this would use the transport
-        tracing::debug!("Sending {} bytes to path {}", data.len(), path_idx);
+        if path_idx >= self.paths.len() {
+            return Err(MultipathError::PathIndexOutOfBounds(path_idx));
+        }
+
+        let transport = &self.paths[path_idx].transport;
+        match transport {
+            Connection::Lan(sock, peer) | Connection::Wan(sock, peer) => {
+                sock.send_to(data, *peer)
+                    .await
+                    .map_err(|e| MultipathError::Io {
+                        path_idx,
+                        message: e.to_string(),
+                    })?;
+            }
+            Connection::WanTorStream { writer, .. } | Connection::WanTcpStream { writer, .. } => {
+                let mut guard = writer.lock().await;
+                crate::transport::framing::write_frame(&mut *guard, data)
+                    .await
+                    .map_err(|e| MultipathError::Io {
+                        path_idx,
+                        message: e.to_string(),
+                    })?;
+            }
+            Connection::Quic(quic) => {
+                quic.send(data).await.map_err(|e| MultipathError::Io {
+                    path_idx,
+                    message: e.to_string(),
+                })?;
+            }
+            Connection::WebRtc(webrtc) => {
+                webrtc.send(data).await.map_err(|e| MultipathError::Io {
+                    path_idx,
+                    message: e.to_string(),
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -321,10 +368,55 @@ impl MultipathConnection {
     }
 
     /// Receive from single path
-    async fn recv_single_path(&self, path_idx: usize, _buf: &mut [u8]) -> Result<usize> {
-        // Placeholder - in real implementation, this would use the transport
-        tracing::debug!("Receiving from path {}", path_idx);
-        Ok(0)
+    async fn recv_single_path(&self, path_idx: usize, buf: &mut [u8]) -> Result<usize> {
+        if path_idx >= self.paths.len() {
+            return Err(MultipathError::PathIndexOutOfBounds(path_idx));
+        }
+
+        let transport = &self.paths[path_idx].transport;
+        let data = match transport {
+            Connection::Lan(sock, _) | Connection::Wan(sock, _) => {
+                let mut tmp = vec![0u8; 65_535];
+                let (n, _) = sock
+                    .recv_from(&mut tmp)
+                    .await
+                    .map_err(|e| MultipathError::Io {
+                        path_idx,
+                        message: e.to_string(),
+                    })?;
+                tmp.truncate(n);
+                tmp
+            }
+            Connection::WanTorStream { reader, .. } | Connection::WanTcpStream { reader, .. } => {
+                let mut guard = reader.lock().await;
+                crate::transport::framing::read_frame(&mut *guard)
+                    .await
+                    .map_err(|e| MultipathError::Io {
+                        path_idx,
+                        message: e.to_string(),
+                    })?
+            }
+            Connection::Quic(quic) => quic.recv().await.map_err(|e| MultipathError::Io {
+                path_idx,
+                message: e.to_string(),
+            })?,
+            Connection::WebRtc(webrtc) => webrtc.recv().await.map_err(|e| MultipathError::Io {
+                path_idx,
+                message: e.to_string(),
+            })?,
+        };
+
+        if data.len() > buf.len() {
+            return Err(MultipathError::BufferTooSmall {
+                path_idx,
+                got: buf.len(),
+                need: data.len(),
+            });
+        }
+
+        buf[..data.len()].copy_from_slice(&data);
+        tracing::debug!("Received {} bytes from path {}", data.len(), path_idx);
+        Ok(data.len())
     }
 
     /// Get number of active paths
@@ -348,6 +440,8 @@ impl MultipathConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use tokio::net::UdpSocket;
 
     #[test]
     fn test_scheduler_policy() {
@@ -374,5 +468,70 @@ mod tests {
         let multi = MultipathConnection::new(SchedulerPolicy::Redundant, 50);
         assert_eq!(multi.active_paths().await, 0);
         assert_eq!(multi.primary_path(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_switch_primary_on_quality_improvement() {
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer_a: SocketAddr = sock_b.local_addr().unwrap();
+        let peer_b: SocketAddr = sock_a.local_addr().unwrap();
+
+        let mut multi = MultipathConnection::new(SchedulerPolicy::Redundant, 20);
+        multi.add_path(
+            Connection::Wan(sock_a, peer_a),
+            PathMetadata {
+                name: "primary".to_string(),
+                rtt_ms: 120,
+                loss_rate: 0.1,
+                active: true,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        multi.add_path(
+            Connection::Wan(sock_b, peer_b),
+            PathMetadata {
+                name: "candidate".to_string(),
+                rtt_ms: 110,
+                loss_rate: 0.1,
+                active: true,
+                created_at: std::time::Instant::now(),
+            },
+        );
+
+        assert_eq!(multi.primary_path(), 0);
+        multi.update_path_quality(1, 70, 0.01).await.unwrap();
+        assert_eq!(multi.primary_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_recv_udp_path() {
+        let sender_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let receiver_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sender_addr = sender_sock.local_addr().unwrap();
+        let receiver_addr = receiver_sock.local_addr().unwrap();
+
+        let mut sender_multi = MultipathConnection::new(SchedulerPolicy::Redundant, 50);
+        sender_multi.add_path(
+            Connection::Wan(sender_sock, receiver_addr),
+            PathMetadata::default(),
+        );
+
+        let mut receiver_multi = MultipathConnection::new(SchedulerPolicy::Redundant, 50);
+        receiver_multi.add_path(
+            Connection::Wan(receiver_sock, sender_addr),
+            PathMetadata::default(),
+        );
+
+        sender_multi
+            .send_multipath(b"hello-multipath", &RoutingPolicy::Primary)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, path_idx) = receiver_multi.recv_multipath(&mut buf).await.unwrap();
+
+        assert_eq!(path_idx, 0);
+        assert_eq!(&buf[..n], b"hello-multipath");
     }
 }

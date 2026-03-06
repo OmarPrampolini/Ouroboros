@@ -20,6 +20,7 @@ const NOISE_PARAMS_CLASSIC: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const MAX_NOISE_MESSAGE_BYTES: usize = 8 * 1024;
 const RESUME_TIMEOUT_MS: u64 = 2000;
 const RESUME_MAX_SKEW_MS: u64 = 5000;
+const NOISE_HANDSHAKE_MAX_SKEW_MS: u64 = 15_000;
 
 #[derive(Debug, Error)]
 pub enum SessionNoiseError {
@@ -331,6 +332,17 @@ fn parse_noise_params(params_str: &str, needs_pq: bool) -> Result<snow::params::
     })
 }
 
+fn validate_packet_timestamp(ts_ms: u64, max_skew_ms: u64, context: &'static str) -> Result<()> {
+    let now = crypto::now_ms();
+    if ts_ms > now.saturating_add(max_skew_ms) || now.saturating_sub(ts_ms) > max_skew_ms {
+        return Err(SessionNoiseError::ProtocolViolation(format!(
+            "{} timestamp outside window",
+            context
+        )));
+    }
+    Ok(())
+}
+
 pub fn classic_noise_params() -> Result<snow::params::NoiseParams> {
     parse_noise_params(NOISE_PARAMS_CLASSIC, false)
 }
@@ -502,6 +514,7 @@ where
             let pkt = deserialize_cipher_packet_with_limit(&raw, limit)?;
             let clear = open(base_key, &pkt, tag16, tag8)
                 .ok_or(SessionNoiseError::InvalidBasePacket("resume handshake"))?;
+            validate_packet_timestamp(clear.ts_ms, RESUME_MAX_SKEW_MS, "resume packet")?;
             let ctrl: Control = bincode::deserialize(&clear.data)
                 .map_err(|e| SessionNoiseError::Deserialization(e.to_string()))?;
             let (token_id, server_nonce) = match ctrl {
@@ -537,6 +550,7 @@ where
             let pkt = deserialize_cipher_packet_with_limit(&raw, limit)?;
             let clear = open(base_key, &pkt, tag16, tag8)
                 .ok_or(SessionNoiseError::InvalidBasePacket("resume handshake"))?;
+            validate_packet_timestamp(clear.ts_ms, RESUME_MAX_SKEW_MS, "resume packet")?;
             let ctrl: Control = bincode::deserialize(&clear.data)
                 .map_err(|e| SessionNoiseError::Deserialization(e.to_string()))?;
             let (token_id, client_nonce, ts_ms) = match ctrl {
@@ -726,6 +740,11 @@ where
             let pkt = deserialize_cipher_packet_with_limit(&raw_bytes, limit)?;
             let clear = open(base_key, &pkt, tag16, tag8)
                 .ok_or(SessionNoiseError::InvalidBasePacket("noise handshake"))?;
+            validate_packet_timestamp(
+                clear.ts_ms,
+                NOISE_HANDSHAKE_MAX_SKEW_MS,
+                "noise handshake packet",
+            )?;
 
             let ctrl: Control = bincode::deserialize(&clear.data)
                 .map_err(|e| SessionNoiseError::Deserialization(e.to_string()))?;

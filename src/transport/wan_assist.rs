@@ -452,6 +452,11 @@ pub mod coordination {
         Ok((their_offer, offset))
     }
 
+    fn apply_signed_offset_ms(base_ms: u64, offset_ms: i64) -> u64 {
+        let adjusted = (base_ms as i128) + (offset_ms as i128);
+        adjusted.clamp(0, u64::MAX as i128) as u64
+    }
+
     /// Coordinazione simultaneous open con rendezvous window
     pub async fn coordinate_simultaneous_open(
         my_offer: &OfferPayload,
@@ -494,14 +499,14 @@ pub mod coordination {
         let rendezvous_window_ms = 30000u64;
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
-        // Applica offset per sincronizzazione
+        // Applica offset per sincronizzazione in modo safe (no wraparound).
         let adjusted_now = if let Some(ntp_offset) = my_offer.ntp_offset {
-            (now_ms as i64 + ntp_offset) as u64
+            apply_signed_offset_ms(now_ms, ntp_offset)
         } else {
             now_ms
         };
 
-        let rendezvous_at_ms = adjusted_now + rendezvous_window_ms;
+        let rendezvous_at_ms = adjusted_now.saturating_add(rendezvous_window_ms);
 
         // 5. Attendi fino al rendezvous time
         let sleep_duration = if rendezvous_at_ms > now_ms {
@@ -523,8 +528,8 @@ pub mod coordination {
         // Proviamo UPnP, STUN, e relay in parallelo
         tracing::info!("Starting simultaneous open handshake");
 
-        // Prepara i parametri
-        let mut params = crate::derive::RendezvousParams {
+        // Prepara i parametri (la versione protocollo resta invariata).
+        let params = crate::derive::RendezvousParams {
             port: my_offer.rendezvous.port,
             key_enc: my_offer.rendezvous.key_enc,
             key_mac: [0u8; 32],
@@ -532,11 +537,6 @@ pub mod coordination {
             tag8: crate::derive::derive_tag8_from_key(&my_offer.rendezvous.key_enc)?,
             version: my_offer.ver,
         };
-
-        // Aggiungi offset per sincronizzazione
-        if let Some(offset) = their_offer.ntp_offset {
-            params.version = params.version.wrapping_add(offset as u8);
-        }
 
         // Prova hole punching simultaneo
         match crate::transport::wan_direct::try_direct_port_forward(params.port).await {
@@ -612,5 +612,20 @@ pub mod coordination {
         };
 
         try_assisted_punch(&params, relay_onions, cfg).await
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::apply_signed_offset_ms;
+
+        #[test]
+        fn signed_offset_clamps_at_zero() {
+            assert_eq!(apply_signed_offset_ms(100, -150), 0);
+        }
+
+        #[test]
+        fn signed_offset_adds_positive_offsets() {
+            assert_eq!(apply_signed_offset_ms(100, 50), 150);
+        }
     }
 }
