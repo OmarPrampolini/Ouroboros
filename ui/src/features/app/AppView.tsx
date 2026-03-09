@@ -1181,6 +1181,7 @@ export function AppView() {
   ]);
 
   const nextGuidedStep = wizardSteps[Math.min(wizardIndex, wizardSteps.length - 1)] ?? "Review flow state";
+  const isConnected = connectStatus?.status === "connected";
   const phaseLabels = ["Derive", "Offer", "Dial", "Noise", "Ready"];
   const phaseState = useMemo<PhaseState[]>(() => {
     const status = (connectStatus?.status || "").toLowerCase();
@@ -1274,6 +1275,18 @@ export function AppView() {
     spaceChunkSizeValid;
   const canSetPassphrase = passphrase.trim().length > 0 && apiReady;
   const canStartAuto = passphrase.trim().length > 0;
+  const allowAdvanced =
+    (flowMode === "space" && wizardIndex >= 3) || (flowMode !== "space" && isConnected);
+  const showDaemonStep = wizardIndex === 0;
+  const showPassphraseStep = usesClassicPass && wizardIndex === 1;
+  const showClassicFlow = flowMode === "classic" && wizardIndex >= 2 && !isConnected;
+  const showOfferFlow = flowMode === "offer" && wizardIndex >= 2 && !isConnected;
+  const showHybridFlow = flowMode === "hybrid" && wizardIndex >= 2 && !isConnected;
+  const showTargetFlow = flowMode === "target" && wizardIndex >= 2 && !isConnected;
+  const showPhraseFlow = flowMode === "phrase" && wizardIndex >= 1 && !isConnected;
+  const showGuaranteedFlow = flowMode === "guaranteed" && wizardIndex >= 1 && !isConnected;
+  const showSpaceFlow = flowMode === "space" && wizardIndex >= 1;
+  const showConnectionStatus = flowMode !== "space" && isConnected;
 
   const tokenStatus = token ? "token loaded" : "token missing";
   const daemonLabel = daemonStatus.running
@@ -1293,6 +1306,12 @@ export function AppView() {
     setShowAdvanced(false);
     setConnectAttempted(false);
   };
+
+  useEffect(() => {
+    if (!allowAdvanced) {
+      setShowAdvanced(false);
+    }
+  }, [allowAdvanced]);
 
   return (
     <div
@@ -1388,11 +1407,16 @@ export function AppView() {
       ) : (
         <>
           <div className="page-header">
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <button className="secondary" onClick={() => setScreen("home")}>Back to flows</button>
-              <button className="secondary" onClick={() => setShowAdvanced((v) => !v)}>
-                {showAdvanced ? "Hide advanced" : "Show advanced"}
-              </button>
+              <span className="status-pill">
+                Step {Math.min(wizardIndex + 1, wizardSteps.length)}/{wizardSteps.length}
+              </span>
+              {allowAdvanced && (
+                <button className="secondary" onClick={() => setShowAdvanced((v) => !v)}>
+                  {showAdvanced ? "Hide advanced" : "Show advanced"}
+                </button>
+              )}
             </div>
             <div>
               <div className="page-title">{FLOW_LABELS[flowMode]}</div>
@@ -1409,9 +1433,10 @@ export function AppView() {
             <div className="guided-next">{nextGuidedStep}</div>
           </div>
 
-          <div className="grid">
-            <div className="panel">
-              <h2>Daemon</h2>
+          <div className="grid guided-grid">
+            {showDaemonStep && (
+              <div className="panel step-panel">
+                <h2>Step 1: Start daemon</h2>
               <label htmlFor="bind">API bind</label>
               <input
                 id="bind"
@@ -1446,9 +1471,11 @@ export function AppView() {
                   Fetch daemon logs
                 </button>
               </div>
+              <div className="helper-text">Completa questo step per sbloccare il successivo.</div>
             </div>
+            )}
 
-            {showAdvanced && (
+            {showAdvanced && allowAdvanced && (
               <div className="panel">
                 <h2>Advanced Settings</h2>
               <div className="field-block">
@@ -1519,7 +1546,7 @@ export function AppView() {
               </div>
             )}
 
-            {usesClassicPass && (
+            {showPassphraseStep && (
               <div className="panel">
                 <h2>Passphrase (Classic/Offer/Target)</h2>
                 <input
@@ -1552,7 +1579,7 @@ export function AppView() {
               </div>
             )}
 
-        {flowMode === "classic" && (
+        {showClassicFlow && (
           <div className="panel">
             <h2>Classic Cascade</h2>
             <div className="checklist">
@@ -1631,7 +1658,7 @@ export function AppView() {
           </div>
         )}
 
-        {flowMode === "offer" && (
+        {showOfferFlow && (
           <div className="panel">
             <h2>Offer QR</h2>
             <div className="helper-text">
@@ -1739,7 +1766,7 @@ export function AppView() {
           </div>
         )}
 
-        {flowMode === "hybrid" && (
+        {showHybridFlow && (
           <div className="panel">
             <h2>Hybrid QR (Resume + Fallback)</h2>
             <div className="helper-text">
@@ -1868,7 +1895,7 @@ export function AppView() {
           </div>
         )}
 
-        {flowMode === "target" && (
+        {showTargetFlow && (
           <div className="panel">
             <h2>Target Direct</h2>
             <div className="helper-text">
@@ -1918,7 +1945,7 @@ export function AppView() {
           </div>
         )}
 
-        {flowMode === "phrase" && (
+        {showPhraseFlow && (
           <div className="panel">
             <h2>Easy Tor (Phrase)</h2>
             <div className="helper-text">
@@ -1995,7 +2022,7 @@ export function AppView() {
           </div>
         )}
 
-        {flowMode === "guaranteed" && (
+        {showGuaranteedFlow && (
           <div className="panel">
             <h2>Guaranteed Relay</h2>
             <div className="checklist">
@@ -2045,9 +2072,15 @@ export function AppView() {
           </div>
         )}
 
-        {flowMode === "space" && (
-          <div className="panel">
+        {showSpaceFlow && (
+          <div className="panel step-panel space-panel">
             <h2>EtherSync Space</h2>
+            <div className="space-focus">
+              <div className="space-focus-id">SPACE ID: {spaceJoinedId || "NOT JOINED"}</div>
+              <div className="space-focus-meta">
+                node: {spaceStatus?.local_addr ?? "-"} | peers: {spaceStatus?.peer_count ?? 0} | stream: {spaceSseState}
+              </div>
+            </div>
             <div className="helper-text">
               Start the EtherSync node, join a space with a passphrase, then publish messages.
             </div>
@@ -2333,8 +2366,9 @@ export function AppView() {
           </div>
         )}
 
-        <div className="panel">
-          <h2>Status</h2>
+        {showConnectionStatus && (
+          <div className="panel step-panel">
+            <h2>Connected Session</h2>
           <div style={{ fontSize: 13 }}>
             {connectStatus ? (
               <div>
@@ -2369,20 +2403,21 @@ export function AppView() {
             <br />
             daemon exit: {daemonStatus.last_exit_code ?? "-"}
           </div>
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button className="secondary" onClick={refreshStatus} disabled={!apiReady}>
-              Refresh
-            </button>
-            <button className="secondary" onClick={() => setSseEnabled(true)} disabled={!apiReady}>
-              Start SSE
-            </button>
-            <button className="secondary" onClick={() => setSseEnabled(false)} disabled={!apiReady}>
-              Stop SSE
-            </button>
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button className="secondary" onClick={refreshStatus} disabled={!apiReady}>
+                Refresh
+              </button>
+              <button className="secondary" onClick={() => setSseEnabled(true)} disabled={!apiReady}>
+                Start SSE
+              </button>
+              <button className="secondary" onClick={() => setSseEnabled(false)} disabled={!apiReady}>
+                Stop SSE
+              </button>
+            </div>
           </div>
-        </div>
+        )}
 
-        {showAdvanced && (
+        {showAdvanced && allowAdvanced && (
           <>
             <div className="panel">
               <h2>Network Diagnostics</h2>
@@ -2468,7 +2503,7 @@ export function AppView() {
     </>
   )}
 
-      {screen === "mode" && showAdvanced && (
+      {screen === "mode" && showAdvanced && allowAdvanced && (
         <ConsolePanel
           logs={filtered}
           filter={filter}

@@ -116,6 +116,10 @@ body.theme-ethersync {
   gap: 20px;
 }
 
+.guided-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .home {
   display: grid;
   gap: 24px;
@@ -399,6 +403,31 @@ body.theme-ethersync {
   font-weight: 600;
 }
 
+.step-panel {
+  min-height: 240px;
+}
+
+.space-focus {
+  margin-top: 8px;
+  margin-bottom: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--panel-border);
+  background: rgba(0, 255, 154, 0.08);
+}
+
+.space-focus-id {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.space-focus-meta {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
 .flow-steps {
   margin: 0 0 12px 18px;
   padding: 0;
@@ -631,6 +660,15 @@ button.warning { background: var(--warn); }
 
 .app-track-ethersync .guided-next {
   background: rgba(201, 162, 39, 0.12);
+}
+
+.app-track-ethersync .space-focus {
+  background: rgba(201, 162, 39, 0.16);
+  border-color: rgba(201, 162, 39, 0.42);
+}
+
+.app-track-ethersync .space-focus-id {
+  color: #2b241a;
 }
 
 .app-track-ethersync input,
