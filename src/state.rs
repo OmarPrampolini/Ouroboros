@@ -1,10 +1,10 @@
 use crate::security::RateLimiter;
 use base64::{engine::general_purpose, Engine as _};
-use ethersync::{EtherNode, NodeConfig};
+use ethersync::{EtherCoordinate, EtherNode, NodeConfig};
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -550,16 +550,27 @@ impl AppState {
         }
         let space_id = derive_space_id(&passphrase, label.as_deref());
 
-        let (node, events_tx) = {
+        let (node, events_tx, already_subscribed) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
                 return Err(anyhow::anyhow!("ethersync is not running"));
             };
-            if rt.subscriptions.contains_key(&space_id) {
-                return Ok(EtherSyncJoinResult { space_id });
-            }
-            (rt.node.clone(), rt.events_tx.clone())
+            (
+                rt.node.clone(),
+                rt.events_tx.clone(),
+                rt.subscriptions.contains_key(&space_id),
+            )
         };
+
+        if already_subscribed {
+            let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
+            tracing::info!(
+                "ethersync join replayed {} message(s) for existing subscription {}",
+                replayed,
+                space_id
+            );
+            return Ok(EtherSyncJoinResult { space_id });
+        }
 
         let mut rx = node
             .subscribe(&passphrase)
@@ -650,6 +661,7 @@ impl AppState {
             }
         });
 
+        let mut inserted = false;
         let mut inner = self.inner.lock().await;
         if let Some(rt) = inner.ethersync.as_mut() {
             if rt.subscriptions.contains_key(&space_id) {
@@ -669,10 +681,21 @@ impl AppState {
                         error: None,
                     },
                 );
+                inserted = true;
             }
         } else {
             task.abort();
             return Err(anyhow::anyhow!("ethersync was stopped"));
+        }
+        drop(inner);
+
+        if inserted {
+            let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
+            tracing::info!(
+                "ethersync join replayed {} message(s) for new subscription {}",
+                replayed,
+                space_id
+            );
         }
 
         Ok(EtherSyncJoinResult { space_id })
@@ -852,6 +875,127 @@ impl AppState {
     }
 }
 
+async fn replay_space_backlog(
+    node: &Arc<EtherNode>,
+    events_tx: &broadcast::Sender<String>,
+    passphrase: &str,
+    space_id: &str,
+) -> usize {
+    emit_ethersync_event(
+        events_tx,
+        EtherSyncEvent {
+            kind: "space_replay_started".to_string(),
+            ts_ms: now_ms(),
+            space_id: Some(space_id.to_string()),
+            slot_id: None,
+            payload_b64: None,
+            text: None,
+            info: Some("replaying recent slot window".to_string()),
+            error: None,
+        },
+    );
+
+    let slots = EtherCoordinate::lookback_window(EtherCoordinate::current_slot());
+    let mut backlog = Vec::new();
+
+    {
+        let storage = node.storage().lock().await;
+        for slot in slots {
+            if let Ok(messages) = storage.get_slot_messages(slot) {
+                backlog.extend(messages);
+            }
+        }
+    }
+
+    backlog.sort_by_key(|m| (m.header.slot_id, m.header.fragment_index));
+
+    let mut replayed = 0usize;
+    let mut seen = HashSet::new();
+
+    for message in backlog {
+        let msg_hash = blake3_hash(&message.to_bytes());
+        if !seen.insert(msg_hash) {
+            continue;
+        }
+
+        match message.decrypt(passphrase) {
+            Ok(payload) => {
+                if let Ok(file_chunk) =
+                    serde_json::from_slice::<EtherSyncFileChunkEnvelope>(&payload)
+                {
+                    if file_chunk.kind == "file_chunk" {
+                        emit_ethersync_event(
+                            events_tx,
+                            EtherSyncEvent {
+                                kind: "space_file_chunk".to_string(),
+                                ts_ms: now_ms(),
+                                space_id: Some(space_id.to_string()),
+                                slot_id: Some(message.header.slot_id),
+                                payload_b64: Some(general_purpose::STANDARD.encode(payload)),
+                                text: None,
+                                info: Some(format!(
+                                    "replay {} ({}/{})",
+                                    file_chunk.filename,
+                                    file_chunk.chunk_index + 1,
+                                    file_chunk.total_chunks
+                                )),
+                                error: None,
+                            },
+                        );
+                        replayed = replayed.saturating_add(1);
+                        continue;
+                    }
+                }
+
+                emit_ethersync_event(
+                    events_tx,
+                    EtherSyncEvent {
+                        kind: "space_message".to_string(),
+                        ts_ms: now_ms(),
+                        space_id: Some(space_id.to_string()),
+                        slot_id: Some(message.header.slot_id),
+                        payload_b64: Some(general_purpose::STANDARD.encode(&payload)),
+                        text: String::from_utf8(payload).ok(),
+                        info: Some("replay".to_string()),
+                        error: None,
+                    },
+                );
+                replayed = replayed.saturating_add(1);
+            }
+            Err(e) => {
+                emit_ethersync_event(
+                    events_tx,
+                    EtherSyncEvent {
+                        kind: "space_message_error".to_string(),
+                        ts_ms: now_ms(),
+                        space_id: Some(space_id.to_string()),
+                        slot_id: Some(message.header.slot_id),
+                        payload_b64: None,
+                        text: None,
+                        info: Some("replay".to_string()),
+                        error: Some(e.to_string()),
+                    },
+                );
+            }
+        }
+    }
+
+    emit_ethersync_event(
+        events_tx,
+        EtherSyncEvent {
+            kind: "space_replay_completed".to_string(),
+            ts_ms: now_ms(),
+            space_id: Some(space_id.to_string()),
+            slot_id: None,
+            payload_b64: None,
+            text: None,
+            info: Some(format!("replayed {} message(s)", replayed)),
+            error: None,
+        },
+    );
+
+    replayed
+}
 fn emit_ethersync_event(events_tx: &broadcast::Sender<String>, event: EtherSyncEvent) {
     if let Ok(json) = serde_json::to_string(&event) {
         let _ = events_tx.send(json);
@@ -895,3 +1039,4 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
