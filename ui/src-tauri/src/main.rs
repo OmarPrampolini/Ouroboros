@@ -39,6 +39,7 @@ async fn start_daemon(
   api_bind: String,
   unsafe_expose_api: bool,
   pluggable_transport: Option<String>,
+  pluggable_profile: Option<String>,
   realtls_domain: Option<String>,
   stealth_mode: Option<String>,
   assist_relays: Option<String>,
@@ -85,6 +86,9 @@ async fn start_daemon(
   let clean = |value: Option<String>| -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
   };
+  if let Some(profile) = clean(pluggable_profile) {
+    cmd = cmd.env("HANDSHACKE_PLUGGABLE_PROFILE", profile.to_lowercase());
+  }
 
   if let Some(pt) = clean(pluggable_transport) {
     let pt = pt.to_lowercase();
@@ -225,3 +229,4 @@ fn main() {
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
+

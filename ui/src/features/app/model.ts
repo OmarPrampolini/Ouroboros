@@ -5,6 +5,7 @@ export const WAN_MODES = ["auto", "direct", "tor"] as const;
 export const TOR_ROLES = ["client", "host"] as const;
 export const GUARANTEED_EGRESS = ["public", "tor"] as const;
 export const PLUGGABLE_TRANSPORTS = ["none", "https", "ftp", "dns", "websocket", "quic"] as const;
+export const PLUGGABLE_PROFILES = ["stable", "experimental"] as const;
 export const STEALTH_MODES = ["active", "passive", "mdns"] as const;
 export const FLOW_MODES = ["classic", "offer", "hybrid", "target", "phrase", "guaranteed", "space"] as const;
 
@@ -92,7 +93,10 @@ export interface HybridQrResponse {
 
 export interface PluggableCheckResponse {
   pluggable_transport: {
+    profile: "stable" | "experimental";
     enabled: boolean;
+    mode: string;
+    mode_class: "stable" | "experimental";
     status: string;
     checklist: {
       real_tls: string;

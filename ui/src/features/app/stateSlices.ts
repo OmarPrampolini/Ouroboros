@@ -8,6 +8,7 @@ import {
   GUARANTEED_EGRESS,
   HybridQrResponse,
   OfferResponse,
+  PLUGGABLE_PROFILES,
   PLUGGABLE_TRANSPORTS,
   PluggableCheckResponse,
   ROLE_OPTIONS,
@@ -191,6 +192,8 @@ export function useGuaranteedSlice() {
 }
 
 export function useAdvancedSlice() {
+  const [pluggableProfile, setPluggableProfile] =
+    useState<(typeof PLUGGABLE_PROFILES)[number]>("stable");
   const [pluggableTransport, setPluggableTransport] =
     useState<(typeof PLUGGABLE_TRANSPORTS)[number]>("none");
   const [realTlsDomain, setRealTlsDomain] = useState<string>("");
@@ -203,6 +206,8 @@ export function useAdvancedSlice() {
   const [metrics, setMetrics] = useState<DebugMetricsResponse | null>(null);
 
   return {
+    pluggableProfile,
+    setPluggableProfile,
     pluggableTransport,
     setPluggableTransport,
     realTlsDomain,

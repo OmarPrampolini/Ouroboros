@@ -24,6 +24,7 @@ import {
   GUARANTEED_EGRESS,
   HybridQrResponse,
   OfferResponse,
+  PLUGGABLE_PROFILES,
   PLUGGABLE_TRANSPORTS,
   PluggableCheckResponse,
   ROLE_OPTIONS,
@@ -189,6 +190,8 @@ export function AppView() {
     setSpaceEvents
   } = useSpaceSlice();
   const {
+    pluggableProfile,
+    setPluggableProfile,
     pluggableTransport,
     setPluggableTransport,
     realTlsDomain,
@@ -425,6 +428,7 @@ export function AppView() {
       return;
     }
 
+    const cleanedPluggableProfile = pluggableProfile.trim() || undefined;
     const cleanedPluggable =
       pluggableTransport === "none" ? undefined : pluggableTransport;
     const cleanedRealTlsDomain = realTlsDomain.trim() || undefined;
@@ -438,6 +442,7 @@ export function AppView() {
         apiBind,
         unsafeExposeApi: unsafeExpose,
         pluggableTransport: cleanedPluggable,
+        pluggableProfile: cleanedPluggableProfile,
         realTlsDomain: cleanedRealTlsDomain,
         stealthMode: cleanedStealthMode,
         assistRelays: cleanedAssistRelays,
@@ -458,6 +463,7 @@ export function AppView() {
   }, [
     apiBind,
     unsafeExpose,
+    pluggableProfile,
     pluggableTransport,
     realTlsDomain,
     stealthMode,
@@ -1300,6 +1306,20 @@ export function AppView() {
             <div className="panel">
               <h2>Advanced Settings</h2>
               <div className="field-block">
+                <div className="field-label">Pluggable profile</div>
+                <div className="mode-row">
+                  {PLUGGABLE_PROFILES.map((profile) => (
+                    <div
+                      key={profile}
+                      className={`mode-pill ${pluggableProfile === profile ? "active" : ""}`}
+                      onClick={() => setPluggableProfile(profile)}
+                    >
+                      {profile}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="field-block">
                 <div className="field-label">Pluggable transport</div>
                 <div className="mode-row">
                   {PLUGGABLE_TRANSPORTS.map((pt) => (
@@ -1318,7 +1338,7 @@ export function AppView() {
                 value={realTlsDomain}
                 onChange={(e) => setRealTlsDomain(e.target.value)}
               />
-              <div className="helper-text">RealTLS overrides pluggable transport.</div>
+              <div className="helper-text">RealTLS overrides pluggable transport. In stable profile, experimental transports are blocked.</div>
               <div className="field-block">
                 <div className="field-label">Stealth mode</div>
                 <div className="mode-row">
@@ -2265,6 +2285,12 @@ export function AppView() {
           <div style={{ fontSize: 13, marginTop: 8 }}>
             {pluggableCheck ? (
               <div>
+                profile: {pluggableCheck.pluggable_transport.profile}
+                <br />
+                mode: {pluggableCheck.pluggable_transport.mode}
+                <br />
+                mode_class: {pluggableCheck.pluggable_transport.mode_class}
+                <br />
                 enabled: {String(pluggableCheck.pluggable_transport.enabled)}
                 <br />
                 status: {pluggableCheck.pluggable_transport.status}
@@ -2302,6 +2328,4 @@ export function AppView() {
     </div>
   );
 }
-
-
 

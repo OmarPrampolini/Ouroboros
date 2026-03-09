@@ -22,7 +22,10 @@ pub mod tor;
 pub mod transport;
 
 // Stable public surface. Keep this list explicit to avoid leaking internal APIs.
-pub use config::{Config, GuaranteedEgress, PluggableTransportMode, ProductMode, TorRole, WanMode};
+pub use config::{
+    Config, GuaranteedEgress, PluggableProfile, PluggableTransportMode, ProductMode, TorRole,
+    WanMode,
+};
 pub use crypto::CryptoError;
 pub use derive::{
     derive_from_passphrase_v1, derive_from_passphrase_v2, DeriveError, RendezvousParams,

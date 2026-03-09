@@ -64,6 +64,35 @@ pub enum PluggableTransportMode {
     Quic,            // QUIC mimicry
 }
 
+impl PluggableTransportMode {
+    pub fn id(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::HttpsLike => "httpslike",
+            Self::FtpData => "ftpdata",
+            Self::DnsTunnel => "dnstunnel",
+            Self::RealTls(_) => "realtls",
+            Self::WebSocket => "websocket",
+            Self::Quic => "quic",
+        }
+    }
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::None | Self::HttpsLike | Self::FtpData | Self::DnsTunnel => "stable",
+            Self::RealTls(_) | Self::WebSocket | Self::Quic => "experimental",
+        }
+    }
+    pub fn requires_external_infra(&self) -> bool {
+        matches!(self, Self::RealTls(_) | Self::WebSocket)
+    }
+}
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PluggableProfile {
+    #[default]
+    Stable,
+    Experimental,
+}
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub api_bind: String, // "127.0.0.1:3000"
@@ -104,6 +133,7 @@ pub struct Config {
     pub nat_detection_servers: Vec<String>,
 
     // Pluggable Transport settings
+    pub pluggable_profile: PluggableProfile,
     pub pluggable_transport: PluggableTransportMode,
     pub pluggable_tls_domains: Vec<String>, // Domains for RealTls mode
     pub pluggable_ws_host: String,          // Host header for WebSocket mimic
@@ -155,6 +185,7 @@ impl Config {
             guaranteed_topic_window_ms: 300_000,
             tor_bin_path: None,
             // Pluggable Transport default
+            pluggable_profile: PluggableProfile::default(),
             pluggable_transport: PluggableTransportMode::default(),
             pluggable_tls_domains: vec!["www.cloudflare.com".into(), "api.google.com".into()],
             pluggable_ws_host: "www.cloudflare.com".into(),
@@ -328,8 +359,14 @@ impl Config {
                 config.key_rotation_grace_s = value;
             }
         }
-
         // Pluggable Transport settings
+        if let Ok(profile) = std::env::var("HANDSHACKE_PLUGGABLE_PROFILE") {
+            config.pluggable_profile = match profile.to_lowercase().as_str() {
+                "experimental" | "exp" => PluggableProfile::Experimental,
+                _ => PluggableProfile::Stable,
+            };
+        }
+
         if let Ok(pt) = std::env::var("HANDSHACKE_PLUGGABLE_TRANSPORT") {
             config.pluggable_transport = match pt.to_lowercase().as_str() {
                 "https" | "httpslike" => PluggableTransportMode::HttpsLike,
@@ -339,13 +376,6 @@ impl Config {
                 "quic" => PluggableTransportMode::Quic,
                 _ => PluggableTransportMode::None,
             };
-
-            if config.pluggable_transport != PluggableTransportMode::None {
-                tracing::warn!(
-                    "PLUGGABLE_TRANSPORT WARNING: experimental feature enabled via HANDSHACKE_PLUGGABLE_TRANSPORT={}. This requires external server-side infrastructure (protocol-specific mimic + TLS/certs where applicable). If you are not operating that infrastructure, connections may fail or be fingerprintable.",
-                    pt
-                );
-            }
         }
 
         // Parse RealTls domain if specified
@@ -357,6 +387,24 @@ impl Config {
                     domain
                 );
             }
+        }
+
+        if config.pluggable_profile == PluggableProfile::Stable
+            && config.pluggable_transport.class() == "experimental"
+        {
+            tracing::warn!(
+                "PLUGGABLE_PROFILE=stable blocks experimental transport {:?}. Falling back to none.",
+                config.pluggable_transport
+            );
+            config.pluggable_transport = PluggableTransportMode::None;
+        } else if config.pluggable_transport.class() == "experimental"
+            && config.pluggable_transport != PluggableTransportMode::None
+        {
+            tracing::warn!(
+                "PLUGGABLE_TRANSPORT WARNING: experimental feature enabled ({:?}) with profile={:?}. This may require external server-side infrastructure and can be fingerprintable if misconfigured.",
+                config.pluggable_transport,
+                config.pluggable_profile
+            );
         }
 
         if let Ok(domains) = std::env::var("HANDSHACKE_REALTLS_DOMAINS") {

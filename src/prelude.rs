@@ -1,5 +1,6 @@
 pub use crate::config::{
-    Config, GuaranteedEgress, PluggableTransportMode, ProductMode, TorRole, WanMode,
+    Config, GuaranteedEgress, PluggableProfile, PluggableTransportMode, ProductMode, TorRole,
+    WanMode,
 };
 pub use crate::offer::{
     Endpoint, EndpointKind, OfferError, OfferPayload, RendezvousInfo, RoleHint,
