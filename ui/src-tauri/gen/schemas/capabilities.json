@@ -1,1 +1,1 @@
-{"main":{"identifier":"main","description":"Default capabilities","local":true,"windows":["main"],"permissions":["core:default","fs:scope-appdata-recursive","fs:allow-read-file","fs:allow-read-text-file","fs:allow-write-file","fs:allow-exists"]}}
+{"main":{"identifier":"main","description":"Default capabilities","local":true,"windows":["main"],"permissions":["core:default","shell:default"]}}

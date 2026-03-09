@@ -116,3 +116,5 @@ dht = ["dep:libp2p"]
 
 [workspace]
 members = [ "ethersync","ouroboros-crypto"]
+exclude = ["ui/src-tauri"]
+

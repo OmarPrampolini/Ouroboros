@@ -4,10 +4,6 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "fs:scope-appdata-recursive",
-    "fs:allow-read-file",
-    "fs:allow-read-text-file",
-    "fs:allow-write-file",
-    "fs:allow-exists"
+    "shell:default"
   ]
 }
