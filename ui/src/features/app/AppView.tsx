@@ -51,6 +51,18 @@ const SPACE_CHUNK_SIZE_DEFAULT = 1024;
 const SPACE_CHUNK_SIZE_MIN = 256;
 const SPACE_CHUNK_SIZE_MAX = 12288;
 
+const HANDSHAKE_FLOW_MODES: readonly FlowMode[] = [
+  "classic",
+  "offer",
+  "hybrid",
+  "target",
+  "phrase",
+  "guaranteed"
+];
+const ETHERSYNC_FLOW_MODES: readonly FlowMode[] = ["space"];
+
+type ProductTrack = "handshake" | "ethersync";
+
 type SpaceIncomingTransfer = {
   transfer_id: string;
   filename: string;
@@ -216,6 +228,8 @@ export function AppView() {
   const [spaceIncomingFiles, setSpaceIncomingFiles] = useState<Record<string, SpaceIncomingTransfer>>(
     {}
   );
+  const [homeTrack, setHomeTrack] = useState<"selector" | ProductTrack>("selector");
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const apiUrl = useMemo(() => `http://${apiBind}`, [apiBind]);
   const authHeader = useMemo(
@@ -1077,6 +1091,26 @@ export function AppView() {
     handleSpaceStatus();
   }, [daemonStatus.running, token, flowMode, handleSpaceStatus]);
 
+  const flowTrack: ProductTrack = flowMode === "space" ? "ethersync" : "handshake";
+  const currentTrack: ProductTrack =
+    screen === "mode" ? flowTrack : homeTrack === "selector" ? "handshake" : homeTrack;
+  const visibleModes =
+    homeTrack === "ethersync" ? ETHERSYNC_FLOW_MODES : HANDSHAKE_FLOW_MODES;
+
+  useEffect(() => {
+    setShowAdvanced(false);
+  }, [flowMode]);
+
+  useEffect(() => {
+    const handshakeClass = "theme-handshake";
+    const ethersyncClass = "theme-ethersync";
+    document.body.classList.remove(handshakeClass, ethersyncClass);
+    document.body.classList.add(currentTrack === "ethersync" ? ethersyncClass : handshakeClass);
+    return () => {
+      document.body.classList.remove(handshakeClass, ethersyncClass);
+    };
+  }, [currentTrack]);
+
   const universeId = useMemo(() => {
     if (!setPassResult) return "";
     const tag16 = setPassResult.tag16.toString(16).padStart(4, "0").toUpperCase();
@@ -1087,14 +1121,66 @@ export function AppView() {
     return `HS-${tag16}`;
   }, [setPassResult]);
 
-  const wizardSteps = ["Daemon", "Flow", "Connect", "Chat"];
+  const wizardSteps = FLOW_STEPS[flowMode];
   const wizardIndex = useMemo(() => {
-    if (connectStatus?.status === "connected") return 3;
-    if (connectAttempted) return 2;
-    if (daemonStatus.running) return 1;
-    return 0;
-  }, [connectStatus, connectAttempted, daemonStatus.running]);
+    if (!daemonStatus.running) return 0;
 
+    switch (flowMode) {
+      case "classic":
+        if (!passphrase.trim()) return 1;
+        if (!connectAttempted) return 2;
+        return 3;
+      case "offer":
+        if (!passphrase.trim()) return 1;
+        if (!offerResult) return 2;
+        if (!connectAttempted) return 3;
+        return 3;
+      case "hybrid":
+        if (!passphrase.trim()) return 1;
+        if (!hybridQrResult) return 2;
+        if (!connectAttempted) return 3;
+        return 3;
+      case "target":
+        if (!passphrase.trim()) return 1;
+        if (!classicTarget.trim()) return 2;
+        if (!connectAttempted) return 3;
+        return 3;
+      case "phrase":
+        if (!phraseInvite.trim()) return 1;
+        if (!joinInvite.trim()) return 2;
+        if (!connectAttempted) return 3;
+        return 3;
+      case "guaranteed":
+        if (!guaranteedPassphrase.trim()) return 1;
+        if (!guaranteedEgress.trim()) return 2;
+        if (!connectAttempted) return 3;
+        return 3;
+      case "space":
+        if (!spaceStatus?.running) return 1;
+        if (!spaceJoinedId) return 2;
+        if (spaceEvents.length === 0) return 3;
+        return 3;
+      default:
+        return 0;
+    }
+  }, [
+    daemonStatus.running,
+    flowMode,
+    passphrase,
+    connectAttempted,
+    offerResult,
+    hybridQrResult,
+    classicTarget,
+    phraseInvite,
+    joinInvite,
+    guaranteedPassphrase,
+    guaranteedEgress,
+    spaceStatus,
+    spaceJoinedId,
+    spaceEvents
+  ]);
+
+  const nextGuidedStep = wizardSteps[Math.min(wizardIndex, wizardSteps.length - 1)] ?? "Review flow state";
   const phaseLabels = ["Derive", "Offer", "Dial", "Noise", "Ready"];
   const phaseState = useMemo<PhaseState[]>(() => {
     const status = (connectStatus?.status || "").toLowerCase();
@@ -1172,7 +1258,10 @@ export function AppView() {
       : null);
 
   const usesClassicPass =
-    flowMode === "classic" || flowMode === "offer" || flowMode === "target";
+    flowMode === "classic" ||
+    flowMode === "offer" ||
+    flowMode === "hybrid" ||
+    flowMode === "target";
   const tokenReady = Boolean(token);
   const apiReady = daemonStatus.running && tokenReady;
   const canSpaceStartAndJoin =
@@ -1191,40 +1280,87 @@ export function AppView() {
     ? `running pid ${daemonStatus.pid ?? "?"}`
     : "stopped";
   const statusLabel = `${daemonLabel} | ${apiBind} | ${tokenStatus} | SSE ${sseState}`;
+  const productLabel = currentTrack === "ethersync" ? "ETHERSYNC" : "HANDSHAKE";
   const mark = (ok: boolean) => (ok ? "[x]" : "[ ]");
+  const selectTrack = (track: ProductTrack) => {
+    setHomeTrack(track);
+  };
+  const resetTrackSelector = () => setHomeTrack("selector");
   const selectMode = (mode: FlowMode) => {
+    setHomeTrack(mode === "space" ? "ethersync" : "handshake");
     setFlowMode(mode);
     setScreen("mode");
+    setShowAdvanced(false);
     setConnectAttempted(false);
   };
 
   return (
-    <div className="app">
-      <TopBar statusLabel={statusLabel} universeId={universeId} />
+    <div
+      className={`app ${currentTrack === "ethersync" ? "app-track-ethersync" : "app-track-handshake"}`}
+    >
+      <TopBar statusLabel={statusLabel} universeId={universeId} brandLabel={productLabel} />
       {warningBanner && <div className="banner">{warningBanner}</div>}
 
       {screen === "home" ? (
         <div className="home">
-          <div className="hero">
-            <h1>Handshacke Matrix Console</h1>
-            <p>
-              Choose a connection mode. Each mode has a guided page with exact steps.
-            </p>
-          </div>
-          <div className="mode-grid">
-            {FLOW_MODES.map((mode) => (
-              <div key={mode} className="mode-card" onClick={() => selectMode(mode)}>
-                <div className="mode-title">{FLOW_LABELS[mode]}</div>
-                <div className="mode-desc">{FLOW_DESC[mode]}</div>
-                <ul className="mode-steps">
-                  {FLOW_STEPS[mode].map((step) => (
-                    <li key={step}>{step}</li>
-                  ))}
-                </ul>
-                <button className="mode-cta">Open</button>
+          {homeTrack === "selector" ? (
+            <>
+              <div className="hero hero-entry">
+                <h1>OUROBOROS</h1>
               </div>
-            ))}
-          </div>
+              <div className="track-grid">
+                <div className="track-card track-card-handshake" onClick={() => selectTrack("handshake")}>
+                  <div className="track-label">A</div>
+                  <div className="mode-title">Handshake Matrix</div>
+                  <div className="mode-desc">
+                    Tutti i flow di connessione (classic/offer/hybrid/target/phrase/guaranteed)
+                    con routing aggressivo.
+                  </div>
+                  <button className="mode-cta">Open Handshake</button>
+                </div>
+                <div className="track-card track-card-ethersync" onClick={() => selectTrack("ethersync")}>
+                  <div className="track-label">B</div>
+                  <div className="mode-title">EtherSync Gold</div>
+                  <div className="mode-desc">
+                    Workspace realtime dedicato a space, messaggi e file chunked con UX separata.
+                  </div>
+                  <button className="mode-cta">Open EtherSync</button>
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="page-header">
+                <button className="secondary" onClick={resetTrackSelector}>
+                  Switch product
+                </button>
+                <div>
+                  <div className="page-title">
+                    {homeTrack === "handshake" ? "Handshake Flows" : "EtherSync Flows"}
+                  </div>
+                  <div className="page-subtitle">
+                    {homeTrack === "handshake"
+                      ? "Modalita guidate per pairing e connessione resilienti."
+                      : "Modalita guidata space-first per collaborazione e sincronizzazione."}
+                  </div>
+                </div>
+              </div>
+              <div className="mode-grid">
+                {visibleModes.map((mode) => (
+                  <div key={mode} className="mode-card" onClick={() => selectMode(mode)}>
+                    <div className="mode-title">{FLOW_LABELS[mode]}</div>
+                    <div className="mode-desc">{FLOW_DESC[mode]}</div>
+                    <ul className="mode-steps">
+                      {FLOW_STEPS[mode].map((step) => (
+                        <li key={step}>{step}</li>
+                      ))}
+                    </ul>
+                    <button className="mode-cta">Open</button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
           <div className="panel">
             <h2>System Status</h2>
             <div style={{ fontSize: 13 }}>
@@ -1252,9 +1388,12 @@ export function AppView() {
       ) : (
         <>
           <div className="page-header">
-            <button className="secondary" onClick={() => setScreen("home")}>
-              Back to modes
-            </button>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button className="secondary" onClick={() => setScreen("home")}>Back to flows</button>
+              <button className="secondary" onClick={() => setShowAdvanced((v) => !v)}>
+                {showAdvanced ? "Hide advanced" : "Show advanced"}
+              </button>
+            </div>
             <div>
               <div className="page-title">{FLOW_LABELS[flowMode]}</div>
               <div className="page-subtitle">{FLOW_DESC[flowMode]}</div>
@@ -1263,6 +1402,12 @@ export function AppView() {
 
           <WizardSteps steps={wizardSteps} activeIndex={wizardIndex} />
           <PhaseBar phases={phases} />
+
+          <div className="panel guided-panel">
+            <h2>Guided Next Step</h2>
+            <div className="helper-text">Flow corrente: {FLOW_LABELS[flowMode]}</div>
+            <div className="guided-next">{nextGuidedStep}</div>
+          </div>
 
           <div className="grid">
             <div className="panel">
@@ -1303,8 +1448,9 @@ export function AppView() {
               </div>
             </div>
 
-            <div className="panel">
-              <h2>Advanced Settings</h2>
+            {showAdvanced && (
+              <div className="panel">
+                <h2>Advanced Settings</h2>
               <div className="field-block">
                 <div className="field-label">Pluggable profile</div>
                 <div className="mode-row">
@@ -1369,8 +1515,9 @@ export function AppView() {
                 value={torOnionAddr}
                 onChange={(e) => setTorOnionAddr(e.target.value)}
               />
-              <div className="helper-text">Restart daemon to apply changes.</div>
-            </div>
+                <div className="helper-text">Restart daemon to apply changes.</div>
+              </div>
+            )}
 
             {usesClassicPass && (
               <div className="panel">
@@ -2235,8 +2382,10 @@ export function AppView() {
           </div>
         </div>
 
-        <div className="panel">
-          <h2>Network Diagnostics</h2>
+        {showAdvanced && (
+          <>
+            <div className="panel">
+              <h2>Network Diagnostics</h2>
           <div className="helper-text">
             This panel reflects live, RAM-only diagnostics. No data is persisted.
           </div>
@@ -2254,9 +2403,9 @@ export function AppView() {
                 <br />
                 packet_loss: {metrics.connection.packet_loss_rate.toFixed(2)}%
                 <br />
-                encrypt_avg: {metrics.connection.avg_encrypt_us.toFixed(1)} µs
+                encrypt_avg: {metrics.connection.avg_encrypt_us.toFixed(1)} us
                 <br />
-                decrypt_avg: {metrics.connection.avg_decrypt_us.toFixed(1)} µs
+                decrypt_avg: {metrics.connection.avg_decrypt_us.toFixed(1)} us
                 <br />
                 connection_errors: {metrics.connection.connection_errors}
               </div>
@@ -2313,11 +2462,13 @@ export function AppView() {
             </button>
           </div>
         </div>
+          </>
+        )}
       </div>
     </>
   )}
 
-      {screen === "mode" && (
+      {screen === "mode" && showAdvanced && (
         <ConsolePanel
           logs={filtered}
           filter={filter}

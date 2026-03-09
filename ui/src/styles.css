@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Cormorant+Garamond:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap");
 
 :root {
   color-scheme: dark;
@@ -13,21 +13,46 @@
   --panel: rgba(7, 14, 10, 0.88);
   --panel-border: rgba(0, 255, 154, 0.18);
   --shadow: rgba(0, 0, 0, 0.6);
+  --font-main: "Chakra Petch", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Consolas", monospace;
 }
 
 * { box-sizing: border-box; }
 
 body {
   margin: 0;
-  font-family: "Chakra Petch", "Segoe UI", sans-serif;
+  font-family: var(--font-main);
   color: var(--ink-1);
+  min-height: 100vh;
+}
+
+body.theme-handshake {
+  color-scheme: dark;
   background: radial-gradient(circle at 12% 15%, rgba(0, 255, 154, 0.18), transparent 45%),
     radial-gradient(circle at 85% 20%, rgba(0, 199, 122, 0.16), transparent 50%),
     repeating-linear-gradient(180deg, rgba(0, 255, 154, 0.04) 0, rgba(0, 255, 154, 0.04) 1px, transparent 1px, transparent 4px),
     linear-gradient(160deg, var(--bg-1), var(--bg-2));
-  min-height: 100vh;
 }
 
+body.theme-ethersync {
+  color-scheme: light;
+  --bg-1: #f6efe2;
+  --bg-2: #fdf9f1;
+  --ink-1: #2b241a;
+  --ink-2: #6f624e;
+  --accent: #c9a227;
+  --accent-2: #ad8a1f;
+  --ok: #5f8f45;
+  --warn: #d46a52;
+  --panel: rgba(255, 251, 241, 0.92);
+  --panel-border: rgba(201, 162, 39, 0.35);
+  --shadow: rgba(65, 44, 10, 0.18);
+  --font-main: "Cormorant Garamond", "Times New Roman", serif;
+  --font-mono: "Space Grotesk", "Segoe UI", sans-serif;
+  background: radial-gradient(circle at 14% 14%, rgba(201, 162, 39, 0.22), transparent 44%),
+    radial-gradient(circle at 86% 18%, rgba(236, 214, 164, 0.44), transparent 48%),
+    linear-gradient(140deg, var(--bg-1), var(--bg-2));
+}
 .app {
   display: flex;
   flex-direction: column;
@@ -111,6 +136,13 @@ body {
   text-transform: uppercase;
 }
 
+.hero-entry h1 {
+  margin: 0;
+  font-size: clamp(58px, 14vw, 132px);
+  letter-spacing: 0.24em;
+  line-height: 0.88;
+}
+
 .hero p {
   margin: 0;
   color: var(--ink-2);
@@ -122,6 +154,68 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 16px;
+}
+
+.track-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+}
+
+.track-card {
+  padding: 22px;
+  border-radius: 18px;
+  border: 1px solid var(--panel-border);
+  background: var(--panel);
+  box-shadow: 0 16px 26px var(--shadow);
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border 0.2s ease;
+}
+
+.track-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(0, 255, 154, 0.5);
+}
+
+.track-card-handshake {
+  border-color: rgba(0, 255, 154, 0.22);
+  background: rgba(6, 12, 9, 0.88);
+}
+
+.track-card-ethersync {
+  border-color: rgba(201, 162, 39, 0.52);
+  background: rgba(255, 250, 240, 0.96);
+  color: #2b241a;
+  box-shadow: 0 16px 26px rgba(86, 58, 8, 0.16);
+}
+
+.track-card-ethersync .mode-title {
+  color: #2b241a;
+}
+
+.track-card-ethersync .mode-desc {
+  color: #6f624e;
+}
+
+.track-card-ethersync .mode-cta {
+  background: #c9a227;
+  color: #2b241a;
+}
+
+.track-card-ethersync:hover {
+  border-color: rgba(201, 162, 39, 0.6);
+}
+
+.track-label {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  margin-bottom: 10px;
+  font-weight: 700;
 }
 
 .mode-card {
@@ -291,6 +385,20 @@ body {
   text-transform: uppercase;
 }
 
+.guided-panel {
+  border-style: dashed;
+}
+
+.guided-next {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(0, 255, 154, 0.1);
+  border: 1px solid var(--panel-border);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .flow-steps {
   margin: 0 0 12px 18px;
   padding: 0;
@@ -319,7 +427,7 @@ input, select, textarea {
   border-radius: 12px;
   border: 1px solid var(--panel-border);
   padding: 10px 12px;
-  font-family: "JetBrains Mono", "Consolas", monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   background: rgba(7, 14, 10, 0.8);
   color: var(--ink-1);
@@ -494,6 +602,49 @@ button.warning { background: var(--warn); }
   border-radius: 12px;
   border: 1px solid rgba(0, 255, 154, 0.3);
   background: rgba(5, 10, 8, 0.9);
+}
+
+.app-track-ethersync .hero,
+.app-track-ethersync .mode-card,
+.app-track-ethersync .page-header {
+  background: rgba(255, 251, 241, 0.92);
+  border-color: var(--panel-border);
+  box-shadow: 0 14px 24px rgba(65, 44, 10, 0.14);
+}
+
+.app-track-ethersync .mode-card {
+  border-color: rgba(201, 162, 39, 0.35);
+}
+
+.app-track-ethersync .mode-card:hover {
+  border-color: rgba(201, 162, 39, 0.62);
+  box-shadow: 0 18px 30px rgba(201, 162, 39, 0.2);
+}
+
+.app-track-ethersync .universe-id {
+  background: rgba(201, 162, 39, 0.18);
+}
+
+.app-track-ethersync .status-pill {
+  background: rgba(201, 162, 39, 0.12);
+}
+
+.app-track-ethersync .guided-next {
+  background: rgba(201, 162, 39, 0.12);
+}
+
+.app-track-ethersync input,
+.app-track-ethersync select,
+.app-track-ethersync textarea {
+  background: rgba(255, 250, 240, 0.96);
+  border-color: rgba(201, 162, 39, 0.38);
+  color: var(--ink-1);
+}
+
+.app-track-ethersync button.secondary {
+  background: rgba(201, 162, 39, 0.12);
+  border: 1px solid rgba(201, 162, 39, 0.4);
+  color: var(--ink-1);
 }
 
 @media (max-width: 900px) {
