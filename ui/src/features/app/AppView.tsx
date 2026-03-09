@@ -230,6 +230,10 @@ export function AppView() {
   );
   const [homeTrack, setHomeTrack] = useState<"selector" | ProductTrack>("selector");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [daemonLiveLines, setDaemonLiveLines] = useState<string[]>([]);
+  const [externalDaemonAttached, setExternalDaemonAttached] = useState(false);
+  const [attachTokenInput, setAttachTokenInput] = useState("");
+  const daemonLogCursor = useRef(0);
 
   const apiUrl = useMemo(() => `http://${apiBind}`, [apiBind]);
   const authHeader = useMemo(
@@ -285,6 +289,28 @@ export function AppView() {
     [apiUrl, token]
   );
 
+  const probeStatusWithToken = useCallback(
+    async (tokenCandidate: string) => {
+      const cleanToken = tokenCandidate.trim();
+      if (!cleanToken) {
+        throw new Error("token required");
+      }
+
+      const res = await fetch(`${apiUrl}/v1/status`, {
+        headers: {
+          Authorization: `Bearer ${cleanToken}`,
+          "Content-Type": "application/json"
+        }
+      });
+
+      if (!res.ok) {
+        throw new Error(`API error ${res.status}`);
+      }
+
+      return (await res.json()) as StatusResponse;
+    },
+    [apiUrl]
+  );
   const refreshStatus = useCallback(async () => {
     if (!token) return;
     try {
@@ -417,7 +443,7 @@ export function AppView() {
   );
 
   const { state: spaceSseState } = useSSE(`${apiUrl}/v1/ethersync/events`, {
-    enabled: daemonStatus.running && !!token && flowMode === "space",
+    enabled: daemonStatus.running && !!token && flowMode === "space" && Boolean(spaceStatus?.running),
     headers: authHeader,
     onEvent: (evt) => {
       const raw = String(evt.data || "");
@@ -452,6 +478,8 @@ export function AppView() {
     const cleanedTorOnion = torOnionAddr.trim() || undefined;
 
     try {
+      daemonLogCursor.current = 0;
+      setDaemonLiveLines([]);
       const result = await invoke<StartResult>("start_daemon", {
         apiBind,
         unsafeExposeApi: unsafeExpose,
@@ -466,11 +494,14 @@ export function AppView() {
 
       setDaemonStatus({ running: true, pid: result.pid });
       setToken(result.token);
+      setHomeTrack(flowMode === "space" ? "ethersync" : "handshake");
+      setScreen("mode");
       setWarning(null);
       logLine("DAEMON", `started pid=${result.pid}`);
     } catch (err) {
       const msg = (err as Error).message || String(err);
       setWarning(msg);
+      setScreen("mode");
       logLine("DAEMON", msg);
       setDaemonStatus({ running: false });
     }
@@ -484,20 +515,91 @@ export function AppView() {
     assistRelays,
     torSocksAddr,
     torOnionAddr,
+    flowMode,
     logLine
   ]);
 
-  const handleFetchDaemonLogs = useCallback(async () => {
-    try {
-      const logs = (await invoke<string[]>("daemon_logs")) || [];
-      if (logs.length === 0) {
-        logLine("DAEMON", "no daemon logs yet");
+  const pullDaemonLogsLive = useCallback(
+    async (snapshot = false) => {
+      try {
+        const logs = (await invoke<string[]>("daemon_logs")) || [];
+        if (logs.length < daemonLogCursor.current) {
+          daemonLogCursor.current = 0;
+        }
+        if (snapshot) {
+          daemonLogCursor.current = logs.length;
+          setDaemonLiveLines(logs.slice(-200));
+          if (logs.length === 0) {
+            logLine("DAEMON", "no daemon logs yet");
+          }
+          return;
+        }
+        const fresh = logs.slice(daemonLogCursor.current);
+        daemonLogCursor.current = logs.length;
+        if (fresh.length > 0) {
+          setDaemonLiveLines((prev) => [...prev, ...fresh].slice(-200));
+          fresh.forEach((line) => logLine("DAEMON", line));
+        }
+      } catch (err) {
+        logLine("DAEMON", `live log poll failed: ${(err as Error).message}`);
       }
-      logs.forEach((line) => logLine("DAEMON", line));
-    } catch (err) {
-      logLine("DAEMON", `log fetch failed: ${(err as Error).message}`);
+    },
+    [logLine]
+  );
+
+  const handleFetchDaemonLogs = useCallback(async () => {
+    await pullDaemonLogsLive(true);
+  }, [pullDaemonLogsLive]);
+
+  const handleAttachDaemon = useCallback(async () => {
+    const candidate = attachTokenInput.trim() || token?.trim() || "";
+    if (!candidate) {
+      setWarning("Token required to reconnect an existing daemon");
+      return;
     }
-  }, [logLine]);
+
+    try {
+      const status = await probeStatusWithToken(candidate);
+      setToken(candidate);
+      setAttachTokenInput(candidate);
+      setDaemonStatus({ running: true, pid: null });
+      setExternalDaemonAttached(true);
+      setWarning(null);
+      setScreen("mode");
+      setConnectStatus(status);
+      startStatusPoll();
+      logLine("DAEMON", `attached to existing daemon on ${apiBind}`);
+    } catch (err) {
+      const msg = (err as Error).message || String(err);
+      setWarning(`attach failed: ${msg}`);
+      logLine("DAEMON", `attach failed: ${msg}`);
+    }
+  }, [
+    attachTokenInput,
+    token,
+    probeStatusWithToken,
+    setConnectStatus,
+    startStatusPoll,
+    apiBind,
+    logLine
+  ]);
+  const handleReclaimPort = useCallback(async () => {
+    try {
+      const result = await invoke<string>("reclaim_port", { apiBind });
+      setDaemonStatus({ running: false });
+      setExternalDaemonAttached(false);
+      setToken(null);
+      setAttachTokenInput("");
+      stopStatusPoll();
+      setSseEnabled(false);
+      setWarning(null);
+      logLine("DAEMON", result);
+      await pullDaemonLogsLive(true);
+    } catch (err) {
+      const msg = (err as Error).message || String(err);
+      logLine("DAEMON", `reclaim failed: ${msg}`);
+    }
+  }, [apiBind, logLine, pullDaemonLogsLive, stopStatusPoll]);
 
   const handleRefreshPluggable = useCallback(async () => {
     try {
@@ -520,9 +622,21 @@ export function AppView() {
   }, [fetchWithAuth, logLine]);
 
   const handleStopDaemon = useCallback(async () => {
-    await invoke("stop_daemon");
+    try {
+      if (externalDaemonAttached) {
+        const reclaimed = await invoke<string>("reclaim_port", { apiBind });
+        logLine("DAEMON", reclaimed);
+      } else {
+        await invoke("stop_daemon");
+      }
+    } catch (err) {
+      logLine("DAEMON", `stop failed: ${(err as Error).message}`);
+    }
+
     setDaemonStatus({ running: false });
+    setExternalDaemonAttached(false);
     setToken(null);
+    setAttachTokenInput("");
     stopStatusPoll();
     setSseEnabled(false);
     setSpaceStatus(null);
@@ -534,6 +648,8 @@ export function AppView() {
     setSpaceFileSize(0);
     logLine("DAEMON", "stopped");
   }, [
+    externalDaemonAttached,
+    apiBind,
     logLine,
     stopStatusPoll,
     setSpaceStatus,
@@ -1056,7 +1172,7 @@ export function AppView() {
   }, []);
 
   useEffect(() => {
-    if (!daemonStatus.running) return;
+    if (!daemonStatus.running || externalDaemonAttached) return;
     let alive = true;
     const tick = async () => {
       while (alive) {
@@ -1073,7 +1189,7 @@ export function AppView() {
     return () => {
       alive = false;
     };
-  }, [daemonStatus.running, logLine]);
+  }, [daemonStatus.running, externalDaemonAttached, logLine]);
 
   // no token-file loading
 
@@ -1084,6 +1200,45 @@ export function AppView() {
       logLine("DAEMON", err);
     }
   }, [daemonStatus.last_error, logLine]);
+
+  useEffect(() => {
+    if (screen !== "mode") return;
+    void pullDaemonLogsLive(true);
+    const timer = window.setInterval(() => {
+      void pullDaemonLogsLive();
+    }, 1200);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [screen, pullDaemonLogsLive]);
+
+  useEffect(() => {
+    if (!externalDaemonAttached || !token) return;
+    let alive = true;
+
+    const tick = async () => {
+      while (alive) {
+        try {
+          await probeStatusWithToken(token);
+          setDaemonStatus((prev) => ({ ...prev, running: true }));
+        } catch (err) {
+          const msg = (err as Error).message || String(err);
+          setWarning(`attached daemon unreachable: ${msg}`);
+          setDaemonStatus({ running: false });
+          setExternalDaemonAttached(false);
+          stopStatusPoll();
+          break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    };
+
+    tick();
+    return () => {
+      alive = false;
+    };
+  }, [externalDaemonAttached, token, probeStatusWithToken, stopStatusPoll]);
 
   useEffect(() => {
     if (!daemonStatus.running || !token) return;
@@ -1287,10 +1442,20 @@ export function AppView() {
   const showGuaranteedFlow = flowMode === "guaranteed" && wizardIndex >= 1 && !isConnected;
   const showSpaceFlow = flowMode === "space" && wizardIndex >= 1;
   const showConnectionStatus = flowMode !== "space" && isConnected;
+  const daemonPortBusy =
+    `${warning ?? ""} ${daemonStatus.last_error ?? ""}`.toLowerCase().includes("10048") ||
+    `${warning ?? ""} ${daemonStatus.last_error ?? ""}`
+      .toLowerCase()
+      .includes("address already in use") ||
+    `${warning ?? ""} ${daemonStatus.last_error ?? ""}`
+      .toLowerCase()
+      .includes("indirizzo di socket");
 
   const tokenStatus = token ? "token loaded" : "token missing";
   const daemonLabel = daemonStatus.running
-    ? `running pid ${daemonStatus.pid ?? "?"}`
+    ? externalDaemonAttached
+      ? "running (attached)"
+      : `running pid ${daemonStatus.pid ?? "?"}`
     : "stopped";
   const statusLabel = `${daemonLabel} | ${apiBind} | ${tokenStatus} | SSE ${sseState}`;
   const productLabel = currentTrack === "ethersync" ? "ETHERSYNC" : "HANDSHAKE";
@@ -1335,7 +1500,7 @@ export function AppView() {
                     Tutti i flow di connessione (classic/offer/hybrid/target/phrase/guaranteed)
                     con routing aggressivo.
                   </div>
-                  <button className="mode-cta">Open Handshake</button>
+                  <button type="button" className="mode-cta">Open Handshake</button>
                 </div>
                 <div className="track-card track-card-ethersync" onClick={() => selectTrack("ethersync")}>
                   <div className="track-label">B</div>
@@ -1343,14 +1508,14 @@ export function AppView() {
                   <div className="mode-desc">
                     Workspace realtime dedicato a space, messaggi e file chunked con UX separata.
                   </div>
-                  <button className="mode-cta">Open EtherSync</button>
+                  <button type="button" className="mode-cta">Open EtherSync</button>
                 </div>
               </div>
             </>
           ) : (
             <>
               <div className="page-header">
-                <button className="secondary" onClick={resetTrackSelector}>
+                <button type="button" className="secondary" onClick={resetTrackSelector}>
                   Switch product
                 </button>
                 <div>
@@ -1374,7 +1539,7 @@ export function AppView() {
                         <li key={step}>{step}</li>
                       ))}
                     </ul>
-                    <button className="mode-cta">Open</button>
+                    <button type="button" className="mode-cta">Open</button>
                   </div>
                 ))}
               </div>
@@ -1408,12 +1573,12 @@ export function AppView() {
         <>
           <div className="page-header">
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <button className="secondary" onClick={() => setScreen("home")}>Back to flows</button>
+              <button type="button" className="secondary" onClick={() => setScreen("home")}>Back to flows</button>
               <span className="status-pill">
                 Step {Math.min(wizardIndex + 1, wizardSteps.length)}/{wizardSteps.length}
               </span>
               {allowAdvanced && (
-                <button className="secondary" onClick={() => setShowAdvanced((v) => !v)}>
+                <button type="button" className="secondary" onClick={() => setShowAdvanced((v) => !v)}>
                   {showAdvanced ? "Hide advanced" : "Show advanced"}
                 </button>
               )}
@@ -1433,46 +1598,99 @@ export function AppView() {
             <div className="guided-next">{nextGuidedStep}</div>
           </div>
 
+          <div className={`panel ${showDaemonStep ? "daemon-live-panel" : "mini-debug-panel"}`}>
+            <h2>Live Daemon Debug (RAM)</h2>
+            <div className="helper-text">Output stdout/stderr live dal sidecar handshacke.</div>
+            <div className={`console ${showDaemonStep ? "daemon-live-console" : "mini-debug-console"}`} style={{ marginTop: 10 }}>
+              {daemonLiveLines.length === 0 ? (
+                <div className="console-line">No daemon logs yet</div>
+              ) : (
+                daemonLiveLines.map((line, idx) => (
+                  <div key={`${idx}-${line.slice(0, 18)}`} className="console-line">
+                    <span>{line}</span>
+                  </div>
+                ))
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <button type="button" className="secondary" onClick={() => void pullDaemonLogsLive(true)}>
+                Refresh logs
+              </button>
+              <button type="button" className="secondary" onClick={() => setDaemonLiveLines([])}>
+                Clear view
+              </button>
+            </div>
+          </div>
+
           <div className="grid guided-grid">
             {showDaemonStep && (
               <div className="panel step-panel">
-                <h2>Step 1: Start daemon</h2>
-              <label htmlFor="bind">API bind</label>
-              <input
-                id="bind"
-                value={apiBind}
-                onChange={(e) => setApiBind(e.target.value)}
-              />
-              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                <button onClick={handleStartDaemon} disabled={daemonStatus.running}>
-                  Start daemon
-                </button>
-                <button
-                  className="secondary"
-                  onClick={handleStopDaemon}
-                  disabled={!daemonStatus.running}
-                >
-                  Stop daemon
-                </button>
-              </div>
-              <label style={{ marginTop: 12, display: "block" }}>
+                <h2>Step 1: Daemon lifecycle</h2>
+                <label htmlFor="bind">API bind</label>
                 <input
-                  type="checkbox"
-                  checked={unsafeExpose}
-                  onChange={(e) => setUnsafeExpose(e.target.checked)}
+                  id="bind"
+                  value={apiBind}
+                  onChange={(e) => setApiBind(e.target.value)}
                 />
-                &nbsp;Allow unsafe expose
-              </label>
-              <div style={{ marginTop: 12, fontSize: 12 }}>
-                Token: {token ? "loaded" : "missing"}
+
+                <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                  <button type="button" onClick={handleStartDaemon} disabled={daemonStatus.running}>
+                    Start daemon
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={handleStopDaemon}
+                    disabled={!daemonStatus.running}
+                  >
+                    Stop daemon
+                  </button>
+                  <button type="button" className="secondary" onClick={handleReclaimPort}>
+                    Force reclaim port
+                  </button>
+                </div>
+
+                {daemonPortBusy && (
+                  <div className="helper-text" style={{ marginTop: 10, color: "var(--warn)" }}>
+                    Porta occupata rilevata. Fai reconnect al daemon gia attivo oppure forzane lo stop.
+                  </div>
+                )}
+
+                <label style={{ marginTop: 12, display: "block" }}>
+                  <input
+                    type="checkbox"
+                    checked={unsafeExpose}
+                    onChange={(e) => setUnsafeExpose(e.target.checked)}
+                  />
+                  &nbsp;Allow unsafe expose
+                </label>
+
+                <label htmlFor="attach-token" style={{ marginTop: 12, display: "block" }}>
+                  Reconnect token (daemon gia attivo)
+                </label>
+                <input
+                  id="attach-token"
+                  value={attachTokenInput}
+                  onChange={(e) => setAttachTokenInput(e.target.value)}
+                  placeholder="Bearer token del daemon esistente"
+                />
+
+                <div style={{ marginTop: 12, fontSize: 12 }}>
+                  Token: {token ? "loaded" : "missing"}
+                  {externalDaemonAttached ? " (attached external daemon)" : ""}
+                </div>
+
+                <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                  <button type="button" className="secondary" onClick={handleAttachDaemon}>
+                    Reconnect existing daemon
+                  </button>
+                  <button type="button" className="secondary" onClick={handleFetchDaemonLogs}>
+                    Fetch daemon logs
+                  </button>
+                </div>
+
+                <div className="helper-text">Completa questo step per sbloccare il successivo.</div>
               </div>
-              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                <button className="secondary" onClick={handleFetchDaemonLogs}>
-                  Fetch daemon logs
-                </button>
-              </div>
-              <div className="helper-text">Completa questo step per sbloccare il successivo.</div>
-            </div>
             )}
 
             {showAdvanced && allowAdvanced && (
@@ -1561,10 +1779,10 @@ export function AppView() {
                   Universe ID: {universeId || "HS-UNSET"}
                 </div>
                 <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                  <button className="secondary" onClick={() => setShowPassphrase((v) => !v)}>
+                  <button type="button" className="secondary" onClick={() => setShowPassphrase((v) => !v)}>
                     {showPassphrase ? "Hide" : "Show"}
                   </button>
-                  <button onClick={handleSetPassphrase} disabled={!canSetPassphrase}>
+                  <button type="button" onClick={handleSetPassphrase} disabled={!canSetPassphrase}>
                     Set
                   </button>
                 </div>
@@ -1648,10 +1866,10 @@ export function AppView() {
               />
             )}
             <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-              <button onClick={handleConnectCascade} disabled={!passphrase.trim() || !apiReady}>
+              <button type="button" onClick={handleConnectCascade} disabled={!passphrase.trim() || !apiReady}>
                 Connect cascade
               </button>
-              <button onClick={handleStartAuto} className="secondary" disabled={!canStartAuto}>
+              <button type="button" onClick={handleStartAuto} className="secondary" disabled={!canStartAuto}>
                 Quick start
               </button>
             </div>
@@ -1709,7 +1927,7 @@ export function AppView() {
               onChange={(e) => setOfferTtl(e.target.value)}
             />
             <div className="qr-box" style={{ marginTop: 12 }}>
-              <button onClick={handleOffer} disabled={!apiReady || !passphrase.trim()}>
+              <button type="button" onClick={handleOffer} disabled={!apiReady || !passphrase.trim()}>
                 Generate offer QR
               </button>
               {offerQr && <img src={offerQr} alt="offer qr" />}
@@ -1722,13 +1940,13 @@ export function AppView() {
               )}
               {offerResult && (
                 <div style={{ display: "flex", gap: 8 }}>
-                  <button
+                  <button type="button"
                     className="secondary"
                     onClick={() => navigator.clipboard.writeText(offerResult.offer)}
                   >
                     Copy
                   </button>
-                  <button className="secondary" onClick={handleOffer}>
+                  <button type="button" className="secondary" onClick={handleOffer}>
                     Regenerate
                   </button>
                 </div>
@@ -1755,10 +1973,10 @@ export function AppView() {
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                <button className="secondary" onClick={() => setClassicOffer("")}>
+                <button type="button" className="secondary" onClick={() => setClassicOffer("")}>
                   Clear offer
                 </button>
-                <button onClick={handleConnectOffer} disabled={!apiReady || !classicOffer.trim()}>
+                <button type="button" onClick={handleConnectOffer} disabled={!apiReady || !classicOffer.trim()}>
                   Connect via offer
                 </button>
               </div>
@@ -1834,7 +2052,7 @@ export function AppView() {
               onChange={(e) => setHybridRelayHints(e.target.value)}
             />
             <div className="qr-box" style={{ marginTop: 12 }}>
-              <button onClick={handleHybridQr} disabled={!apiReady || !passphrase.trim()}>
+              <button type="button" onClick={handleHybridQr} disabled={!apiReady || !passphrase.trim()}>
                 Generate hybrid QR
               </button>
               {hybridQrImage && <img src={hybridQrImage} alt="hybrid qr" />}
@@ -1848,13 +2066,13 @@ export function AppView() {
               )}
               {hybridQrResult && (
                 <div style={{ display: "flex", gap: 8 }}>
-                  <button
+                  <button type="button"
                     className="secondary"
                     onClick={() => navigator.clipboard.writeText(hybridQrResult.qr)}
                   >
                     Copy QR
                   </button>
-                  <button className="secondary" onClick={handleHybridQr}>
+                  <button type="button" className="secondary" onClick={handleHybridQr}>
                     Regenerate
                   </button>
                 </div>
@@ -1881,10 +2099,10 @@ export function AppView() {
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                <button className="secondary" onClick={() => setHybridQrInput("")}>
+                <button type="button" className="secondary" onClick={() => setHybridQrInput("")}>
                   Clear QR
                 </button>
-                <button
+                <button type="button"
                   onClick={handleConnectHybridQr}
                   disabled={!apiReady || !hybridQrInput.trim()}
                 >
@@ -1932,10 +2150,10 @@ export function AppView() {
               &nbsp;Target is .onion (use Tor)
             </label>
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-              <button className="secondary" onClick={() => setClassicTarget("")}>
+              <button type="button" className="secondary" onClick={() => setClassicTarget("")}>
                 Clear target
               </button>
-              <button
+              <button type="button"
                 onClick={handleConnectTarget}
                 disabled={!apiReady || !passphrase.trim() || !classicTarget.trim()}
               >
@@ -1978,19 +2196,19 @@ export function AppView() {
               {phraseStats.chars} chars / {phraseStats.lines} lines
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={handlePhraseOpen} disabled={!apiReady || !phrasePassphrase.trim()}>
+              <button type="button" onClick={handlePhraseOpen} disabled={!apiReady || !phrasePassphrase.trim()}>
                 Open phrase
               </button>
-              <button className="secondary" onClick={handlePasteTheme}>
+              <button type="button" className="secondary" onClick={handlePasteTheme}>
                 Paste
               </button>
-              <button className="secondary" onClick={handlePhraseClose} disabled={!apiReady}>
+              <button type="button" className="secondary" onClick={handlePhraseClose} disabled={!apiReady}>
                 Close
               </button>
-              <button className="secondary" onClick={() => setPhrasePassphrase("")}>
+              <button type="button" className="secondary" onClick={() => setPhrasePassphrase("")}>
                 Clear
               </button>
-              <button className="secondary" onClick={refreshPhraseStatus} disabled={!apiReady}>
+              <button type="button" className="secondary" onClick={refreshPhraseStatus} disabled={!apiReady}>
                 Status
               </button>
             </div>
@@ -2001,7 +2219,7 @@ export function AppView() {
               {phraseQr && <img src={phraseQr} alt="phrase qr" />}
               {phraseInvite && <textarea rows={4} value={phraseInvite} readOnly />}
               {phraseInvite && (
-                <button
+                <button type="button"
                   className="secondary"
                   onClick={() => navigator.clipboard.writeText(phraseInvite)}
                 >
@@ -2015,7 +2233,7 @@ export function AppView() {
                 value={joinInvite}
                 onChange={(e) => setJoinInvite(e.target.value)}
               />
-              <button style={{ marginTop: 8 }} onClick={handlePhraseJoin} disabled={!apiReady}>
+              <button type="button" style={{ marginTop: 8 }} onClick={handlePhraseJoin} disabled={!apiReady}>
                 Join phrase
               </button>
             </div>
@@ -2063,7 +2281,7 @@ export function AppView() {
                 ))}
               </div>
             </div>
-            <button
+            <button type="button"
               onClick={handleConnectGuaranteed}
               disabled={!apiReady || !guaranteedPassphrase.trim()}
             >
@@ -2102,24 +2320,24 @@ export function AppView() {
               <li>Publish and monitor events</li>
             </ol>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
-              <button onClick={handleSpaceStartAndJoin} disabled={!canSpaceStartAndJoin}>
+              <button type="button" onClick={handleSpaceStartAndJoin} disabled={!canSpaceStartAndJoin}>
                 Start + Join
               </button>
-              <button
+              <button type="button"
                 className="secondary"
                 onClick={() => setSpacePassphrase(passphrase)}
                 disabled={!passphrase.trim()}
               >
                 Use main passphrase
               </button>
-              <button
+              <button type="button"
                 className="secondary"
                 onClick={() => copyToClipboard(spaceStatus?.local_addr ?? "", "local addr")}
                 disabled={!spaceStatus?.local_addr}
               >
                 Copy local addr
               </button>
-              <button
+              <button type="button"
                 className="secondary"
                 onClick={() => copyToClipboard(spaceJoinedId, "space id")}
                 disabled={!spaceJoinedId}
@@ -2145,13 +2363,13 @@ export function AppView() {
               />
             </div>
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-              <button onClick={handleSpaceStart} disabled={!apiReady}>
+              <button type="button" onClick={handleSpaceStart} disabled={!apiReady}>
                 Start EtherSync node
               </button>
-              <button className="secondary" onClick={handleSpaceStop} disabled={!apiReady}>
+              <button type="button" className="secondary" onClick={handleSpaceStop} disabled={!apiReady}>
                 Stop node
               </button>
-              <button className="secondary" onClick={handleSpaceStatus} disabled={!apiReady}>
+              <button type="button" className="secondary" onClick={handleSpaceStatus} disabled={!apiReady}>
                 Refresh
               </button>
             </div>
@@ -2178,7 +2396,7 @@ export function AppView() {
                 value={spacePeerToAdd}
                 onChange={(e) => setSpacePeerToAdd(e.target.value)}
               />
-              <button
+              <button type="button"
                 style={{ marginTop: 8 }}
                 className="secondary"
                 onClick={handleSpaceAddPeer}
@@ -2205,13 +2423,13 @@ export function AppView() {
                 Keep this passphrase private: anyone with it can join the same space.
               </div>
               <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                <button
+                <button type="button"
                   onClick={handleSpaceJoin}
                   disabled={!apiReady || !spaceStatus?.running || !spacePassphrase.trim()}
                 >
                   Join space
                 </button>
-                <button className="secondary" onClick={() => setSpaceEvents([])}>
+                <button type="button" className="secondary" onClick={() => setSpaceEvents([])}>
                   Clear events
                 </button>
               </div>
@@ -2228,7 +2446,7 @@ export function AppView() {
                 value={spaceMessage}
                 onChange={(e) => setSpaceMessage(e.target.value)}
               />
-              <button
+              <button type="button"
                 style={{ marginTop: 8 }}
                 onClick={handleSpacePublish}
                 disabled={!apiReady || !spacePassphrase.trim() || !spaceMessage.trim()}
@@ -2261,7 +2479,7 @@ export function AppView() {
               <div style={{ marginTop: 8, fontSize: 12 }}>
                 file: {spaceFileName || "-"} | size: {spaceFileSize || 0} bytes
               </div>
-              <button
+              <button type="button"
                 style={{ marginTop: 8 }}
                 onClick={handleSpacePublishFile}
                 disabled={!canSpacePublishFile}
@@ -2272,7 +2490,7 @@ export function AppView() {
 
             <div className="field-block" style={{ marginTop: 12 }}>
               <div className="field-label">Received files</div>
-              <button
+              <button type="button"
                 className="secondary"
                 onClick={() => setSpaceIncomingFiles({})}
                 disabled={spaceTransferList.length === 0}
@@ -2319,7 +2537,7 @@ export function AppView() {
                         }}
                       />
                     </div>
-                    <button
+                    <button type="button"
                       style={{ marginTop: 8 }}
                       className="secondary"
                       onClick={() => handleSpaceDownloadTransfer(transfer.transfer_id)}
@@ -2332,36 +2550,64 @@ export function AppView() {
               )}
             </div>
 
-            <div className="field-block" style={{ marginTop: 12 }}>
-              <div className="field-label">Recent messages</div>
-              <div style={{ maxHeight: 180, overflow: "auto", fontSize: 12 }}>
-                {spaceMessageList.length === 0 ? (
-                  <div className="helper-text">No text messages received yet.</div>
-                ) : (
-                  spaceMessageList.map((evt, idx) => (
-                    <div key={`${evt.ts_ms}-${idx}`} style={{ marginBottom: 8 }}>
-                      [{new Date(evt.ts_ms).toLocaleTimeString()}] {evt.text}
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            <div style={{ marginTop: 12, maxHeight: 260, overflow: "auto", fontSize: 12 }}>
-              {spaceEvents.length === 0 ? (
-                <div className="helper-text">No EtherSync events yet.</div>
-              ) : (
-                spaceEvents.map((evt, idx) => (
-                  <div key={`${evt.ts_ms}-${idx}`} style={{ marginBottom: 8 }}>
-                    [{new Date(evt.ts_ms).toLocaleTimeString()}] {evt.kind}
-                    {evt.space_id ? ` space=${evt.space_id}` : ""}
-                    {typeof evt.slot_id === "number" ? ` slot=${evt.slot_id}` : ""}
-                    {evt.text ? ` text=${evt.text}` : ""}
-                    {evt.info ? ` info=${evt.info}` : ""}
-                    {evt.error ? ` error=${evt.error}` : ""}
+            <div className="space-board">
+              <div className="space-board-header">
+                <div>
+                  <div className="space-board-title">Space Board</div>
+                  <div className="space-board-meta">
+                    Live feed di messaggi + timeline eventi del nodo corrente
                   </div>
-                ))
-              )}
+                </div>
+                <div className="space-board-meta">
+                  stream: {spaceSseState} | joined: {spaceJoinedId || "-"}
+                </div>
+              </div>
+
+              <div className="space-board-grid">
+                <div className="space-board-column">
+                  <div className="space-board-column-head">Messages</div>
+                  <div className="space-message-feed">
+                    {spaceMessageList.length === 0 ? (
+                      <div className="space-placeholder">No text messages received yet.</div>
+                    ) : (
+                      spaceMessageList.map((evt, idx) => (
+                        <div key={`${evt.ts_ms}-${idx}`} className="space-message-card">
+                          <div className="space-message-top">
+                            <span>{new Date(evt.ts_ms).toLocaleTimeString()}</span>
+                            <span>{evt.space_id || spaceJoinedId || "space-unknown"}</span>
+                          </div>
+                          <div className="space-message-text">{evt.text}</div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                <div className="space-board-column">
+                  <div className="space-board-column-head">Event timeline</div>
+                  <div className="space-event-feed">
+                    {spaceEvents.length === 0 ? (
+                      <div className="space-placeholder">No EtherSync events yet.</div>
+                    ) : (
+                      spaceEvents.map((evt, idx) => (
+                        <div key={`${evt.ts_ms}-${idx}`} className="space-event-card">
+                          <div className="space-event-top">
+                            <span className="space-event-kind">{evt.kind}</span>
+                            <span>{new Date(evt.ts_ms).toLocaleTimeString()}</span>
+                          </div>
+                          <div className="space-event-meta">
+                            {evt.space_id ? `space=${evt.space_id}` : ""}
+                            {typeof evt.slot_id === "number" ? ` slot=${evt.slot_id}` : ""}
+                            {evt.text ? ` text=${evt.text}` : ""}
+                            {evt.info ? ` info=${evt.info}` : ""}
+                            {evt.error ? ` error=${evt.error}` : ""}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -2404,13 +2650,13 @@ export function AppView() {
             daemon exit: {daemonStatus.last_exit_code ?? "-"}
           </div>
             <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-              <button className="secondary" onClick={refreshStatus} disabled={!apiReady}>
+              <button type="button" className="secondary" onClick={refreshStatus} disabled={!apiReady}>
                 Refresh
               </button>
-              <button className="secondary" onClick={() => setSseEnabled(true)} disabled={!apiReady}>
+              <button type="button" className="secondary" onClick={() => setSseEnabled(true)} disabled={!apiReady}>
                 Start SSE
               </button>
-              <button className="secondary" onClick={() => setSseEnabled(false)} disabled={!apiReady}>
+              <button type="button" className="secondary" onClick={() => setSseEnabled(false)} disabled={!apiReady}>
                 Stop SSE
               </button>
             </div>
@@ -2455,7 +2701,7 @@ export function AppView() {
             </div>
           )}
           <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button className="secondary" onClick={handleRefreshMetrics} disabled={!apiReady}>
+            <button type="button" className="secondary" onClick={handleRefreshMetrics} disabled={!apiReady}>
               Refresh diagnostics
             </button>
           </div>
@@ -2492,7 +2738,7 @@ export function AppView() {
             )}
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button className="secondary" onClick={handleRefreshPluggable} disabled={!apiReady}>
+            <button type="button" className="secondary" onClick={handleRefreshPluggable} disabled={!apiReady}>
               Refresh pluggables
             </button>
           </div>
@@ -2514,4 +2760,22 @@ export function AppView() {
     </div>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
