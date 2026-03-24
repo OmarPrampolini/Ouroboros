@@ -7,18 +7,24 @@ use crate::{
     gossip::{GossipEngine, PeerManager},
     message::EtherMessage,
     network::EtherUdpSocket,
+    routing::{
+        decode_orp_frame, encode_orp_frame, OrpFrame, RouteAnnouncement, RouteCache,
+        RouteCapabilities, RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE,
+        SUBSPACE_ROUTE_LOOKUP, SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
+    },
     storage::EtherStorage,
     EtherSyncError,
 };
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
+use ouroboros_crypto::random::fill_random;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::interval;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 /// EtherNode configuration
 #[derive(Debug, Clone)]
@@ -43,6 +49,10 @@ pub struct NodeConfig {
     pub gossip_ttl: u8,
     /// Slot duration override (0 = use default)
     pub slot_duration_secs: u64,
+    /// Enable ORP deterministic overlay routing
+    pub enable_orp: bool,
+    /// How often to publish ORP route announcements (seconds)
+    pub orp_announce_interval_secs: u64,
 }
 
 impl Default for NodeConfig {
@@ -57,7 +67,9 @@ impl Default for NodeConfig {
             erasure_parity_fragments: 2,
             enable_compression: true,
             gossip_ttl: 3,
-            slot_duration_secs: 0, // Use default
+            slot_duration_secs: 0,
+            enable_orp: false,
+            orp_announce_interval_secs: 60,
         }
     }
 }
@@ -93,6 +105,10 @@ pub struct EtherNode {
     seen_messages: Arc<RwLock<HashSet<[u8; 32]>>>,
     /// Max seen cache size
     max_seen_cache: usize,
+    /// ORP route cache (shared across tasks)
+    route_cache: Arc<Mutex<RouteCache>>,
+    /// Ephemeral node id for the current session (random 16 bytes)
+    node_id: [u8; 16],
 }
 
 impl EtherNode {
@@ -129,6 +145,12 @@ impl EtherNode {
             Arc::clone(&socket),
         ))));
 
+        // Generate ephemeral node id for this session
+        let mut node_id = [0u8; 16];
+        fill_random(&mut node_id).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate node id".to_string())
+        })?;
+
         Ok(Self {
             config,
             storage,
@@ -138,6 +160,8 @@ impl EtherNode {
             subscriptions: Arc::new(RwLock::new(Vec::new())),
             seen_messages: Arc::new(RwLock::new(HashSet::new())),
             max_seen_cache: 10000,
+            route_cache: Arc::new(Mutex::new(RouteCache::new())),
+            node_id,
         })
     }
 
@@ -301,31 +325,70 @@ impl EtherNode {
         // Clone refs for subscription router
         let subscriptions = Arc::clone(&self.subscriptions);
 
+        // Clone route_cache for the router task
+        let route_cache_router = Arc::clone(&self.route_cache);
+
         // Spawn subscription router task
         let router_handle = tokio::spawn(async move {
             while let Some(msg) = new_msg_rx.recv().await {
+                let subspace = msg.header.subspace;
+
                 // Route message to matching subscriptions
                 let subs = subscriptions.read().await;
                 for sub in subs.iter() {
-                    // Derive expected coordinate_hash for this subscription
-                    // using the message's slot and compare with message's coordinate_hash
-                    let expected_hash =
-                        match EtherCoordinate::derive(&sub._passphrase, msg.header.slot_id, 0) {
-                            Ok(coord) => {
-                                use ouroboros_crypto::hash::blake3_hash;
-                                let mut encoded = Vec::with_capacity(32 + 8 + 8 + 16);
-                                encoded.extend_from_slice(&coord.space_hash);
-                                encoded.extend_from_slice(&coord.slot.to_be_bytes());
-                                encoded.extend_from_slice(&coord.subspace.to_be_bytes());
-                                encoded.extend_from_slice(&coord.entropy);
-                                blake3_hash(&encoded)
-                            }
+                    // Derive expected coordinate_hash for this subscription at the
+                    // message's subspace so both user and ORP subspaces are matched.
+                    let expected_hash = match EtherCoordinate::derive(
+                        &sub._passphrase,
+                        msg.header.slot_id,
+                        subspace,
+                    ) {
+                        Ok(coord) => {
+                            use ouroboros_crypto::hash::blake3_hash;
+                            let mut encoded = Vec::with_capacity(32 + 8 + 8 + 16);
+                            encoded.extend_from_slice(&coord.space_hash);
+                            encoded.extend_from_slice(&coord.slot.to_be_bytes());
+                            encoded.extend_from_slice(&coord.subspace.to_be_bytes());
+                            encoded.extend_from_slice(&coord.entropy);
+                            blake3_hash(&encoded)
+                        }
+                        Err(_) => continue,
+                    };
+
+                    if msg.header.coordinate_hash != expected_hash {
+                        continue;
+                    }
+
+                    if subspace == SUBSPACE_USER {
+                        // Regular user payload — deliver to subscriber channel.
+                        let _ = sub.sender.send(msg.clone()).await;
+                    } else {
+                        // ORP control frame — feed into route cache.
+                        // We need a dummy source addr since routing is via gossip;
+                        // Phase 2 will thread the real peer addr through the pipeline.
+                        let dummy_src: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+                        let plaintext = match msg.decrypt(&sub._passphrase) {
+                            Ok(p) => p,
                             Err(_) => continue,
                         };
-
-                    if msg.header.coordinate_hash == expected_hash {
-                        // Try to send - ignore errors if channel closed
-                        let _ = sub.sender.send(msg.clone()).await;
+                        let frame = match crate::routing::decode_orp_frame(&plaintext) {
+                            Ok(f) => f,
+                            Err(_) => continue,
+                        };
+                        let current_slot = EtherCoordinate::current_slot();
+                        let passphrase_bytes =
+                            ouroboros_crypto::derive::canonicalize_passphrase(&sub._passphrase);
+                        let space_hash = ouroboros_crypto::hash::blake3_hash(&passphrase_bytes);
+                        let mut cache = route_cache_router.lock().await;
+                        match frame {
+                            OrpFrame::Announce(ann) => {
+                                cache.insert_announcement(ann, dummy_src, current_slot, &space_hash);
+                            }
+                            OrpFrame::Offer(offer) => {
+                                cache.insert_offer(offer);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -344,6 +407,9 @@ impl EtherNode {
 
         // Spawn peer cleanup task
         let cleanup_handle = self.spawn_cleanup_task();
+
+        // ORP announce task is driven per-passphrase in Phase 2.
+        // Nothing to spawn at node level yet.
 
         info!("EtherNode running with gossip engine");
 
@@ -517,6 +583,316 @@ impl EtherNode {
                 seen.remove(&hash);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ORP — Ouroboros Routing Protocol
+    // -----------------------------------------------------------------------
+
+    /// Publish an ORP route announcement for the given passphrase space.
+    ///
+    /// The announcement is encrypted with the same passphrase on subspace 1
+    /// and gossiped to all known peers, making this node discoverable by others
+    /// in the same slot without relying on static bootstrap peers.
+    pub async fn publish_route_announcement(
+        &self,
+        passphrase: &str,
+    ) -> Result<(), EtherSyncError> {
+        let slot = EtherCoordinate::current_slot();
+        let local_addr = self.socket.local_addr();
+
+        // Build assist_tag: first 8 bytes of blake3(node_id)
+        let mut assist_tag = [0u8; 8];
+        let tag_hash = blake3_hash(&self.node_id);
+        assist_tag.copy_from_slice(&tag_hash[..8]);
+
+        let announcement = RouteAnnouncement {
+            version: 1,
+            slot,
+            node_id: self.node_id,
+            capabilities: RouteCapabilities {
+                can_relay: false,
+                direct_udp: !local_addr.ip().is_unspecified(),
+                wan_assist: false,
+                tor_capable: false,
+            },
+            reachable_udp: if local_addr.ip().is_unspecified() {
+                vec![]
+            } else {
+                vec![local_addr]
+            },
+            assist_tag,
+            expires_at_slot: slot + 4,
+        };
+
+        let frame = OrpFrame::Announce(announcement);
+        let payload = encode_orp_frame(&frame)?;
+
+        let msg = EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_ANNOUNCE)?;
+
+        // Store locally and gossip
+        let hash = Self::message_hash(&msg);
+        {
+            let mut storage = self.storage.lock().await;
+            storage.store(slot, hash, msg.clone())?;
+        }
+        {
+            let mut seen = self.seen_messages.write().await;
+            seen.insert(hash);
+            self.cleanup_seen_cache(&mut seen).await;
+        }
+
+        let gossip_engine = self.gossip_engine.clone();
+        let msg_clone = msg.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                {
+                    let engine_guard = gossip_engine.read().await;
+                    if let Some(ref engine) = *engine_guard {
+                        if let Err(e) = engine.publish(msg_clone).await {
+                            trace!("ORP announce gossip failed: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        trace!("Published ORP route announcement for slot {}", slot);
+        Ok(())
+    }
+
+    /// Broadcast a route lookup into the passphrase space and return the lookup id.
+    ///
+    /// Callers should wait briefly and then call `best_route` with the returned
+    /// lookup id to retrieve the highest-scored offer received from peers.
+    pub async fn lookup_route(
+        &self,
+        passphrase: &str,
+        target_tag: [u8; 8],
+    ) -> Result<[u8; 16], EtherSyncError> {
+        let slot = EtherCoordinate::current_slot();
+
+        let mut lookup_id = [0u8; 16];
+        fill_random(&mut lookup_id).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate lookup id".to_string())
+        })?;
+
+        let lookup = RouteLookup {
+            version: 1,
+            lookup_id,
+            target_tag,
+            max_hops: 2,
+            ttl: 3,
+        };
+
+        let frame = OrpFrame::Lookup(lookup);
+        let payload = encode_orp_frame(&frame)?;
+
+        let msg = EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_LOOKUP)?;
+
+        let hash = Self::message_hash(&msg);
+        {
+            let mut storage = self.storage.lock().await;
+            storage.store(slot, hash, msg.clone())?;
+        }
+        {
+            let mut seen = self.seen_messages.write().await;
+            seen.insert(hash);
+            self.cleanup_seen_cache(&mut seen).await;
+        }
+
+        let gossip_engine = self.gossip_engine.clone();
+        let msg_clone = msg.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                {
+                    let engine_guard = gossip_engine.read().await;
+                    if let Some(ref engine) = *engine_guard {
+                        if let Err(e) = engine.publish(msg_clone).await {
+                            trace!("ORP lookup gossip failed: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        trace!("Published ORP route lookup {:?} for tag {:?}", lookup_id, target_tag);
+        Ok(lookup_id)
+    }
+
+    /// Return the best cached route offer for the given lookup id, if any.
+    pub async fn best_route(
+        &self,
+        _passphrase: &str,
+        lookup_id: [u8; 16],
+    ) -> Result<Option<RouteOffer>, EtherSyncError> {
+        let cache = self.route_cache.lock().await;
+        Ok(cache.best_offer(&lookup_id).map(|co| co.frame.clone()))
+    }
+
+    /// Feed a received ORP control message into the route cache.
+    ///
+    /// Called from the subscription router when a message arrives on a
+    /// control subspace (1–4).
+    async fn handle_orp_message(
+        &self,
+        msg: &EtherMessage,
+        passphrase: &str,
+        source_peer: SocketAddr,
+    ) {
+        let plaintext = match msg.decrypt(passphrase) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let frame = match decode_orp_frame(&plaintext) {
+            Ok(f) => f,
+            Err(e) => {
+                trace!("ORP frame decode error: {:?}", e);
+                return;
+            }
+        };
+
+        let current_slot = EtherCoordinate::current_slot();
+        let passphrase_bytes = canonicalize_passphrase(passphrase);
+        let space_hash = blake3_hash(&passphrase_bytes);
+
+        let mut cache = self.route_cache.lock().await;
+
+        match frame {
+            OrpFrame::Announce(ann) => {
+                if !cache.insert_announcement(ann, source_peer, current_slot, &space_hash) {
+                    trace!("ORP announcement rejected (stale or cache full)");
+                }
+            }
+            OrpFrame::Offer(offer) => {
+                cache.insert_offer(offer);
+            }
+            OrpFrame::Lookup(_) | OrpFrame::Forward(_) | OrpFrame::Ack(_) => {
+                // Lookup and Forward handling will be added in Phase 2.
+            }
+        }
+    }
+
+    /// Spawn the ORP periodic announcement task.
+    fn spawn_orp_announce_task(
+        &self,
+        passphrase: String,
+        interval_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let gossip_engine = Arc::clone(&self.gossip_engine);
+        let storage = Arc::clone(&self.storage);
+        let seen_messages = Arc::clone(&self.seen_messages);
+        let route_cache = Arc::clone(&self.route_cache);
+        let socket = Arc::clone(&self.socket);
+        let node_id = self.node_id;
+        let max_seen_cache = self.max_seen_cache;
+
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(interval_secs));
+            loop {
+                ticker.tick().await;
+
+                let slot = EtherCoordinate::current_slot();
+                let local_addr = socket.local_addr();
+
+                let mut assist_tag = [0u8; 8];
+                let tag_hash = blake3_hash(&node_id);
+                assist_tag.copy_from_slice(&tag_hash[..8]);
+
+                let announcement = RouteAnnouncement {
+                    version: 1,
+                    slot,
+                    node_id,
+                    capabilities: RouteCapabilities {
+                        can_relay: false,
+                        direct_udp: !local_addr.ip().is_unspecified(),
+                        wan_assist: false,
+                        tor_capable: false,
+                    },
+                    reachable_udp: if local_addr.ip().is_unspecified() {
+                        vec![]
+                    } else {
+                        vec![local_addr]
+                    },
+                    assist_tag,
+                    expires_at_slot: slot + 4,
+                };
+
+                let frame = OrpFrame::Announce(announcement);
+                let payload = match encode_orp_frame(&frame) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("ORP encode error in announce task: {:?}", e);
+                        continue;
+                    }
+                };
+
+                let msg = match EtherMessage::new_control_message(
+                    &passphrase,
+                    slot,
+                    &payload,
+                    SUBSPACE_ROUTE_ANNOUNCE,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("ORP message creation error: {:?}", e);
+                        continue;
+                    }
+                };
+
+                let hash = blake3_hash(&msg.encrypted_payload);
+                {
+                    let mut st = storage.lock().await;
+                    let _ = st.store(slot, hash, msg.clone());
+                }
+                {
+                    let mut seen = seen_messages.write().await;
+                    seen.insert(hash);
+                    if seen.len() > max_seen_cache {
+                        let to_remove: Vec<_> = seen.iter().take(seen.len() / 2).cloned().collect();
+                        for h in to_remove { seen.remove(&h); }
+                    }
+                }
+
+                // Evict stale cache entries on each announce cycle
+                {
+                    let mut cache = route_cache.lock().await;
+                    cache.evict_stale(slot, 600); // 10 minutes
+                }
+
+                let ge = gossip_engine.clone();
+                let m = msg.clone();
+                tokio::spawn(async move {
+                    for _ in 0..50 {
+                        {
+                            let g = ge.read().await;
+                            if let Some(ref engine) = *g {
+                                let _ = engine.publish(m).await;
+                                return;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                });
+
+                trace!("ORP periodic announcement published for slot {}", slot);
+            }
+        })
+    }
+
+    /// Get a reference to the ORP route cache.
+    pub fn route_cache(&self) -> &Arc<Mutex<RouteCache>> {
+        &self.route_cache
+    }
+
+    /// Return this node's ephemeral session id.
+    pub fn node_id(&self) -> [u8; 16] {
+        self.node_id
     }
 }
 

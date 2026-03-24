@@ -15,7 +15,9 @@ const MESSAGE_VERSION: u8 = 1;
 const DEFAULT_TTL: u8 = 3;
 const NONCE_LEN: usize = 24;
 const AUTH_TAG_LEN: usize = 16;
-const HEADER_LEN: usize = 1 + 8 + 32 + 2 + 2 + 1;
+// version(1) + slot_id(8) + subspace(8) + coordinate_hash(32) + fragment_index(2)
+// + total_fragments(2) + ttl(1) = 54
+const HEADER_LEN: usize = 1 + 8 + 8 + 32 + 2 + 2 + 1;
 const PAYLOAD_LENGTH_FIELD_LEN: usize = 4;
 
 /// EtherMessage header (unencrypted)
@@ -23,6 +25,8 @@ const PAYLOAD_LENGTH_FIELD_LEN: usize = 4;
 pub struct EtherMessageHeader {
     pub version: u8,
     pub slot_id: u64,
+    /// Subspace within the passphrase space (0 = user payloads, 1-4 = ORP control)
+    pub subspace: u64,
     pub coordinate_hash: [u8; 32],
     pub fragment_index: u16,
     pub total_fragments: u16,
@@ -40,6 +44,9 @@ pub struct EtherMessage {
 
 impl EtherMessage {
     /// Create new message (encrypts payload)
+    ///
+    /// `subspace` selects the logical channel within the passphrase space.
+    /// Use `0` for user payloads, or the `SUBSPACE_*` constants from `routing` for ORP control frames.
     pub fn new(
         passphrase: &str,
         slot: u64,
@@ -47,18 +54,55 @@ impl EtherMessage {
         fragment_idx: u16,
         total_fragments: u16,
     ) -> Result<Self, crate::EtherSyncError> {
+        Self::new_with_subspace(passphrase, slot, payload, fragment_idx, total_fragments, 0)
+    }
+
+    /// Create new user-payload message (subspace 0)
+    pub fn new_user_message(
+        passphrase: &str,
+        slot: u64,
+        payload: &[u8],
+    ) -> Result<Self, crate::EtherSyncError> {
+        Self::new_with_subspace(passphrase, slot, payload, 0, 1, 0)
+    }
+
+    /// Create new ORP control message on the given subspace
+    pub fn new_control_message(
+        passphrase: &str,
+        slot: u64,
+        payload: &[u8],
+        subspace: u64,
+    ) -> Result<Self, crate::EtherSyncError> {
+        if subspace == 0 {
+            return Err(EtherSyncError::NetworkError(
+                "subspace 0 is reserved for user payloads".to_string(),
+            ));
+        }
+        Self::new_with_subspace(passphrase, slot, payload, 0, 1, subspace)
+    }
+
+    /// Create new message with explicit subspace
+    pub fn new_with_subspace(
+        passphrase: &str,
+        slot: u64,
+        payload: &[u8],
+        fragment_idx: u16,
+        total_fragments: u16,
+        subspace: u64,
+    ) -> Result<Self, crate::EtherSyncError> {
         if total_fragments == 0 || fragment_idx >= total_fragments {
             return Err(EtherSyncError::NetworkError(
                 "invalid fragment metadata".to_string(),
             ));
         }
 
-        let key = derive_message_key(passphrase, slot)?;
-        let coordinate_hash = derive_coordinate_hash(passphrase, slot)?;
+        let key = derive_message_key(passphrase, slot, subspace)?;
+        let coordinate_hash = derive_coordinate_hash(passphrase, slot, subspace)?;
 
         let header = EtherMessageHeader {
             version: MESSAGE_VERSION,
             slot_id: slot,
+            subspace,
             coordinate_hash,
             fragment_index: fragment_idx,
             total_fragments,
@@ -97,14 +141,15 @@ impl EtherMessage {
 
     /// Decrypt and verify message
     pub fn decrypt(&self, passphrase: &str) -> Result<Vec<u8>, crate::EtherSyncError> {
-        let expected_coordinate_hash = derive_coordinate_hash(passphrase, self.header.slot_id)?;
+        let expected_coordinate_hash =
+            derive_coordinate_hash(passphrase, self.header.slot_id, self.header.subspace)?;
         if expected_coordinate_hash != self.header.coordinate_hash {
             return Err(EtherSyncError::NetworkError(
                 "coordinate hash mismatch".to_string(),
             ));
         }
 
-        let key = derive_message_key(passphrase, self.header.slot_id)?;
+        let key = derive_message_key(passphrase, self.header.slot_id, self.header.subspace)?;
         let aad = serialize_header(&self.header);
 
         let mut ciphertext_and_tag =
@@ -147,6 +192,7 @@ impl EtherMessage {
         let header = EtherMessageHeader {
             version: cursor.get_u8(),
             slot_id: cursor.get_u64(),
+            subspace: cursor.get_u64(),
             coordinate_hash: {
                 let mut hash = [0u8; 32];
                 cursor.copy_to_slice(&mut hash);
@@ -194,7 +240,11 @@ impl EtherMessage {
     }
 }
 
-fn derive_message_key(passphrase: &str, slot: u64) -> Result<[u8; 32], EtherSyncError> {
+fn derive_message_key(
+    passphrase: &str,
+    slot: u64,
+    subspace: u64,
+) -> Result<[u8; 32], EtherSyncError> {
     let passphrase_bytes = canonicalize_passphrase(passphrase);
     if passphrase_bytes.is_empty() {
         return Err(EtherSyncError::InvalidPassphrase);
@@ -205,13 +255,18 @@ fn derive_message_key(passphrase: &str, slot: u64) -> Result<[u8; 32], EtherSync
 
     let mut info = b"ethersync/message/key/v1".to_vec();
     info.extend_from_slice(&slot.to_be_bytes());
+    info.extend_from_slice(&subspace.to_be_bytes());
 
     hkdf_expand_array::<32>(&passphrase_bytes, Some(&salt), &info)
         .map_err(|_| EtherSyncError::DerivationFailed)
 }
 
-fn derive_coordinate_hash(passphrase: &str, slot: u64) -> Result<[u8; 32], EtherSyncError> {
-    let coordinate = EtherCoordinate::derive(passphrase, slot, 0)?;
+fn derive_coordinate_hash(
+    passphrase: &str,
+    slot: u64,
+    subspace: u64,
+) -> Result<[u8; 32], EtherSyncError> {
+    let coordinate = EtherCoordinate::derive(passphrase, slot, subspace)?;
     let mut encoded = Vec::with_capacity(32 + 8 + 8 + 16);
     encoded.extend_from_slice(&coordinate.space_hash);
     encoded.extend_from_slice(&coordinate.slot.to_be_bytes());
@@ -224,10 +279,11 @@ fn serialize_header(header: &EtherMessageHeader) -> [u8; HEADER_LEN] {
     let mut buf = [0u8; HEADER_LEN];
     buf[0] = header.version;
     buf[1..9].copy_from_slice(&header.slot_id.to_be_bytes());
-    buf[9..41].copy_from_slice(&header.coordinate_hash);
-    buf[41..43].copy_from_slice(&header.fragment_index.to_be_bytes());
-    buf[43..45].copy_from_slice(&header.total_fragments.to_be_bytes());
-    buf[45] = header.ttl;
+    buf[9..17].copy_from_slice(&header.subspace.to_be_bytes());
+    buf[17..49].copy_from_slice(&header.coordinate_hash);
+    buf[49..51].copy_from_slice(&header.fragment_index.to_be_bytes());
+    buf[51..53].copy_from_slice(&header.total_fragments.to_be_bytes());
+    buf[53] = header.ttl;
     buf
 }
 
@@ -272,5 +328,42 @@ mod tests {
             parsed.decrypt("serialize passphrase").unwrap(),
             b"serialize me"
         );
+    }
+
+    #[test]
+    fn user_message_uses_subspace_zero() {
+        let msg = EtherMessage::new_user_message("pass", 42, b"data").unwrap();
+        assert_eq!(msg.header.subspace, 0);
+    }
+
+    #[test]
+    fn control_message_uses_given_subspace() {
+        let msg = EtherMessage::new_control_message("pass", 42, b"orp frame", 1).unwrap();
+        assert_eq!(msg.header.subspace, 1);
+        let plaintext = msg.decrypt("pass").unwrap();
+        assert_eq!(plaintext, b"orp frame");
+    }
+
+    #[test]
+    fn subspace_zero_rejected_for_control_message() {
+        let result = EtherMessage::new_control_message("pass", 42, b"x", 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn different_subspaces_produce_different_coordinate_hashes() {
+        let msg0 = EtherMessage::new_with_subspace("pass", 10, b"x", 0, 1, 0).unwrap();
+        let msg1 = EtherMessage::new_with_subspace("pass", 10, b"x", 0, 1, 1).unwrap();
+        assert_ne!(msg0.header.coordinate_hash, msg1.header.coordinate_hash);
+    }
+
+    #[test]
+    fn wrong_subspace_fails_decrypt() {
+        // Message created on subspace 1, attempted decrypt as subspace 0 should fail
+        let msg = EtherMessage::new_with_subspace("pass", 10, b"secret", 0, 1, 1).unwrap();
+        // Manually corrupt: pretend it's subspace 0 by cloning with wrong subspace
+        let mut tampered = msg.clone();
+        tampered.header.subspace = 0;
+        assert!(tampered.decrypt("pass").is_err());
     }
 }
