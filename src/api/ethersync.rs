@@ -124,7 +124,7 @@ pub(crate) async fn handle_join_space(
     }
     match state
         .app
-        .ethersync_join_space(
+        .ethersync_join_space_with_policy(
             req.passphrase,
             req.label,
             req.retention_tier,

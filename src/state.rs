@@ -1057,6 +1057,15 @@ impl AppState {
         &self,
         passphrase: String,
         label: Option<String>,
+    ) -> anyhow::Result<EtherSyncJoinResult> {
+        self.ethersync_join_space_with_policy(passphrase, label, None, None, None)
+            .await
+    }
+
+    pub async fn ethersync_join_space_with_policy(
+        &self,
+        passphrase: String,
+        label: Option<String>,
         retention_tier: Option<String>,
         replication_factor: Option<usize>,
         route_bias: Option<String>,
