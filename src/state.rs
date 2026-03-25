@@ -233,6 +233,16 @@ pub struct KeeperBackfillResult {
     pub remaining_pending: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SpacePolicySnapshot {
+    pub space_key: String,
+    pub retention_tier: String,
+    pub replication_factor: usize,
+    pub route_bias: String,
+    pub pending_keeper_envelopes: usize,
+    pub archived_keeper_envelopes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EtherSyncFileChunkEnvelope {
     kind: String,
@@ -1402,6 +1412,115 @@ impl AppState {
             space_id,
             restored_messages: restored,
             remaining_pending,
+        })
+    }
+
+    pub async fn ethersync_list_space_policies(&self) -> anyhow::Result<Vec<SpacePolicySnapshot>> {
+        let (space_policies, keeper_envelopes, keeper_archive) = {
+            let inner = self.inner.lock().await;
+            let Some(rt) = inner.ethersync.as_ref() else {
+                return Err(anyhow::anyhow!("ethersync is not running"));
+            };
+            (
+                rt.space_policies.clone(),
+                rt.keeper_envelopes.clone(),
+                rt.keeper_archive.clone(),
+            )
+        };
+
+        let policies = space_policies.lock().await;
+        let pending = keeper_envelopes.lock().await;
+        let archived = keeper_archive.lock().await;
+
+        let mut items = policies
+            .iter()
+            .map(|(space_key, policy)| SpacePolicySnapshot {
+                space_key: space_key.clone(),
+                retention_tier: policy.retention_tier.clone(),
+                replication_factor: policy.replication_factor,
+                route_bias: policy.route_bias.as_str().to_string(),
+                pending_keeper_envelopes: pending
+                    .get(space_key)
+                    .map(|items| items.len())
+                    .unwrap_or(0),
+                archived_keeper_envelopes: archived
+                    .get(space_key)
+                    .map(|items| items.len())
+                    .unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+
+        items.sort_by(|a, b| a.space_key.cmp(&b.space_key));
+        Ok(items)
+    }
+
+    pub async fn ethersync_set_space_policy(
+        &self,
+        passphrase: String,
+        retention_tier: Option<String>,
+        replication_factor: Option<usize>,
+        route_bias: Option<String>,
+    ) -> anyhow::Result<SpacePolicySnapshot> {
+        if passphrase.trim().is_empty() {
+            return Err(anyhow::anyhow!("passphrase required"));
+        }
+        let space_key = derive_space_key(&passphrase);
+        let requested_policy = build_space_policy(
+            retention_tier.as_deref(),
+            replication_factor,
+            route_bias.as_deref(),
+        );
+
+        let (space_policies, keeper_envelopes, keeper_archive, events_tx) = {
+            let inner = self.inner.lock().await;
+            let Some(rt) = inner.ethersync.as_ref() else {
+                return Err(anyhow::anyhow!("ethersync is not running"));
+            };
+            (
+                rt.space_policies.clone(),
+                rt.keeper_envelopes.clone(),
+                rt.keeper_archive.clone(),
+                rt.events_tx.clone(),
+            )
+        };
+
+        let applied_policy =
+            upsert_space_policy(&space_policies, &space_key, requested_policy, true).await;
+        let pending_keeper_envelopes = {
+            let guard = keeper_envelopes.lock().await;
+            guard.get(&space_key).map(|items| items.len()).unwrap_or(0)
+        };
+        let archived_keeper_envelopes = {
+            let guard = keeper_archive.lock().await;
+            guard.get(&space_key).map(|items| items.len()).unwrap_or(0)
+        };
+
+        emit_ethersync_event(
+            &events_tx,
+            EtherSyncEvent {
+                kind: "space_policy_updated".to_string(),
+                ts_ms: now_ms(),
+                space_id: Some(space_key.clone()),
+                slot_id: None,
+                payload_b64: None,
+                text: None,
+                info: Some(format!(
+                    "retention={} replication_factor={} route_bias={}",
+                    applied_policy.retention_tier,
+                    applied_policy.replication_factor,
+                    applied_policy.route_bias.as_str()
+                )),
+                error: None,
+            },
+        );
+
+        Ok(SpacePolicySnapshot {
+            space_key,
+            retention_tier: applied_policy.retention_tier,
+            replication_factor: applied_policy.replication_factor,
+            route_bias: applied_policy.route_bias.as_str().to_string(),
+            pending_keeper_envelopes,
+            archived_keeper_envelopes,
         })
     }
 }

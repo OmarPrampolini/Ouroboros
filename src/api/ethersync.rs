@@ -15,9 +15,12 @@ use tokio::time::interval;
 use super::types::{
     EtherSyncJoinRequest, EtherSyncPeerAddRequest, EtherSyncPublishFileRequest,
     EtherSyncPublishRequest, EtherSyncStartRequest, KeeperBackfillRequest,
+    KeeperPolicyUpdateRequest,
 };
 use super::{ApiError, ApiState};
-use crate::state::{EtherSyncStartConfig, EtherSyncStatus, KeeperBackfillResult};
+use crate::state::{
+    EtherSyncStartConfig, EtherSyncStatus, KeeperBackfillResult, SpacePolicySnapshot,
+};
 
 type EtherSyncResult<T> = Result<Json<T>, ApiError>;
 
@@ -265,6 +268,44 @@ pub(crate) async fn handle_keeper_backfill(
     let result = state
         .app
         .ethersync_keeper_backfill(req.passphrase, req.max_messages)
+        .await
+        .map_err(|e| ApiError::bad_request(&e.to_string()))?;
+    Ok(Json(result))
+}
+
+pub(crate) async fn handle_keeper_policies(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(state): Extension<Arc<ApiState>>,
+) -> EtherSyncResult<Vec<SpacePolicySnapshot>> {
+    if !state.app.api_allow(addr.ip(), 1.0).await {
+        return Err(ApiError::bad_request("rate limit"));
+    }
+
+    let result = state
+        .app
+        .ethersync_list_space_policies()
+        .await
+        .map_err(|e| ApiError::bad_request(&e.to_string()))?;
+    Ok(Json(result))
+}
+
+pub(crate) async fn handle_keeper_policy_update(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(state): Extension<Arc<ApiState>>,
+    Json(req): Json<KeeperPolicyUpdateRequest>,
+) -> EtherSyncResult<SpacePolicySnapshot> {
+    if !state.app.api_allow(addr.ip(), 1.0).await {
+        return Err(ApiError::bad_request("rate limit"));
+    }
+
+    let result = state
+        .app
+        .ethersync_set_space_policy(
+            req.passphrase,
+            req.retention_tier,
+            req.replication_factor,
+            req.route_bias,
+        )
         .await
         .map_err(|e| ApiError::bad_request(&e.to_string()))?;
     Ok(Json(result))

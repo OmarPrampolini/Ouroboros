@@ -204,3 +204,11 @@ pub(crate) struct KeeperBackfillRequest {
     pub passphrase: String,
     pub max_messages: Option<usize>,
 }
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct KeeperPolicyUpdateRequest {
+    pub passphrase: String,
+    pub retention_tier: Option<String>,
+    pub replication_factor: Option<usize>,
+    pub route_bias: Option<String>,
+}

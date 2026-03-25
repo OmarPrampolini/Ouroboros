@@ -22,6 +22,7 @@ Key surfaces:
 - `/v1/routes/discover`
 - `/v1/routes/status`
 - `/v1/keepers/status`
+- `/v1/keepers/policies`
 - `/v1/keepers/backfill`
 - `/v1/ethersync/*`
 

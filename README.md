@@ -208,6 +208,8 @@ Representative endpoints:
 - `GET /v1/routes/discover`
 - `GET /v1/routes/status`
 - `GET /v1/keepers/status`
+- `GET /v1/keepers/policies`
+- `POST /v1/keepers/policies`
 - `POST /v1/keepers/backfill`
 - `GET /v1/ethersync/status`
 - `POST /v1/ethersync/start`
@@ -226,6 +228,7 @@ The API now exposes:
 - federated discovery candidates resolved from ORP, bundle, and config bootstrap
 - pending-versus-archived keeper state plus a concrete backfill control path for managed-retention experimentation
 - managed-space counts and route-bias posture across joined spaces
+- per-space keeper policy inspection and updates for operator workflows
 
 `POST /v1/ethersync/spaces/join` now accepts optional per-space policy hints:
 

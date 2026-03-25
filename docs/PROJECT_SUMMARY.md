@@ -125,6 +125,8 @@ What is not claimed yet:
 - `GET /v1/routes/discover`
 - `GET /v1/routes/status`
 - `GET /v1/keepers/status`
+- `GET /v1/keepers/policies`
+- `POST /v1/keepers/policies`
 - `POST /v1/keepers/backfill`
 - `GET /v1/ethersync/status`
 - `POST /v1/ethersync/start`

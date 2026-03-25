@@ -97,6 +97,10 @@ fn build_router(state: Arc<ApiState>, api_token: Option<String>) -> Router {
             get(diagnostics::handle_keepers_status),
         )
         .route(
+            "/v1/keepers/policies",
+            get(ethersync::handle_keeper_policies).post(ethersync::handle_keeper_policy_update),
+        )
+        .route(
             "/v1/connect/fallbacks",
             get(diagnostics::handle_connect_fallbacks),
         )
