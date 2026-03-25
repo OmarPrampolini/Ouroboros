@@ -10,6 +10,8 @@ use crate::offer::RoleHint;
 pub struct ApiError {
     pub code: u16,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -17,6 +19,7 @@ impl ApiError {
         Self {
             code: StatusCode::BAD_REQUEST.as_u16(),
             message: msg.to_string(),
+            details: None,
         }
     }
 
@@ -24,7 +27,13 @@ impl ApiError {
         Self {
             code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
             message: "operation failed".to_string(),
+            details: None,
         }
+    }
+
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 

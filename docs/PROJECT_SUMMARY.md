@@ -138,6 +138,8 @@ What is not claimed yet:
 - `POST /v1/ethersync/files/publish`
 - `GET /v1/ethersync/events`
 
+`POST /v1/connect` now returns structured rejection details when `privacy_profile=high-risk` is requested before the gate is available.
+
 ## Feature flags
 
 Default:

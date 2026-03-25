@@ -37,6 +37,7 @@ fn connect_err(code: StatusCode, msg: &str) -> ApiError {
     ApiError {
         code: code.as_u16(),
         message: msg.to_string(),
+        details: None,
     }
 }
 
@@ -187,10 +188,29 @@ pub(crate) async fn handle_connect(
     }
     let privacy_profile = req.privacy_profile;
     if privacy_profile == PrivacyProfile::HighRisk {
+        let details = match app.ethersync_status().await {
+            Ok(status) => serde_json::json!({
+                "requested_privacy_profile": "high-risk",
+                "available": status.high_risk_available,
+                "gate_reasons": status.high_risk_gate_reasons,
+                "routes_status_path": "/v1/routes/status",
+                "interop_path": "/v1/interop",
+            }),
+            Err(_) => serde_json::json!({
+                "requested_privacy_profile": "high-risk",
+                "available": false,
+                "gate_reasons": [
+                    "EtherSync status unavailable while evaluating the high-risk gate"
+                ],
+                "routes_status_path": "/v1/routes/status",
+                "interop_path": "/v1/interop",
+            }),
+        };
         return Err(connect_err(
-            StatusCode::CONFLICT,
+            StatusCode::SERVICE_UNAVAILABLE,
             "high-risk profile unavailable: ORP high-risk circuits are not implemented yet; inspect /v1/routes/status for gate state",
-        ));
+        )
+        .with_details(details));
     }
     if req.offer.is_some() && req.passphrase.is_some() {
         return Err(connect_err(

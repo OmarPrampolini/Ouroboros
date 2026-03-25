@@ -231,6 +231,7 @@ The API now exposes:
 - capability reporting for `quic`, `webrtc`, `pq`, ORP tiers, and bridge bootstrap posture
 - operator hints, route class counts, and bootstrap bundle visibility
 - high-risk gate telemetry for relay count, operator diversity, region diversity, operator concentration, and three-hop viability
+- structured `high-risk` rejection details from `POST /v1/connect`, including gate reasons and the canonical diagnostics paths
 - federated discovery candidates resolved from ORP, bundle, and config bootstrap
 - pending-versus-archived keeper state plus a concrete backfill control path for managed-retention experimentation
 - managed-space counts and route-bias posture across joined spaces
