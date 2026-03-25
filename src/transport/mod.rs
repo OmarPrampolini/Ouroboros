@@ -1,4 +1,4 @@
-//! Transport layer: LAN -> WAN (Direct/Assist/Tor) with optional QUIC/WebRTC
+//! Transport layer: LAN -> WAN (Direct/Assist/ORP/Tor) with optional QUIC/WebRTC
 
 pub mod assist_inbox;
 pub mod dandelion;
@@ -10,6 +10,7 @@ pub mod io;
 pub mod lan;
 pub mod multipath;
 pub mod nat_detection;
+pub mod orp;
 pub mod pluggable;
 pub mod quic_rfc9000;
 pub mod stealth;
@@ -27,6 +28,7 @@ pub use wan::wan_tor;
 
 use crate::config::{Config, WanMode, UDP_MAX_PACKET_SIZE, WAN_ASSIST_GLOBAL_TIMEOUT_SECS};
 use crate::derive::RendezvousParams;
+use ethersync::EtherNode;
 use crate::network_telemetry;
 use crate::offer::{OfferPayload, RoleHint};
 use crate::resume::ResumeParams;
@@ -152,10 +154,23 @@ impl Connection {
     }
 }
 
-/// Establish connection with cascade strategy: LAN → WAN → TUN
+/// Establish connection with cascade strategy: LAN → WAN → ORP → Tor.
 ///
-/// For WAN mode, uses config to determine Direct vs Tor transport.
+/// Convenience wrapper over [`establish_connection_with_orp`] with no ORP node.
 pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<Connection> {
+    establish_connection_with_orp(p, cfg, None).await
+}
+
+/// Establish connection with optional ORP fallback inserted between Relay and Tor.
+///
+/// When `orp_node` is `Some` and `cfg.enable_orp` is `true`, the ORP route cache
+/// is consulted before falling back to Tor.  All other strategy steps (LAN,
+/// UPnP, STUN, Relay) are unaffected.
+pub async fn establish_connection_with_orp(
+    p: &RendezvousParams,
+    cfg: &Config,
+    orp_node: Option<&EtherNode>,
+) -> Result<Connection> {
     // NAT strategy selection (uses cached detection when available).
     // NOTE: Requires STUN servers configured via config.nat_detection_servers.
     let nat_profile = match detect_nat_profile().await {
@@ -337,21 +352,38 @@ pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<
                     );
                 }
             }
-            TransportKind::Tor => match wan::try_tor_mode(cfg).await {
-                Ok(wan_conn) => {
-                    network_telemetry::record_strategy_result("tor", true);
-                    return connection_from_wan(wan_conn).await;
+            TransportKind::Tor => {
+                // ORP: deterministic overlay route — tried before Tor.
+                if cfg.enable_orp {
+                    if let Some(node) = orp_node {
+                        match orp::try_orp_route(node, p, cfg).await {
+                            Ok(conn) => {
+                                tracing::info!("ORP: route established, skipping Tor");
+                                return Ok(conn);
+                            }
+                            Err(e) => {
+                                tracing::debug!("ORP route failed, falling back to Tor: {}", e);
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    network_telemetry::record_strategy_result("tor", false);
-                    network_telemetry::record_fallback_event(
-                        "connect",
-                        "tor_failed",
-                        Some(e.to_string()),
-                    );
-                    tracing::warn!("Tor failed: {}", e)
+
+                match wan::try_tor_mode(cfg).await {
+                    Ok(wan_conn) => {
+                        network_telemetry::record_strategy_result("tor", true);
+                        return connection_from_wan(wan_conn).await;
+                    }
+                    Err(e) => {
+                        network_telemetry::record_strategy_result("tor", false);
+                        network_telemetry::record_fallback_event(
+                            "connect",
+                            "tor_failed",
+                            Some(e.to_string()),
+                        );
+                        tracing::warn!("Tor failed: {}", e)
+                    }
                 }
-            },
+            }
         }
     }
 

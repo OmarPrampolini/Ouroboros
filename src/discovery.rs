@@ -5,7 +5,7 @@ use std::sync::Arc;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[cfg(feature = "dht")]
 mod kad;
@@ -210,6 +210,63 @@ impl DiscoveryProvider for InMemoryDiscovery {
             .collect();
         out.truncate(limit);
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ORP-backed discovery provider
+// ---------------------------------------------------------------------------
+
+/// Discovery provider backed by the EtherSync ORP route cache.
+///
+/// `announce` is a no-op — route announcements are published independently via
+/// [`ethersync::EtherNode::publish_route_announcement`].
+///
+/// `discover` returns direct-UDP endpoints from fresh ORP announcements whose
+/// `space_prefix` (first 8 bytes of `RouteKey`) matches the requested
+/// `space_hash` prefix — no cross-space leakage.
+pub struct OrpDiscoveryProvider {
+    route_cache: Arc<Mutex<ethersync::routing::RouteCache>>,
+}
+
+impl OrpDiscoveryProvider {
+    pub fn new(route_cache: Arc<Mutex<ethersync::routing::RouteCache>>) -> Self {
+        Self { route_cache }
+    }
+}
+
+#[async_trait::async_trait]
+impl DiscoveryProvider for OrpDiscoveryProvider {
+    async fn announce(&self, _space_hash: [u8; 32], _record: DiscoveryRecord) -> Result<()> {
+        // ORP announcements are handled by EtherNode — nothing to do here.
+        Ok(())
+    }
+
+    async fn discover(&self, space_hash: [u8; 32], limit: usize) -> Result<Vec<SocketAddr>> {
+        use ethersync::routing::ANNOUNCE_SLOT_LOOKBACK;
+        use ethersync::EtherCoordinate;
+
+        let current_slot = EtherCoordinate::current_slot();
+        let min_slot = current_slot.saturating_sub(ANNOUNCE_SLOT_LOOKBACK);
+
+        // Filter by the first 8 bytes of space_hash (= space_prefix).
+        let mut target_prefix = [0u8; 8];
+        target_prefix.copy_from_slice(&space_hash[..8]);
+
+        let cache = self.route_cache.lock().await;
+        let addrs: Vec<SocketAddr> = cache
+            .announcements
+            .iter()
+            .filter(|(key, ann)| {
+                key.space_prefix == target_prefix
+                    && ann.frame.slot >= min_slot
+                    && ann.frame.capabilities.direct_udp
+            })
+            .flat_map(|(_, ann)| ann.frame.reachable_udp.iter().cloned())
+            .take(limit)
+            .collect();
+
+        Ok(addrs)
     }
 }
 

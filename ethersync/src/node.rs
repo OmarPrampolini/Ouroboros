@@ -7,18 +7,24 @@ use crate::{
     gossip::{GossipEngine, PeerManager},
     message::EtherMessage,
     network::EtherUdpSocket,
+    routing::{
+        decode_orp_frame, encode_orp_frame, OrpFrame, RouteAnnouncement, RouteCache,
+        RouteCapabilities, RouteHop, RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE,
+        SUBSPACE_ROUTE_LOOKUP, SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
+    },
     storage::EtherStorage,
     EtherSyncError,
 };
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
-use std::collections::HashSet;
+use ouroboros_crypto::random::fill_random;
+use std::collections::{HashMap as StdHashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::interval;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 /// EtherNode configuration
 #[derive(Debug, Clone)]
@@ -43,6 +49,10 @@ pub struct NodeConfig {
     pub gossip_ttl: u8,
     /// Slot duration override (0 = use default)
     pub slot_duration_secs: u64,
+    /// Enable ORP deterministic overlay routing
+    pub enable_orp: bool,
+    /// How often to publish ORP route announcements (seconds)
+    pub orp_announce_interval_secs: u64,
 }
 
 impl Default for NodeConfig {
@@ -57,7 +67,9 @@ impl Default for NodeConfig {
             erasure_parity_fragments: 2,
             enable_compression: true,
             gossip_ttl: 3,
-            slot_duration_secs: 0, // Use default
+            slot_duration_secs: 0,
+            enable_orp: false,
+            orp_announce_interval_secs: 60,
         }
     }
 }
@@ -93,6 +105,17 @@ pub struct EtherNode {
     seen_messages: Arc<RwLock<HashSet<[u8; 32]>>>,
     /// Max seen cache size
     max_seen_cache: usize,
+    /// ORP route cache (shared across tasks)
+    route_cache: Arc<Mutex<RouteCache>>,
+    /// Ephemeral node id for the current session (random 16 bytes)
+    node_id: [u8; 16],
+    /// Active ORP spaces: maps space_prefix (first 8 bytes of space_hash)
+    /// to the passphrase that was used to join.  Only populated when
+    /// `start_orp_for_space` is called.
+    orp_spaces: Arc<RwLock<StdHashMap<[u8; 8], String>>>,
+    /// Handles for ORP announce tasks (one per space), so they can be
+    /// cleaned up on stop.
+    orp_announce_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl EtherNode {
@@ -129,6 +152,12 @@ impl EtherNode {
             Arc::clone(&socket),
         ))));
 
+        // Generate ephemeral node id for this session
+        let mut node_id = [0u8; 16];
+        fill_random(&mut node_id).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate node id".to_string())
+        })?;
+
         Ok(Self {
             config,
             storage,
@@ -138,6 +167,10 @@ impl EtherNode {
             subscriptions: Arc::new(RwLock::new(Vec::new())),
             seen_messages: Arc::new(RwLock::new(HashSet::new())),
             max_seen_cache: 10000,
+            route_cache: Arc::new(Mutex::new(RouteCache::new())),
+            node_id,
+            orp_spaces: Arc::new(RwLock::new(StdHashMap::new())),
+            orp_announce_tasks: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -301,32 +334,159 @@ impl EtherNode {
         // Clone refs for subscription router
         let subscriptions = Arc::clone(&self.subscriptions);
 
+        // Clone route_cache for the router task
+        let route_cache_router = Arc::clone(&self.route_cache);
+
+        // Clones needed for Lookup → Offer response generation
+        let router_node_id = self.node_id;
+        let router_socket = Arc::clone(&self.socket);
+        let router_gossip = Arc::clone(&self.gossip_engine);
+        let router_storage = Arc::clone(&self.storage);
+        let router_seen = Arc::clone(&self.seen_messages);
+        let router_max_seen = self.max_seen_cache;
+        let router_enable_orp = self.config.enable_orp;
+
         // Spawn subscription router task
         let router_handle = tokio::spawn(async move {
             while let Some(msg) = new_msg_rx.recv().await {
+                let subspace = msg.header.subspace;
+
                 // Route message to matching subscriptions
                 let subs = subscriptions.read().await;
                 for sub in subs.iter() {
-                    // Derive expected coordinate_hash for this subscription
-                    // using the message's slot and compare with message's coordinate_hash
-                    let expected_hash =
-                        match EtherCoordinate::derive(&sub._passphrase, msg.header.slot_id, 0) {
-                            Ok(coord) => {
-                                use ouroboros_crypto::hash::blake3_hash;
-                                let mut encoded = Vec::with_capacity(32 + 8 + 8 + 16);
-                                encoded.extend_from_slice(&coord.space_hash);
-                                encoded.extend_from_slice(&coord.slot.to_be_bytes());
-                                encoded.extend_from_slice(&coord.subspace.to_be_bytes());
-                                encoded.extend_from_slice(&coord.entropy);
-                                blake3_hash(&encoded)
-                            }
-                            Err(_) => continue,
-                        };
+                    // Derive expected coordinate_hash for this subscription at the
+                    // message's subspace so both user and ORP subspaces are matched.
+                    let expected_hash = match EtherCoordinate::derive(
+                        &sub._passphrase,
+                        msg.header.slot_id,
+                        subspace,
+                    ) {
+                        Ok(coord) => {
+                            use ouroboros_crypto::hash::blake3_hash;
+                            let mut encoded = Vec::with_capacity(32 + 8 + 8 + 16);
+                            encoded.extend_from_slice(&coord.space_hash);
+                            encoded.extend_from_slice(&coord.slot.to_be_bytes());
+                            encoded.extend_from_slice(&coord.subspace.to_be_bytes());
+                            encoded.extend_from_slice(&coord.entropy);
+                            blake3_hash(&encoded)
+                        }
+                        Err(_) => continue,
+                    };
 
-                    if msg.header.coordinate_hash == expected_hash {
-                        // Try to send - ignore errors if channel closed
-                        let _ = sub.sender.send(msg.clone()).await;
+                    if msg.header.coordinate_hash != expected_hash {
+                        continue;
                     }
+
+                    if subspace == SUBSPACE_USER {
+                        // Regular user payload — deliver to subscriber channel.
+                        let _ = sub.sender.send(msg.clone()).await;
+                        continue;
+                    }
+
+                    // ORP control frame — decrypt and feed into route cache.
+                    let plaintext = match msg.decrypt(&sub._passphrase) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let frame = match crate::routing::decode_orp_frame(&plaintext) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let current_slot = EtherCoordinate::current_slot();
+                    let passphrase_bytes =
+                        ouroboros_crypto::derive::canonicalize_passphrase(&sub._passphrase);
+                    let space_hash = ouroboros_crypto::hash::blake3_hash(&passphrase_bytes);
+                    let dummy_src: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+                    let mut cache = route_cache_router.lock().await;
+                    match frame {
+                        OrpFrame::Announce(ann) => {
+                            cache.insert_announcement(ann, dummy_src, current_slot, &space_hash);
+                        }
+                        OrpFrame::Offer(offer) => {
+                            cache.insert_offer(offer);
+                        }
+                        OrpFrame::Lookup(lookup) if router_enable_orp => {
+                            // Check if OUR assist_tag matches the lookup target_tag.
+                            let mut our_tag = [0u8; 8];
+                            let tag_hash = ouroboros_crypto::hash::blake3_hash(&router_node_id);
+                            our_tag.copy_from_slice(&tag_hash[..8]);
+
+                            if our_tag != lookup.target_tag {
+                                // Not addressed to us — ignore.
+                                continue;
+                            }
+
+                            let local_addr = router_socket.local_addr();
+                            let hop = if !local_addr.ip().is_unspecified() {
+                                RouteHop::Direct { addr: local_addr }
+                            } else {
+                                // Can't offer a route if we have no reachable addr.
+                                continue;
+                            };
+
+                            let offer = RouteOffer {
+                                version: 1,
+                                lookup_id: lookup.lookup_id,
+                                responder_id: router_node_id,
+                                next_hop: hop,
+                                score: 5000, // direct = highest base score
+                            };
+                            let offer_frame = OrpFrame::Offer(offer);
+                            let offer_payload = match crate::routing::encode_orp_frame(&offer_frame) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+
+                            let slot = EtherCoordinate::current_slot();
+                            let offer_msg = match EtherMessage::new_control_message(
+                                &sub._passphrase,
+                                slot,
+                                &offer_payload,
+                                SUBSPACE_ROUTE_OFFER,
+                            ) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+
+                            let hash = ouroboros_crypto::hash::blake3_hash(&offer_msg.encrypted_payload);
+                            {
+                                let mut st = router_storage.lock().await;
+                                let _ = st.store(slot, hash, offer_msg.clone());
+                            }
+                            {
+                                let mut seen = router_seen.write().await;
+                                seen.insert(hash);
+                                if seen.len() > router_max_seen {
+                                    let to_remove: Vec<_> = seen.iter().take(seen.len() / 2).cloned().collect();
+                                    for h in to_remove { seen.remove(&h); }
+                                }
+                            }
+
+                            // Gossip the offer
+                            let ge = router_gossip.clone();
+                            let m = offer_msg;
+                            tokio::spawn(async move {
+                                for _ in 0..50 {
+                                    {
+                                        let g = ge.read().await;
+                                        if let Some(ref engine) = *g {
+                                            let _ = engine.publish(m).await;
+                                            return;
+                                        }
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                            });
+
+                            trace!(
+                                "ORP: responded to lookup {:?} with direct offer",
+                                &lookup.lookup_id[..4]
+                            );
+                        }
+                        _ => {} // Forward, Ack, Lookup when ORP disabled
+                    }
+                    drop(cache);
                 }
             }
         });
@@ -518,6 +678,317 @@ impl EtherNode {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // ORP — Ouroboros Routing Protocol
+    // -----------------------------------------------------------------------
+
+    /// Publish an ORP route announcement for the given passphrase space.
+    ///
+    /// The announcement is encrypted with the same passphrase on subspace 1
+    /// and gossiped to all known peers, making this node discoverable by others
+    /// in the same slot without relying on static bootstrap peers.
+    pub async fn publish_route_announcement(
+        &self,
+        passphrase: &str,
+    ) -> Result<(), EtherSyncError> {
+        let slot = EtherCoordinate::current_slot();
+        let local_addr = self.socket.local_addr();
+
+        // Build assist_tag: first 8 bytes of blake3(node_id)
+        let mut assist_tag = [0u8; 8];
+        let tag_hash = blake3_hash(&self.node_id);
+        assist_tag.copy_from_slice(&tag_hash[..8]);
+
+        let announcement = RouteAnnouncement {
+            version: 1,
+            slot,
+            node_id: self.node_id,
+            capabilities: RouteCapabilities {
+                can_relay: false,
+                direct_udp: !local_addr.ip().is_unspecified(),
+                wan_assist: false,
+                tor_capable: false,
+            },
+            reachable_udp: if local_addr.ip().is_unspecified() {
+                vec![]
+            } else {
+                vec![local_addr]
+            },
+            assist_tag,
+            expires_at_slot: slot + 4,
+        };
+
+        let frame = OrpFrame::Announce(announcement);
+        let payload = encode_orp_frame(&frame)?;
+
+        let msg = EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_ANNOUNCE)?;
+
+        // Store locally and gossip
+        let hash = Self::message_hash(&msg);
+        {
+            let mut storage = self.storage.lock().await;
+            storage.store(slot, hash, msg.clone())?;
+        }
+        {
+            let mut seen = self.seen_messages.write().await;
+            seen.insert(hash);
+            self.cleanup_seen_cache(&mut seen).await;
+        }
+
+        let gossip_engine = self.gossip_engine.clone();
+        let msg_clone = msg.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                {
+                    let engine_guard = gossip_engine.read().await;
+                    if let Some(ref engine) = *engine_guard {
+                        if let Err(e) = engine.publish(msg_clone).await {
+                            trace!("ORP announce gossip failed: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        trace!("Published ORP route announcement for slot {}", slot);
+        Ok(())
+    }
+
+    /// Broadcast a route lookup into the passphrase space and return the lookup id.
+    ///
+    /// Callers should wait briefly and then call `best_route` with the returned
+    /// lookup id to retrieve the highest-scored offer received from peers.
+    pub async fn lookup_route(
+        &self,
+        passphrase: &str,
+        target_tag: [u8; 8],
+    ) -> Result<[u8; 16], EtherSyncError> {
+        let slot = EtherCoordinate::current_slot();
+
+        let mut lookup_id = [0u8; 16];
+        fill_random(&mut lookup_id).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate lookup id".to_string())
+        })?;
+
+        let lookup = RouteLookup {
+            version: 1,
+            lookup_id,
+            target_tag,
+            max_hops: 2,
+            ttl: 3,
+        };
+
+        let frame = OrpFrame::Lookup(lookup);
+        let payload = encode_orp_frame(&frame)?;
+
+        let msg = EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_LOOKUP)?;
+
+        let hash = Self::message_hash(&msg);
+        {
+            let mut storage = self.storage.lock().await;
+            storage.store(slot, hash, msg.clone())?;
+        }
+        {
+            let mut seen = self.seen_messages.write().await;
+            seen.insert(hash);
+            self.cleanup_seen_cache(&mut seen).await;
+        }
+
+        let gossip_engine = self.gossip_engine.clone();
+        let msg_clone = msg.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                {
+                    let engine_guard = gossip_engine.read().await;
+                    if let Some(ref engine) = *engine_guard {
+                        if let Err(e) = engine.publish(msg_clone).await {
+                            trace!("ORP lookup gossip failed: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        trace!("Published ORP route lookup {:?} for tag {:?}", lookup_id, target_tag);
+        Ok(lookup_id)
+    }
+
+    /// Return the best cached route offer for the given lookup id, if any.
+    pub async fn best_route(
+        &self,
+        _passphrase: &str,
+        lookup_id: [u8; 16],
+    ) -> Result<Option<RouteOffer>, EtherSyncError> {
+        let cache = self.route_cache.lock().await;
+        Ok(cache.best_offer(&lookup_id).map(|co| co.frame.clone()))
+    }
+
+    /// Activate ORP for a passphrase space.
+    ///
+    /// Registers the space prefix, starts periodic route announcements,
+    /// and publishes an immediate first announcement.  Returns the space
+    /// prefix so callers can track it.
+    pub async fn start_orp_for_space(&self, passphrase: &str) -> [u8; 8] {
+        let passphrase_bytes = canonicalize_passphrase(passphrase);
+        let space_hash = blake3_hash(&passphrase_bytes);
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&space_hash[..8]);
+
+        // Register the space
+        {
+            let mut spaces = self.orp_spaces.write().await;
+            spaces.insert(prefix, passphrase.to_string());
+        }
+
+        // Immediate first announcement
+        if let Err(e) = self.publish_route_announcement(passphrase).await {
+            warn!("ORP: initial announcement failed: {:?}", e);
+        }
+
+        // Start periodic announce task
+        let handle = self.spawn_orp_announce_task(
+            passphrase.to_string(),
+            self.config.orp_announce_interval_secs,
+        );
+        {
+            let mut tasks = self.orp_announce_tasks.lock().await;
+            tasks.push(handle);
+        }
+
+        info!(
+            "ORP: activated for space {} (announce interval {}s)",
+            hex::encode(prefix),
+            self.config.orp_announce_interval_secs
+        );
+        prefix
+    }
+
+    /// Return all space prefixes that have ORP active.
+    pub async fn orp_space_prefixes(&self) -> Vec<[u8; 8]> {
+        self.orp_spaces.read().await.keys().cloned().collect()
+    }
+
+    /// Spawn the ORP periodic announcement task.
+    fn spawn_orp_announce_task(
+        &self,
+        passphrase: String,
+        interval_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let gossip_engine = Arc::clone(&self.gossip_engine);
+        let storage = Arc::clone(&self.storage);
+        let seen_messages = Arc::clone(&self.seen_messages);
+        let route_cache = Arc::clone(&self.route_cache);
+        let socket = Arc::clone(&self.socket);
+        let node_id = self.node_id;
+        let max_seen_cache = self.max_seen_cache;
+
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(interval_secs));
+            loop {
+                ticker.tick().await;
+
+                let slot = EtherCoordinate::current_slot();
+                let local_addr = socket.local_addr();
+
+                let mut assist_tag = [0u8; 8];
+                let tag_hash = blake3_hash(&node_id);
+                assist_tag.copy_from_slice(&tag_hash[..8]);
+
+                let announcement = RouteAnnouncement {
+                    version: 1,
+                    slot,
+                    node_id,
+                    capabilities: RouteCapabilities {
+                        can_relay: false,
+                        direct_udp: !local_addr.ip().is_unspecified(),
+                        wan_assist: false,
+                        tor_capable: false,
+                    },
+                    reachable_udp: if local_addr.ip().is_unspecified() {
+                        vec![]
+                    } else {
+                        vec![local_addr]
+                    },
+                    assist_tag,
+                    expires_at_slot: slot + 4,
+                };
+
+                let frame = OrpFrame::Announce(announcement);
+                let payload = match encode_orp_frame(&frame) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("ORP encode error in announce task: {:?}", e);
+                        continue;
+                    }
+                };
+
+                let msg = match EtherMessage::new_control_message(
+                    &passphrase,
+                    slot,
+                    &payload,
+                    SUBSPACE_ROUTE_ANNOUNCE,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("ORP message creation error: {:?}", e);
+                        continue;
+                    }
+                };
+
+                let hash = blake3_hash(&msg.encrypted_payload);
+                {
+                    let mut st = storage.lock().await;
+                    let _ = st.store(slot, hash, msg.clone());
+                }
+                {
+                    let mut seen = seen_messages.write().await;
+                    seen.insert(hash);
+                    if seen.len() > max_seen_cache {
+                        let to_remove: Vec<_> = seen.iter().take(seen.len() / 2).cloned().collect();
+                        for h in to_remove { seen.remove(&h); }
+                    }
+                }
+
+                // Evict stale cache entries on each announce cycle
+                {
+                    let mut cache = route_cache.lock().await;
+                    cache.evict_stale(slot, 600); // 10 minutes
+                }
+
+                let ge = gossip_engine.clone();
+                let m = msg.clone();
+                tokio::spawn(async move {
+                    for _ in 0..50 {
+                        {
+                            let g = ge.read().await;
+                            if let Some(ref engine) = *g {
+                                let _ = engine.publish(m).await;
+                                return;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                });
+
+                trace!("ORP periodic announcement published for slot {}", slot);
+            }
+        })
+    }
+
+    /// Get a reference to the ORP route cache.
+    pub fn route_cache(&self) -> &Arc<Mutex<RouteCache>> {
+        &self.route_cache
+    }
+
+    /// Return this node's ephemeral session id.
+    pub fn node_id(&self) -> [u8; 16] {
+        self.node_id
+    }
 }
 
 #[cfg(feature = "handshake-fallback")]
@@ -574,5 +1045,101 @@ mod tests {
 
         // Hashes should be different due to random nonce
         assert_ne!(hash1, hash2);
+    }
+
+    #[tokio::test]
+    async fn test_orp_disabled_no_spaces() {
+        let config = NodeConfig {
+            enable_orp: false,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        // With ORP disabled, no spaces should be registered
+        let prefixes = node.orp_space_prefixes().await;
+        assert!(prefixes.is_empty());
+
+        // Route cache should be empty
+        let cache = node.route_cache().lock().await;
+        assert!(cache.announcements.is_empty());
+        assert!(cache.offers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_start_orp_for_space_registers_prefix() {
+        let config = NodeConfig {
+            enable_orp: true,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        let prefix = node.start_orp_for_space("test-passphrase").await;
+
+        // Prefix should be non-zero
+        assert_ne!(prefix, [0u8; 8]);
+
+        // Space should now appear in orp_space_prefixes
+        let prefixes = node.orp_space_prefixes().await;
+        assert_eq!(prefixes.len(), 1);
+        assert!(prefixes.contains(&prefix));
+    }
+
+    #[tokio::test]
+    async fn test_start_orp_produces_announcement_in_cache() {
+        let config = NodeConfig {
+            enable_orp: true,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        let _prefix = node.start_orp_for_space("announce-test").await;
+
+        // The initial announcement should be stored in local storage
+        // and the route cache gets populated when announcements are
+        // received from gossip. Let's verify the announcement was at
+        // least published by checking storage.
+        let slot = crate::EtherCoordinate::current_slot();
+        let storage = node.storage().lock().await;
+        let msgs = storage.get_slot_messages(slot).unwrap_or_default();
+        // Should have at least 1 message (the route announcement)
+        assert!(!msgs.is_empty(), "ORP announcement should be stored locally");
+    }
+
+    #[tokio::test]
+    async fn test_orp_deterministic_prefix() {
+        // Same passphrase must produce same prefix
+        let config = NodeConfig {
+            enable_orp: true,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        let prefix1 = node.start_orp_for_space("deterministic-test").await;
+        let prefix2 = node.start_orp_for_space("deterministic-test").await;
+        assert_eq!(prefix1, prefix2, "same passphrase must yield same space prefix");
+
+        // Different passphrase must produce different prefix
+        let prefix3 = node.start_orp_for_space("other-passphrase").await;
+        assert_ne!(prefix1, prefix3, "different passphrases must yield different prefixes");
+    }
+
+    #[tokio::test]
+    async fn test_orp_no_cross_space_in_space_prefixes() {
+        let config = NodeConfig {
+            enable_orp: true,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        let prefix_a = node.start_orp_for_space("space-alpha").await;
+        let prefix_b = node.start_orp_for_space("space-beta").await;
+
+        let prefixes = node.orp_space_prefixes().await;
+        assert_eq!(prefixes.len(), 2);
+        assert!(prefixes.contains(&prefix_a));
+        assert!(prefixes.contains(&prefix_b));
+
+        // Verify they're distinct
+        assert_ne!(prefix_a, prefix_b);
     }
 }
