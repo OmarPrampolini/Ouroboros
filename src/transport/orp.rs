@@ -5,6 +5,7 @@
 //! specific `assist_tag` inside active ORP spaces, prefer fresh cached
 //! announcements for that tag, then fall back to the lookup/offer flow.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use ethersync::routing::{RouteHop, ANNOUNCE_SLOT_LOOKBACK};
@@ -20,9 +21,35 @@ use crate::transport::{connect_to, Connection};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
-fn push_unique_addr(out: &mut Vec<SocketAddr>, addr: SocketAddr) {
-    if !out.contains(&addr) {
-        out.push(addr);
+#[derive(Debug, Clone)]
+struct RouteCandidate {
+    addr: SocketAddr,
+    score: u16,
+    source: String,
+}
+
+fn push_candidate(
+    out: &mut HashMap<SocketAddr, RouteCandidate>,
+    addr: SocketAddr,
+    score: u16,
+    source: String,
+) {
+    match out.get_mut(&addr) {
+        Some(existing) if existing.score >= score => {}
+        Some(existing) => {
+            existing.score = score;
+            existing.source = source;
+        }
+        None => {
+            out.insert(
+                addr,
+                RouteCandidate {
+                    addr,
+                    score,
+                    source,
+                },
+            );
+        }
     }
 }
 
@@ -68,7 +95,7 @@ pub async fn try_orp_route(
     let current_slot = EtherCoordinate::current_slot();
     let min_slot = current_slot.saturating_sub(ANNOUNCE_SLOT_LOOKBACK);
     let local_node_id = node.node_id();
-    let mut candidates = Vec::new();
+    let mut candidates = HashMap::new();
 
     {
         let cache = node.route_cache().lock().await;
@@ -82,7 +109,18 @@ pub async fn try_orp_route(
                 }
 
                 for addr in &announcement.frame.reachable_udp {
-                    push_unique_addr(&mut candidates, *addr);
+                    push_candidate(
+                        &mut candidates,
+                        *addr,
+                        ethersync::score_announcement(announcement, current_slot),
+                        format!(
+                            "space={} class={:?} operator={} region={}",
+                            hex::encode(space_prefix),
+                            announcement.frame.route_class,
+                            announcement.frame.operator_id_hint,
+                            announcement.frame.region_hint
+                        ),
+                    );
                 }
             }
         }
@@ -119,7 +157,12 @@ pub async fn try_orp_route(
             match node.best_route(&passphrase, lookup_id).await {
                 Ok(Some(offer)) => {
                     if let RouteHop::Direct { addr } = offer.next_hop {
-                        push_unique_addr(&mut candidates, addr);
+                        push_candidate(
+                            &mut candidates,
+                            addr,
+                            offer.score,
+                            format!("lookup={} direct-offer", hex::encode(lookup_id)),
+                        );
                     }
                 }
                 Ok(None) => {}
@@ -152,6 +195,13 @@ pub async fn try_orp_route(
         )));
     }
 
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.addr.to_string().cmp(&b.addr.to_string()))
+    });
+
     tracing::debug!(
         "ORP: {} candidate(s) resolved for assist_tag={} across {} active space(s)",
         candidates.len(),
@@ -160,13 +210,23 @@ pub async fn try_orp_route(
     );
 
     let dial_timeout = Duration::from_millis(cfg.wan_connect_timeout_ms.clamp(500, 5_000));
-    for addr in &candidates {
-        let target = addr.to_string();
-        tracing::debug!("ORP: dialing resolved candidate {}", target);
+    for candidate in &candidates {
+        let target = candidate.addr.to_string();
+        tracing::debug!(
+            "ORP: dialing resolved candidate {} score={} source={}",
+            target,
+            candidate.score,
+            candidate.source
+        );
 
         match timeout(dial_timeout, connect_to(&target, params, cfg)).await {
             Ok(Ok(conn)) => {
-                tracing::info!("ORP: connection established via {}", addr);
+                tracing::info!(
+                    "ORP: connection established via {} score={} source={}",
+                    candidate.addr,
+                    candidate.score,
+                    candidate.source
+                );
                 network_telemetry::record_strategy_result("orp", true);
                 return Ok(conn);
             }
@@ -174,17 +234,23 @@ pub async fn try_orp_route(
                 network_telemetry::record_fallback_event(
                     "orp",
                     "candidate_failed",
-                    Some(format!("addr={} err={}", addr, e)),
+                    Some(format!(
+                        "addr={} score={} source={} err={}",
+                        candidate.addr, candidate.score, candidate.source, e
+                    )),
                 );
-                tracing::debug!("ORP: {} unreachable: {}", addr, e);
+                tracing::debug!("ORP: {} unreachable: {}", candidate.addr, e);
             }
             Err(_) => {
                 network_telemetry::record_fallback_event(
                     "orp",
                     "candidate_timeout",
-                    Some(format!("addr={}", addr)),
+                    Some(format!(
+                        "addr={} score={} source={}",
+                        candidate.addr, candidate.score, candidate.source
+                    )),
                 );
-                tracing::debug!("ORP: {} timed out", addr);
+                tracing::debug!("ORP: {} timed out", candidate.addr);
             }
         }
     }

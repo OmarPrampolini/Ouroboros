@@ -162,6 +162,28 @@ pub struct Config {
     /// before falling back to Tor.  Requires an active EtherNode.
     #[serde(default)]
     pub enable_orp: bool,
+    /// Operator identity hint advertised by this node when ORP is active.
+    pub operator_id: String,
+    /// Region or deployment bucket advertised by this node when ORP is active.
+    pub operator_region: String,
+    /// Whether this node should advertise relay capability in ORP.
+    pub operator_can_relay: bool,
+    /// Whether this node should advertise bridge/bootstrap capability in ORP.
+    pub operator_bridge_capable: bool,
+    /// Whether this node should advertise keeper capability in ORP.
+    pub operator_keeper_capable: bool,
+    /// Whether keeper-backed replication is enabled for the local runtime.
+    pub keeper_replication_enabled: bool,
+    /// Replication factor for managed keeper-backed retention.
+    pub keeper_replication_factor: usize,
+    /// Human-readable retention tier for status surfaces.
+    pub retention_tier: String,
+    /// Static bridge bootstrap hints visible to the local runtime.
+    pub bridge_bootstrap_hints: Vec<String>,
+    /// Optional path to a JSON bootstrap bundle describing relays, bridges, and keepers.
+    pub bootstrap_bundle_path: Option<String>,
+    /// Optional inline JSON bootstrap bundle for local development.
+    pub bootstrap_bundle_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +241,17 @@ impl Config {
             nat_detection_servers: vec!["8.8.8.8:19302".into(), "1.1.1.1:3478".into()],
             require_capabilities: false,
             enable_orp: false,
+            operator_id: "local-node".to_string(),
+            operator_region: "unknown".to_string(),
+            operator_can_relay: false,
+            operator_bridge_capable: false,
+            operator_keeper_capable: false,
+            keeper_replication_enabled: false,
+            keeper_replication_factor: 0,
+            retention_tier: "local-only".to_string(),
+            bridge_bootstrap_hints: Vec::new(),
+            bootstrap_bundle_path: None,
+            bootstrap_bundle_json: None,
         }
     }
 }
@@ -560,6 +593,75 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_OPERATOR_ID") {
+            let value = value.trim();
+            if !value.is_empty() {
+                config.operator_id = value.to_string();
+            }
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_OPERATOR_REGION") {
+            let value = value.trim();
+            if !value.is_empty() {
+                config.operator_region = value.to_string();
+            }
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_OPERATOR_CAN_RELAY") {
+            config.operator_can_relay =
+                matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_OPERATOR_BRIDGE_CAPABLE") {
+            config.operator_bridge_capable =
+                matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_OPERATOR_KEEPER_CAPABLE") {
+            config.operator_keeper_capable =
+                matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_KEEPER_REPLICATION_ENABLED") {
+            config.keeper_replication_enabled =
+                matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_KEEPER_REPLICATION_FACTOR") {
+            if let Ok(value) = value.parse::<usize>() {
+                config.keeper_replication_factor = value.min(16);
+            }
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_RETENTION_TIER") {
+            let value = value.trim();
+            if !value.is_empty() {
+                config.retention_tier = value.to_string();
+            }
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_BRIDGE_BOOTSTRAP_HINTS") {
+            config.bridge_bootstrap_hints = value
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_BOOTSTRAP_BUNDLE_PATH") {
+            let value = value.trim();
+            if !value.is_empty() {
+                config.bootstrap_bundle_path = Some(value.to_string());
+            }
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_BOOTSTRAP_BUNDLE_JSON") {
+            let value = value.trim();
+            if !value.is_empty() {
+                config.bootstrap_bundle_json = Some(value.to_string());
+            }
         }
 
         config

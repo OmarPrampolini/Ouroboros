@@ -235,6 +235,7 @@ Claims that are not yet unlocked:
 - [README.md](../README.md)
 - [docs/roadmap_gates.md](./roadmap_gates.md)
 - [docs/operators.md](./operators.md)
+- [docs/bootstrap_bundle.md](./bootstrap_bundle.md)
 - [docs/interop.md](./interop.md)
 - [docs/threat_model_book.md](./threat_model_book.md)
 - [docs/adr/0001-deterministic-scope.md](./adr/0001-deterministic-scope.md)

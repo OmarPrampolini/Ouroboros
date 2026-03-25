@@ -8,8 +8,8 @@ use crate::{
     message::EtherMessage,
     network::EtherUdpSocket,
     routing::{
-        encode_orp_frame, OrpFrame, RouteAnnouncement, RouteCache, RouteCapabilities, RouteHop,
-        RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_LOOKUP,
+        encode_orp_frame, OrpFrame, RouteAnnouncement, RouteCache, RouteCapabilities, RouteClass,
+        RouteHop, RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_LOOKUP,
         SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
     },
     storage::EtherStorage,
@@ -53,6 +53,14 @@ pub struct NodeConfig {
     pub enable_orp: bool,
     /// How often to publish ORP route announcements (seconds)
     pub orp_announce_interval_secs: u64,
+    /// ORP role hints advertised in route announcements.
+    pub orp_can_relay: bool,
+    pub orp_wan_assist: bool,
+    pub orp_tor_capable: bool,
+    pub orp_bridge_capable: bool,
+    pub orp_keeper_capable: bool,
+    pub orp_operator_id_hint: String,
+    pub orp_region_hint: String,
 }
 
 impl Default for NodeConfig {
@@ -70,6 +78,13 @@ impl Default for NodeConfig {
             slot_duration_secs: 0,
             enable_orp: false,
             orp_announce_interval_secs: 60,
+            orp_can_relay: false,
+            orp_wan_assist: false,
+            orp_tor_capable: false,
+            orp_bridge_capable: false,
+            orp_keeper_capable: false,
+            orp_operator_id_hint: "local-node".to_string(),
+            orp_region_hint: "unknown".to_string(),
         }
     }
 }
@@ -119,6 +134,18 @@ pub struct EtherNode {
 }
 
 impl EtherNode {
+    fn route_class_for_config(config: &NodeConfig) -> RouteClass {
+        if config.orp_bridge_capable {
+            RouteClass::Bridge
+        } else if config.orp_keeper_capable {
+            RouteClass::Keeper
+        } else if config.orp_wan_assist || config.orp_can_relay {
+            RouteClass::Assisted
+        } else {
+            RouteClass::Direct
+        }
+    }
+
     /// Create and initialize new EtherNode
     ///
     /// Binds UDP socket and initializes all components
@@ -707,10 +734,12 @@ impl EtherNode {
             slot,
             node_id: self.node_id,
             capabilities: RouteCapabilities {
-                can_relay: false,
+                can_relay: self.config.orp_can_relay,
                 direct_udp: !local_addr.ip().is_unspecified(),
-                wan_assist: false,
-                tor_capable: false,
+                wan_assist: self.config.orp_wan_assist,
+                tor_capable: self.config.orp_tor_capable,
+                bridge_capable: self.config.orp_bridge_capable,
+                keeper_capable: self.config.orp_keeper_capable,
             },
             reachable_udp: if local_addr.ip().is_unspecified() {
                 vec![]
@@ -718,6 +747,10 @@ impl EtherNode {
                 vec![local_addr]
             },
             assist_tag,
+            route_class: Self::route_class_for_config(&self.config),
+            operator_id_hint: self.config.orp_operator_id_hint.clone(),
+            region_hint: self.config.orp_region_hint.clone(),
+            measured_rtt_ms: None,
             expires_at_slot: slot + 4,
         };
 
@@ -833,7 +866,9 @@ impl EtherNode {
         lookup_id: [u8; 16],
     ) -> Result<Option<RouteOffer>, EtherSyncError> {
         let cache = self.route_cache.lock().await;
-        Ok(cache.best_offer(&lookup_id).map(|co| co.frame.clone()))
+        Ok(cache
+            .best_offer(&lookup_id, EtherCoordinate::current_slot())
+            .map(|co| co.frame.clone()))
     }
 
     /// Return active ORP spaces with their passphrases.
@@ -930,6 +965,14 @@ impl EtherNode {
         let socket = Arc::clone(&self.socket);
         let node_id = self.node_id;
         let max_seen_cache = self.max_seen_cache;
+        let orp_can_relay = self.config.orp_can_relay;
+        let orp_wan_assist = self.config.orp_wan_assist;
+        let orp_tor_capable = self.config.orp_tor_capable;
+        let orp_bridge_capable = self.config.orp_bridge_capable;
+        let orp_keeper_capable = self.config.orp_keeper_capable;
+        let orp_operator_id_hint = self.config.orp_operator_id_hint.clone();
+        let orp_region_hint = self.config.orp_region_hint.clone();
+        let route_class = Self::route_class_for_config(&self.config);
 
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(interval_secs));
@@ -948,10 +991,12 @@ impl EtherNode {
                     slot,
                     node_id,
                     capabilities: RouteCapabilities {
-                        can_relay: false,
+                        can_relay: orp_can_relay,
                         direct_udp: !local_addr.ip().is_unspecified(),
-                        wan_assist: false,
-                        tor_capable: false,
+                        wan_assist: orp_wan_assist,
+                        tor_capable: orp_tor_capable,
+                        bridge_capable: orp_bridge_capable,
+                        keeper_capable: orp_keeper_capable,
                     },
                     reachable_udp: if local_addr.ip().is_unspecified() {
                         vec![]
@@ -959,6 +1004,10 @@ impl EtherNode {
                         vec![local_addr]
                     },
                     assist_tag,
+                    route_class,
+                    operator_id_hint: orp_operator_id_hint.clone(),
+                    region_hint: orp_region_hint.clone(),
+                    measured_rtt_ms: None,
                     expires_at_slot: slot + 4,
                 };
 

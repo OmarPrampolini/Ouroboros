@@ -89,7 +89,14 @@ Shared cryptographic building blocks:
 - target-aware lookup and offer flow
 - route cache for ORP-Standard
 - target connect through `orp:<16-hex>`
+- route classes, operator hints, and region hints in announcements
 - future wire contract formalized for high-risk circuits
+
+### Bootstrap and keeper posture
+
+- bootstrap bundles can now be loaded for diagnostics and operator visibility
+- keeper replication posture is surfaced in runtime status
+- bridge hints and operator identity hints are part of the current code model
 
 ## Current truth
 

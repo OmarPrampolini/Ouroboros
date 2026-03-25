@@ -215,6 +215,7 @@ The API now exposes:
 - route and ORP diagnostics
 - keeper and retention scaffolding
 - capability reporting for `quic`, `webrtc`, `pq`, ORP tiers, and bridge bootstrap posture
+- operator hints, route class counts, and bootstrap bundle visibility
 
 ## Wire and Interop Posture
 
@@ -247,6 +248,7 @@ If you want the system-level map, start here:
 - [Architecture Book](./docs/ARCHITECTURE_BOOK.md)
 - [Roadmap and Gates](./docs/roadmap_gates.md)
 - [Interop and Versioning](./docs/interop.md)
+- [Bootstrap Bundle](./docs/bootstrap_bundle.md)
 - [Operator Model](./docs/operators.md)
 - [Threat Model Book](./docs/threat_model_book.md)
 - [Feature Flags](./docs/feature_flags.md)

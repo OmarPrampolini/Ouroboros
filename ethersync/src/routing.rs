@@ -68,6 +68,10 @@ pub struct RouteCapabilities {
     pub wan_assist: bool,
     /// Peer supports Tor as a fallback transport.
     pub tor_capable: bool,
+    /// Peer can act as a bridge/bootstrap ingress helper.
+    pub bridge_capable: bool,
+    /// Peer can participate in keeper-backed retention.
+    pub keeper_capable: bool,
 }
 
 impl Default for RouteCapabilities {
@@ -77,8 +81,20 @@ impl Default for RouteCapabilities {
             direct_udp: true,
             wan_assist: false,
             tor_capable: false,
+            bridge_capable: false,
+            keeper_capable: false,
         }
     }
+}
+
+/// High-level class for a route announcement within ORP-Standard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteClass {
+    Direct,
+    Assisted,
+    Bridge,
+    Keeper,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +147,14 @@ pub struct RouteAnnouncement {
     pub reachable_udp: Vec<SocketAddr>,
     /// Short tag used to look up this peer in relay-assisted forwarding.
     pub assist_tag: [u8; 8],
+    /// High-level route class to help route selection and diagnostics.
+    pub route_class: RouteClass,
+    /// Stable but non-authoritative operator identity hint.
+    pub operator_id_hint: String,
+    /// Region or deployment bucket hint for diversity diagnostics.
+    pub region_hint: String,
+    /// Best-effort RTT hint in milliseconds when available.
+    pub measured_rtt_ms: Option<u16>,
     /// Slot after which this announcement should be discarded.
     pub expires_at_slot: u64,
 }
@@ -365,15 +389,16 @@ impl RouteCache {
             .iter()
             .filter(|(k, _)| k.space_prefix == *space_prefix && k.slot >= min_slot)
             .map(|(_, v)| v)
-            .find(|a| &a.frame.assist_tag == target_tag)
+            .filter(|a| &a.frame.assist_tag == target_tag)
+            .max_by_key(|a| score_announcement(a, current_slot))
     }
 
     /// Return the best scored offer for a lookup id (highest score wins).
-    pub fn best_offer(&self, lookup_id: &[u8; 16]) -> Option<&CachedOffer> {
+    pub fn best_offer(&self, lookup_id: &[u8; 16], current_slot: u64) -> Option<&CachedOffer> {
         self.offers
             .get(lookup_id)?
             .iter()
-            .max_by_key(|o| o.frame.score)
+            .max_by_key(|o| score_offer(o, current_slot))
     }
 
     /// Evict expired announcements and offers older than `max_age_secs`.
@@ -427,6 +452,40 @@ pub fn score_offer(offer: &CachedOffer, _current_slot: u64) -> u16 {
         .saturating_sub(freshness_penalty)
 }
 
+/// Score a cached announcement to prefer fresh direct routes, then assisted roles.
+pub fn score_announcement(announcement: &CachedAnnouncement, current_slot: u64) -> u16 {
+    let slot_penalty = current_slot
+        .saturating_sub(announcement.frame.slot)
+        .min(4)
+        .saturating_mul(750) as u16;
+    let freshness_penalty = (announcement.last_seen.elapsed().as_secs().min(30) * 25) as u16;
+
+    let class_bonus = match announcement.frame.route_class {
+        RouteClass::Direct => 5000,
+        RouteClass::Assisted => 3800,
+        RouteClass::Bridge => 3200,
+        RouteClass::Keeper => 2200,
+    };
+
+    let capability_bonus = (announcement.frame.capabilities.can_relay as u16) * 400
+        + (announcement.frame.capabilities.wan_assist as u16) * 250
+        + (announcement.frame.capabilities.bridge_capable as u16) * 250
+        + (announcement.frame.capabilities.keeper_capable as u16) * 150
+        + (announcement.frame.capabilities.tor_capable as u16) * 50;
+
+    let rtt_bonus = announcement
+        .frame
+        .measured_rtt_ms
+        .map(|rtt| 1000u16.saturating_sub(rtt.min(1000)))
+        .unwrap_or(0);
+
+    class_bonus
+        .saturating_add(capability_bonus)
+        .saturating_add(rtt_bonus)
+        .saturating_sub(slot_penalty)
+        .saturating_sub(freshness_penalty)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -448,6 +507,10 @@ mod tests {
             capabilities: RouteCapabilities::default(),
             reachable_udp: vec![dummy_addr()],
             assist_tag: tag,
+            route_class: RouteClass::Direct,
+            operator_id_hint: "local-node".to_string(),
+            region_hint: "unknown".to_string(),
+            measured_rtt_ms: None,
             expires_at_slot: slot + 4,
         }
     }
@@ -547,7 +610,7 @@ mod tests {
             });
         }
 
-        let best = cache.best_offer(&lookup_id).unwrap();
+        let best = cache.best_offer(&lookup_id, 50).unwrap();
         assert_eq!(best.frame.score, 500);
     }
 
@@ -717,7 +780,7 @@ mod tests {
         };
         cache.insert_offer(offer);
 
-        let best = cache.best_offer(&lookup_id);
+        let best = cache.best_offer(&lookup_id, 50);
         assert!(best.is_some());
         let best = best.unwrap();
         assert_eq!(best.frame.score, 5000);

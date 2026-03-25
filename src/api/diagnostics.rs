@@ -4,7 +4,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use crate::config::Config;
 use crate::network_telemetry;
@@ -27,6 +27,8 @@ pub(crate) struct DandelionPolicySnapshot {
 pub(crate) struct NetworkCapabilities {
     pub runtime_connection_mode: Option<String>,
     pub runtime_privacy_profile: String,
+    pub operator_id_hint: String,
+    pub operator_region_hint: String,
     pub configured_assist_relays: usize,
     pub assist_obfuscation_v5_enabled: bool,
     pub guaranteed_relay_configured: bool,
@@ -48,6 +50,10 @@ pub(crate) struct NetworkCapabilities {
     pub keeper_replication: bool,
     pub bridge_bootstrap: bool,
     pub privacy_tiers: Vec<String>,
+    pub bootstrap_bundle_loaded: bool,
+    pub bootstrap_bundle_relays: usize,
+    pub bootstrap_bundle_bridges: usize,
+    pub bootstrap_bundle_keepers: usize,
     pub api_version: String,
     pub wire_compatibility_window: String,
     pub deprecation_window: String,
@@ -97,7 +103,12 @@ pub(crate) struct RouteStatusResponse {
     pub last_orp_activity_ms: Option<u64>,
     pub active_spaces: usize,
     pub route_classes: Vec<String>,
+    pub route_class_counts: BTreeMap<String, usize>,
     pub standard_private_available: bool,
+    pub relay_nodes_observed: Option<usize>,
+    pub bridge_nodes_observed: Option<usize>,
+    pub keeper_nodes_observed: Option<usize>,
+    pub distinct_operator_hints_observed: usize,
     pub high_risk: HighRiskGateStatus,
 }
 
@@ -115,6 +126,13 @@ pub(crate) struct KeeperStatusResponse {
     pub discovery_bootstrap_peer_count: usize,
     pub bridge_bootstrap_enabled: bool,
     pub bridge_hint_count: usize,
+    pub bootstrap_bundle_loaded: bool,
+    pub bootstrap_bundle_mirrors: usize,
+    pub bootstrap_bundle_relays: usize,
+    pub bootstrap_bundle_bridges: usize,
+    pub bootstrap_bundle_keepers: usize,
+    pub operator_id_hint: String,
+    pub operator_region_hint: String,
     pub notes: Vec<String>,
 }
 
@@ -156,6 +174,8 @@ pub(crate) async fn handle_capabilities(
 
     let cfg = Config::from_env();
     let conn_state = state.app.get_connection_state().await;
+    let ethersync_status = state.app.ethersync_status().await.ok();
+    let bootstrap_bundle = crate::bootstrap_bundle::summarize_bootstrap_bundle(&cfg);
 
     let dandelion_mode = DandelionMode::from_env();
     let dandelion_policy = dandelion_mode.effective_policy();
@@ -166,6 +186,14 @@ pub(crate) async fn handle_capabilities(
             .unwrap_or_else(|_| "\"standard-private\"".to_string())
             .trim_matches('"')
             .to_string(),
+        operator_id_hint: ethersync_status
+            .as_ref()
+            .map(|s| s.operator_id_hint.clone())
+            .unwrap_or_else(|| cfg.operator_id.clone()),
+        operator_region_hint: ethersync_status
+            .as_ref()
+            .map(|s| s.operator_region_hint.clone())
+            .unwrap_or_else(|| cfg.operator_region.clone()),
         configured_assist_relays: cfg.assist_relays.len(),
         assist_obfuscation_v5_enabled: cfg.assist_obfuscation_v5,
         guaranteed_relay_configured: !cfg.guaranteed_relay_url.trim().is_empty(),
@@ -189,9 +217,25 @@ pub(crate) async fn handle_capabilities(
         pq_primitives: cfg!(feature = "pq"),
         orp_standard: true,
         orp_highrisk: false,
-        keeper_replication: false,
-        bridge_bootstrap: !cfg.assist_relays.is_empty(),
+        keeper_replication: cfg.keeper_replication_enabled,
+        bridge_bootstrap: !cfg.bridge_bootstrap_hints.is_empty() || !cfg.assist_relays.is_empty(),
         privacy_tiers: vec!["standard-private".to_string(), "high-risk".to_string()],
+        bootstrap_bundle_loaded: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_loaded)
+            .unwrap_or(bootstrap_bundle.loaded),
+        bootstrap_bundle_relays: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_relays)
+            .unwrap_or(bootstrap_bundle.relays),
+        bootstrap_bundle_bridges: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_bridges)
+            .unwrap_or(bootstrap_bundle.bridges),
+        bootstrap_bundle_keepers: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_keepers)
+            .unwrap_or(bootstrap_bundle.keepers),
         api_version: "/v1".to_string(),
         wire_compatibility_window: "CipherPacket V2 plus additive ORP frame extensions".to_string(),
         deprecation_window:
@@ -217,17 +261,52 @@ pub(crate) async fn handle_routes_status(
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
 
-    let relay_nodes_observed = if let Some(node) = state.app.orp_node().await {
+    let (
+        relay_nodes_observed,
+        bridge_nodes_observed,
+        keeper_nodes_observed,
+        distinct_operator_hints_observed,
+        route_class_counts,
+    ) = if let Some(node) = state.app.orp_node().await {
         let cache = node.route_cache().lock().await;
-        Some(
-            cache
-                .announcements
-                .values()
-                .filter(|ann| ann.frame.capabilities.can_relay)
-                .count(),
+        let relay_nodes = cache
+            .announcements
+            .values()
+            .filter(|ann| ann.frame.capabilities.can_relay)
+            .count();
+        let bridge_nodes = cache
+            .announcements
+            .values()
+            .filter(|ann| ann.frame.capabilities.bridge_capable)
+            .count();
+        let keeper_nodes = cache
+            .announcements
+            .values()
+            .filter(|ann| ann.frame.capabilities.keeper_capable)
+            .count();
+        let distinct_operators = cache
+            .announcements
+            .values()
+            .filter(|ann| !ann.frame.operator_id_hint.trim().is_empty())
+            .map(|ann| ann.frame.operator_id_hint.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+
+        let mut class_counts = BTreeMap::new();
+        for announcement in cache.announcements.values() {
+            let key = format!("{:?}", announcement.frame.route_class).to_lowercase();
+            *class_counts.entry(key).or_insert(0) += 1;
+        }
+
+        (
+            Some(relay_nodes),
+            Some(bridge_nodes),
+            Some(keeper_nodes),
+            distinct_operators,
+            class_counts,
         )
     } else {
-        None
+        (None, None, None, 0, BTreeMap::new())
     };
 
     let high_risk = HighRiskGateStatus {
@@ -256,11 +335,18 @@ pub(crate) async fn handle_routes_status(
         active_spaces: status.spaces.len(),
         route_classes: vec![
             "direct".to_string(),
-            "assist".to_string(),
+            "assisted".to_string(),
+            "bridge".to_string(),
+            "keeper".to_string(),
             "orp-standard".to_string(),
             "tor-fallback".to_string(),
         ],
+        route_class_counts,
         standard_private_available: true,
+        relay_nodes_observed,
+        bridge_nodes_observed,
+        keeper_nodes_observed,
+        distinct_operator_hints_observed,
         high_risk,
     }))
 }
@@ -295,8 +381,15 @@ pub(crate) async fn handle_keepers_status(
         discovery_bootstrap_peer_count: status.discovery_bootstrap_peer_count,
         bridge_bootstrap_enabled: status.bridge_bootstrap_enabled,
         bridge_hint_count: status.bridge_hint_count,
+        bootstrap_bundle_loaded: status.bootstrap_bundle_loaded,
+        bootstrap_bundle_mirrors: status.bootstrap_bundle_mirrors,
+        bootstrap_bundle_relays: status.bootstrap_bundle_relays,
+        bootstrap_bundle_bridges: status.bootstrap_bundle_bridges,
+        bootstrap_bundle_keepers: status.bootstrap_bundle_keepers,
+        operator_id_hint: status.operator_id_hint,
+        operator_region_hint: status.operator_region_hint,
         notes: vec![
-            "Current runtime is local-retention only; keeper replication is scaffolded but disabled"
+            "Current runtime can now describe keeper and bridge posture even when retention is still local-first"
                 .to_string(),
             "Bootstrap remains hybrid: static discovery peers, assist relays, and future bridge bundles"
                 .to_string(),

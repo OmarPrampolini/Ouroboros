@@ -1,5 +1,6 @@
 pub mod api;
 pub mod api_offer;
+pub mod bootstrap_bundle;
 pub mod chunk;
 pub mod cli;
 pub mod config;
@@ -23,8 +24,8 @@ pub mod transport;
 
 // Stable public surface. Keep this list explicit to avoid leaking internal APIs.
 pub use config::{
-    Config, GuaranteedEgress, PluggableProfile, PluggableTransportMode, ProductMode, TorRole,
-    WanMode,
+    Config, GuaranteedEgress, PluggableProfile, PluggableTransportMode, PrivacyProfile,
+    ProductMode, TorRole, WanMode,
 };
 pub use crypto::CryptoError;
 pub use derive::{

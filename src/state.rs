@@ -14,6 +14,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use zeroize::Zeroize;
 
+use crate::bootstrap_bundle::BootstrapBundleSummary;
 use crate::config::PrivacyProfile;
 
 pub mod connection_manager;
@@ -135,6 +136,20 @@ pub struct EtherSyncStatus {
     pub high_risk_available: bool,
     /// Blocking reasons preventing the high-risk profile from being enabled.
     pub high_risk_gate_reasons: Vec<String>,
+    /// Operator identity hint surfaced by the running node.
+    pub operator_id_hint: String,
+    /// Operator region hint surfaced by the running node.
+    pub operator_region_hint: String,
+    /// Whether a bootstrap bundle was successfully loaded.
+    pub bootstrap_bundle_loaded: bool,
+    /// Number of mirror endpoints in the loaded bootstrap bundle.
+    pub bootstrap_bundle_mirrors: usize,
+    /// Number of relay descriptors in the loaded bootstrap bundle.
+    pub bootstrap_bundle_relays: usize,
+    /// Number of bridge descriptors in the loaded bootstrap bundle.
+    pub bootstrap_bundle_bridges: usize,
+    /// Number of keeper descriptors in the loaded bootstrap bundle.
+    pub bootstrap_bundle_keepers: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +207,13 @@ struct EtherSyncRuntime {
     /// Whether ORP was enabled when this runtime was started.
     enable_orp: bool,
     bootstrap_peer_count: usize,
+    retention_tier: String,
+    keeper_replication_enabled: bool,
+    keeper_replication_factor: usize,
+    bridge_hint_count: usize,
+    operator_id_hint: String,
+    operator_region_hint: String,
+    bootstrap_bundle: BootstrapBundleSummary,
 }
 
 const ETHERSYNC_FILE_CHUNK_DEFAULT: usize = 1024;
@@ -429,6 +451,9 @@ impl AppState {
             }
         }
 
+        let runtime_cfg = crate::config::Config::from_env();
+        let bootstrap_bundle = crate::bootstrap_bundle::summarize_bootstrap_bundle(&runtime_cfg);
+        let bootstrap_peer_count = cfg.bootstrap_peers.len();
         let node_cfg = NodeConfig {
             bind_addr: cfg.bind_addr.clone(),
             bootstrap_peers: cfg.bootstrap_peers,
@@ -437,6 +462,15 @@ impl AppState {
             gossip_ttl: cfg.gossip_ttl.max(1),
             enable_compression: cfg.enable_compression,
             enable_orp: cfg.enable_orp,
+            orp_can_relay: runtime_cfg.operator_can_relay,
+            orp_wan_assist: !runtime_cfg.assist_relays.is_empty(),
+            orp_tor_capable: runtime_cfg.wan_mode != crate::config::WanMode::Direct
+                || runtime_cfg.tor_bin_path.is_some()
+                || runtime_cfg.tor_onion_addr.is_some(),
+            orp_bridge_capable: runtime_cfg.operator_bridge_capable,
+            orp_keeper_capable: runtime_cfg.operator_keeper_capable,
+            orp_operator_id_hint: runtime_cfg.operator_id.clone(),
+            orp_region_hint: runtime_cfg.operator_region.clone(),
             ..NodeConfig::default()
         };
 
@@ -475,7 +509,14 @@ impl AppState {
             subscriptions: HashMap::new(),
             events_tx,
             enable_orp: cfg.enable_orp,
-            bootstrap_peer_count: cfg.bootstrap_peers.len(),
+            bootstrap_peer_count,
+            retention_tier: runtime_cfg.retention_tier.clone(),
+            keeper_replication_enabled: runtime_cfg.keeper_replication_enabled,
+            keeper_replication_factor: runtime_cfg.keeper_replication_factor,
+            bridge_hint_count: runtime_cfg.bridge_bootstrap_hints.len(),
+            operator_id_hint: runtime_cfg.operator_id.clone(),
+            operator_region_hint: runtime_cfg.operator_region.clone(),
+            bootstrap_bundle,
         };
 
         let mut inner = self.inner.lock().await;
@@ -523,7 +564,20 @@ impl AppState {
     }
 
     pub async fn ethersync_status(&self) -> anyhow::Result<EtherSyncStatus> {
-        let (node, bind_addr, spaces, enable_orp, bootstrap_peer_count) = {
+        let (
+            node,
+            bind_addr,
+            spaces,
+            enable_orp,
+            bootstrap_peer_count,
+            retention_tier,
+            keeper_replication_enabled,
+            keeper_replication_factor,
+            bridge_hint_count,
+            operator_id_hint,
+            operator_region_hint,
+            bootstrap_bundle,
+        ) = {
             let inner = self.inner.lock().await;
             match inner.ethersync.as_ref() {
                 Some(rt) => (
@@ -532,8 +586,28 @@ impl AppState {
                     rt.subscriptions.keys().cloned().collect::<Vec<_>>(),
                     rt.enable_orp,
                     rt.bootstrap_peer_count,
+                    rt.retention_tier.clone(),
+                    rt.keeper_replication_enabled,
+                    rt.keeper_replication_factor,
+                    rt.bridge_hint_count,
+                    rt.operator_id_hint.clone(),
+                    rt.operator_region_hint.clone(),
+                    rt.bootstrap_bundle.clone(),
                 ),
-                None => (None, None, Vec::new(), false, 0),
+                None => (
+                    None,
+                    None,
+                    Vec::new(),
+                    false,
+                    0,
+                    "local-only".to_string(),
+                    false,
+                    0,
+                    0,
+                    "local-node".to_string(),
+                    "unknown".to_string(),
+                    BootstrapBundleSummary::default(),
+                ),
             }
         };
 
@@ -542,7 +616,12 @@ impl AppState {
         };
 
         let runtime_cfg = crate::config::Config::from_env();
-        let high_risk_gate_reasons = default_high_risk_gate_reasons(enable_orp);
+        let high_risk_gate_reasons = default_high_risk_gate_reasons(
+            enable_orp,
+            keeper_replication_enabled,
+            bootstrap_bundle.loaded,
+            bridge_hint_count,
+        );
 
         // Collect ORP diagnostics from the route cache.
         let (route_cache_size, route_offers_count, last_orp_activity_ms) = {
@@ -571,16 +650,25 @@ impl AppState {
             route_cache_size,
             route_offers_count,
             last_orp_activity_ms,
-            retention_tier: "local-only".to_string(),
+            retention_tier,
             replay_window_slots: LOOKBACK_SLOTS,
-            keeper_replication_enabled: false,
-            keeper_replication_factor: 0,
+            keeper_replication_enabled,
+            keeper_replication_factor,
             bootstrap_peer_count,
             discovery_bootstrap_peer_count: runtime_cfg.discovery_bootstrap_peers.len(),
-            bridge_bootstrap_enabled: !runtime_cfg.assist_relays.is_empty(),
-            bridge_hint_count: runtime_cfg.assist_relays.len(),
+            bridge_bootstrap_enabled: bridge_hint_count > 0
+                || bootstrap_bundle.bridges > 0
+                || !runtime_cfg.assist_relays.is_empty(),
+            bridge_hint_count,
             high_risk_available: high_risk_gate_reasons.is_empty(),
             high_risk_gate_reasons,
+            operator_id_hint,
+            operator_region_hint,
+            bootstrap_bundle_loaded: bootstrap_bundle.loaded,
+            bootstrap_bundle_mirrors: bootstrap_bundle.mirrors,
+            bootstrap_bundle_relays: bootstrap_bundle.relays,
+            bootstrap_bundle_bridges: bootstrap_bundle.bridges,
+            bootstrap_bundle_keepers: bootstrap_bundle.keepers,
         })
     }
 
@@ -1107,21 +1195,36 @@ fn derive_transfer_id(filename: &str, total_bytes: usize, ts_ms: u64) -> String 
     hex::encode(&hash[..10])
 }
 
-fn default_high_risk_gate_reasons(orp_enabled: bool) -> Vec<String> {
+fn default_high_risk_gate_reasons(
+    orp_enabled: bool,
+    keeper_replication_enabled: bool,
+    bootstrap_bundle_loaded: bool,
+    bridge_hint_count: usize,
+) -> Vec<String> {
     let mut reasons = Vec::new();
     if !orp_enabled {
         reasons.push("ORP runtime is not enabled for this EtherSync node".to_string());
     }
     reasons.push("ORP-HighRisk circuits are not implemented in this build".to_string());
     reasons.push("relay operator diversity telemetry is not available yet".to_string());
-    reasons.push("bridge bootstrap attestation is not available yet".to_string());
-    reasons.push("keeper-backed replicated retention is not available yet".to_string());
+    if bridge_hint_count == 0 && !bootstrap_bundle_loaded {
+        reasons.push("bridge bootstrap attestation is not available yet".to_string());
+    }
+    if !keeper_replication_enabled {
+        reasons.push("keeper-backed replicated retention is not available yet".to_string());
+    }
     reasons
 }
 
 fn default_ethersync_status() -> EtherSyncStatus {
     let runtime_cfg = crate::config::Config::from_env();
-    let high_risk_gate_reasons = default_high_risk_gate_reasons(false);
+    let bootstrap_bundle = crate::bootstrap_bundle::summarize_bootstrap_bundle(&runtime_cfg);
+    let high_risk_gate_reasons = default_high_risk_gate_reasons(
+        false,
+        runtime_cfg.keeper_replication_enabled,
+        bootstrap_bundle.loaded,
+        runtime_cfg.bridge_bootstrap_hints.len(),
+    );
 
     EtherSyncStatus {
         running: false,
@@ -1134,16 +1237,25 @@ fn default_ethersync_status() -> EtherSyncStatus {
         route_cache_size: 0,
         route_offers_count: 0,
         last_orp_activity_ms: None,
-        retention_tier: "local-only".to_string(),
+        retention_tier: runtime_cfg.retention_tier.clone(),
         replay_window_slots: LOOKBACK_SLOTS,
-        keeper_replication_enabled: false,
-        keeper_replication_factor: 0,
+        keeper_replication_enabled: runtime_cfg.keeper_replication_enabled,
+        keeper_replication_factor: runtime_cfg.keeper_replication_factor,
         bootstrap_peer_count: 0,
         discovery_bootstrap_peer_count: runtime_cfg.discovery_bootstrap_peers.len(),
-        bridge_bootstrap_enabled: !runtime_cfg.assist_relays.is_empty(),
-        bridge_hint_count: runtime_cfg.assist_relays.len(),
+        bridge_bootstrap_enabled: !runtime_cfg.bridge_bootstrap_hints.is_empty()
+            || bootstrap_bundle.bridges > 0
+            || !runtime_cfg.assist_relays.is_empty(),
+        bridge_hint_count: runtime_cfg.bridge_bootstrap_hints.len(),
         high_risk_available: false,
         high_risk_gate_reasons,
+        operator_id_hint: runtime_cfg.operator_id.clone(),
+        operator_region_hint: runtime_cfg.operator_region.clone(),
+        bootstrap_bundle_loaded: bootstrap_bundle.loaded,
+        bootstrap_bundle_mirrors: bootstrap_bundle.mirrors,
+        bootstrap_bundle_relays: bootstrap_bundle.relays,
+        bootstrap_bundle_bridges: bootstrap_bundle.bridges,
+        bootstrap_bundle_keepers: bootstrap_bundle.keepers,
     }
 }
 

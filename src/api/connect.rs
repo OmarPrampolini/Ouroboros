@@ -189,7 +189,7 @@ pub(crate) async fn handle_connect(
     if privacy_profile == PrivacyProfile::HighRisk {
         return Err(connect_err(
             StatusCode::CONFLICT,
-            "high-risk profile unavailable: ORP high-risk circuits are not implemented yet",
+            "high-risk profile unavailable: ORP high-risk circuits are not implemented yet; inspect /v1/routes/status for gate state",
         ));
     }
     if req.offer.is_some() && req.passphrase.is_some() {

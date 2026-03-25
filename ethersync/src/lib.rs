@@ -12,11 +12,11 @@ pub use message::EtherMessage;
 pub use network::{EtherUdpSocket, FrameCodec, RateLimiter};
 pub use node::{EtherNode, NodeConfig};
 pub use routing::{
-    decode_orp_frame, encode_orp_frame, CircuitClose, CircuitExtend, CircuitOpen, CoverPacket,
-    OrpFrame, RouteAck, RouteAnnouncement, RouteCache, RouteCapabilities, RouteForward, RouteHop,
-    RouteLookup, RouteOffer, SUBSPACE_CIRCUIT_CLOSE, SUBSPACE_CIRCUIT_EXTEND,
-    SUBSPACE_CIRCUIT_OPEN, SUBSPACE_COVER_TRAFFIC, SUBSPACE_RELAY_BEACON, SUBSPACE_ROUTE_ANNOUNCE,
-    SUBSPACE_ROUTE_LOOKUP, SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
+    decode_orp_frame, encode_orp_frame, score_announcement, CircuitClose, CircuitExtend,
+    CircuitOpen, CoverPacket, OrpFrame, RouteAck, RouteAnnouncement, RouteCache, RouteCapabilities,
+    RouteClass, RouteForward, RouteHop, RouteLookup, RouteOffer, SUBSPACE_CIRCUIT_CLOSE,
+    SUBSPACE_CIRCUIT_EXTEND, SUBSPACE_CIRCUIT_OPEN, SUBSPACE_COVER_TRAFFIC, SUBSPACE_RELAY_BEACON,
+    SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_LOOKUP, SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
 };
 
 use thiserror::Error;
