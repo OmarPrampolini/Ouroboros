@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::{client::TlsStream, TlsConnector};
+use x509_parser::pem::Pem;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::config::Config;
@@ -249,13 +250,12 @@ fn spki_hash_from_cert(cert_der: &[u8]) -> Result<[u8; 32]> {
 /// Helper: compute SPKI SHA256 hashes from PEM-encoded certificate bundle.
 pub fn spki_hashes_from_pem(pem: &str) -> Result<Vec<[u8; 32]>> {
     let mut out = Vec::new();
-    let mut reader = std::io::Cursor::new(pem.as_bytes());
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| any_error(format!("PEM parse failed: {:?}", e)))?;
-    for cert in certs {
-        let h = spki_hash_from_cert(cert.as_ref())?;
-        out.push(h);
+    for pem_block in Pem::iter_from_buffer(pem.as_bytes()) {
+        let pem_block = pem_block.map_err(|e| any_error(format!("PEM parse failed: {:?}", e)))?;
+        if pem_block.label == "CERTIFICATE" {
+            let h = spki_hash_from_cert(&pem_block.contents)?;
+            out.push(h);
+        }
     }
     if out.is_empty() {
         return Err(any_error("No certificates found in PEM"));

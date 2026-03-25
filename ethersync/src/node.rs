@@ -113,9 +113,9 @@ pub struct EtherNode {
     /// to the passphrase that was used to join.  Only populated when
     /// `start_orp_for_space` is called.
     orp_spaces: Arc<RwLock<StdHashMap<[u8; 8], String>>>,
-    /// Handles for ORP announce tasks (one per space), so they can be
-    /// cleaned up on stop.
-    orp_announce_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Handles for ORP announce tasks keyed by space prefix, so duplicate joins
+    /// do not spawn duplicate announcers and shutdown can abort them cleanly.
+    orp_announce_tasks: Arc<Mutex<StdHashMap<[u8; 8], tokio::task::JoinHandle<()>>>>,
 }
 
 impl EtherNode {
@@ -169,7 +169,7 @@ impl EtherNode {
             route_cache: Arc::new(Mutex::new(RouteCache::new())),
             node_id,
             orp_spaces: Arc::new(RwLock::new(StdHashMap::new())),
-            orp_announce_tasks: Arc::new(Mutex::new(Vec::new())),
+            orp_announce_tasks: Arc::new(Mutex::new(StdHashMap::new())),
         })
     }
 
@@ -531,6 +531,7 @@ impl EtherNode {
         // Clean shutdown
         drop(engine);
         router_handle.abort();
+        self.abort_orp_announce_tasks().await;
 
         Ok(())
     }
@@ -835,6 +836,16 @@ impl EtherNode {
         Ok(cache.best_offer(&lookup_id).map(|co| co.frame.clone()))
     }
 
+    /// Return active ORP spaces with their passphrases.
+    pub async fn active_orp_spaces(&self) -> Vec<([u8; 8], String)> {
+        self.orp_spaces
+            .read()
+            .await
+            .iter()
+            .map(|(prefix, passphrase)| (*prefix, passphrase.clone()))
+            .collect()
+    }
+
     /// Activate ORP for a passphrase space.
     ///
     /// Registers the space prefix, starts periodic route announcements,
@@ -846,15 +857,27 @@ impl EtherNode {
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(&space_hash[..8]);
 
-        // Register the space
-        {
+        // Register the space once; repeated joins should not duplicate announcers.
+        let already_active = {
             let mut spaces = self.orp_spaces.write().await;
-            spaces.insert(prefix, passphrase.to_string());
+            if spaces.contains_key(&prefix) {
+                true
+            } else {
+                spaces.insert(prefix, passphrase.to_string());
+                false
+            }
+        };
+
+        if already_active {
+            trace!("ORP: space {} already active", hex::encode(prefix));
+            return prefix;
         }
 
         // Immediate first announcement
-        if let Err(e) = self.publish_route_announcement(passphrase).await {
-            warn!("ORP: initial announcement failed: {:?}", e);
+        {
+            if let Err(e) = self.publish_route_announcement(passphrase).await {
+                warn!("ORP: initial announcement failed: {:?}", e);
+            }
         }
 
         // Start periodic announce task
@@ -862,10 +885,8 @@ impl EtherNode {
             passphrase.to_string(),
             self.config.orp_announce_interval_secs,
         );
-        {
-            let mut tasks = self.orp_announce_tasks.lock().await;
-            tasks.push(handle);
-        }
+        let mut tasks = self.orp_announce_tasks.lock().await;
+        tasks.insert(prefix, handle);
 
         info!(
             "ORP: activated for space {} (announce interval {}s)",
@@ -878,6 +899,19 @@ impl EtherNode {
     /// Return all space prefixes that have ORP active.
     pub async fn orp_space_prefixes(&self) -> Vec<[u8; 8]> {
         self.orp_spaces.read().await.keys().cloned().collect()
+    }
+
+    async fn abort_orp_announce_tasks(&self) {
+        let handles = {
+            let mut tasks = self.orp_announce_tasks.lock().await;
+            tasks.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
+        };
+
+        for handle in handles {
+            handle.abort();
+        }
+
+        self.orp_spaces.write().await.clear();
     }
 
     /// Spawn the ORP periodic announcement task.

@@ -9,8 +9,6 @@ ignore = [
     "RUSTSEC-2025-0141", # bincode (used directly and via webrtc stack)
     "RUSTSEC-2024-0384", # instant (via reed-solomon-erasure -> parking_lot)
     "RUSTSEC-2024-0436", # paste (via netlink stack)
-    "RUSTSEC-2024-0381", # pqcrypto-kyber (intentionally retained for pq feature compatibility)
-    "RUSTSEC-2025-0134", # rustls-pemfile (deprecated wrapper; migration planned)
 ]
 
 [licenses]

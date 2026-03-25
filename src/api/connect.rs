@@ -3,10 +3,11 @@ use axum::{
     extract::{ConnectInfo, Extension},
     Json,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::{
     future::Future,
     net::SocketAddr,
+    str::FromStr,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -43,6 +44,18 @@ const CONNECT_RETRY_BUDGET: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: u64 = 200;
 const CONNECT_CIRCUIT_FAILURE_THRESHOLD: u32 = 6;
 const CONNECT_CIRCUIT_COOLDOWN_SECS: u64 = 20;
+
+fn parse_orp_target_tag(raw: &str) -> Option<[u8; 8]> {
+    let candidate = raw.trim().strip_prefix("orp:").unwrap_or(raw.trim());
+    if candidate.len() != 16 || !candidate.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let bytes = hex::decode(candidate).ok()?;
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&bytes);
+    Some(tag)
+}
 
 #[derive(Debug, Default)]
 struct ConnectCircuitBreaker {
@@ -691,19 +704,69 @@ pub(crate) async fn handle_connect(
         }
     }
     if let Some(target) = req.target.clone() {
-        let conn = match run_with_retry_budget(
-            "target_connect",
-            CONNECT_RETRY_BUDGET,
-            CONNECT_RETRY_BACKOFF_MS,
-            || transport::connect_to(&target, &params, &cfg),
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Target connect failed: {:?}", e);
-                record_connect_failure("target connect").await;
-                return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
+        let orp_target_tag = parse_orp_target_tag(&target);
+        let conn = if let Some(target_tag) = orp_target_tag {
+            let orp_node = app.orp_node().await;
+            let Some(orp_node) = orp_node else {
+                return Err(connect_err(
+                    StatusCode::BAD_REQUEST,
+                    "ORP target requires an active ORP-enabled EtherSync runtime",
+                ));
+            };
+
+            match run_with_retry_budget(
+                "target_connect_orp",
+                CONNECT_RETRY_BUDGET,
+                CONNECT_RETRY_BACKOFF_MS,
+                || {
+                    let p = params.clone();
+                    let c = cfg.clone();
+                    let orp_ref = orp_node.clone();
+                    let orp_passphrase = passphrase.expose_secret().to_string();
+                    async move {
+                        transport::establish_connection_with_orp(
+                            &p,
+                            &c,
+                            Some(orp_ref.as_ref()),
+                            Some(orp_passphrase.as_str()),
+                            Some(target_tag),
+                        )
+                        .await
+                    }
+                },
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("ORP target connect failed: {:?}", e);
+                    record_connect_failure("target ORP connect").await;
+                    return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
+                }
+            }
+        } else {
+            match SocketAddr::from_str(&target) {
+                Ok(_) => match run_with_retry_budget(
+                    "target_connect",
+                    CONNECT_RETRY_BUDGET,
+                    CONNECT_RETRY_BACKOFF_MS,
+                    || transport::connect_to(&target, &params, &cfg),
+                )
+                .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Target connect failed: {:?}", e);
+                        record_connect_failure("target connect").await;
+                        return Err(connect_err(StatusCode::BAD_GATEWAY, "operation failed"));
+                    }
+                },
+                Err(_) => {
+                    return Err(connect_err(
+                        StatusCode::BAD_REQUEST,
+                        "target must be ip:port or orp:<16 hex chars>",
+                    ));
+                }
             }
         };
 
@@ -825,11 +888,14 @@ pub(crate) async fn handle_connect(
             let p = params.clone();
             let c = cfg.clone();
             let orp_ref = orp_node.clone();
+            let orp_passphrase = passphrase.expose_secret().to_string();
             async move {
                 transport::establish_connection_with_orp(
                     &p,
                     &c,
                     orp_ref.as_deref(),
+                    Some(orp_passphrase.as_str()),
+                    None,
                 )
                 .await
             }

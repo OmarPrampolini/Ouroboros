@@ -599,6 +599,11 @@ mod tests {
         if std::env::var("CI").is_ok() {
             return;
         }
+        // Keep the perf assertion for optimized runs; debug builds are too noisy
+        // to use a hard wall-clock threshold reliably on developer machines.
+        if cfg!(debug_assertions) {
+            return;
+        }
         let key = [42u8; 32];
         let tag = 0x1337;
         let payload = ClearPayload {

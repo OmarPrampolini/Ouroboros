@@ -1,6 +1,4 @@
 use crate::config::UDP_MAX_PACKET_SIZE;
-#[cfg(feature = "pq")]
-use crate::crypto::post_quantum::NOISE_PARAMS_PQ;
 use crate::crypto::{
     self, deserialize_cipher_packet_with_limit, open, seal_with_nonce, ClearPayload, NonceSeq,
     MAX_TCP_FRAME_BYTES, MAX_UDP_PACKET_BYTES, NONCE_DOMAIN_NOISE, NONCE_DOMAIN_RESUME,
@@ -323,7 +321,7 @@ fn parse_noise_params(params_str: &str, needs_pq: bool) -> Result<snow::params::
     params_str.parse().map_err(|e| {
         if needs_pq {
             SessionNoiseError::NoiseParams(format!(
-                "{}: {}. Ensure snow features hfs + pqclean_kyber1024 are enabled.",
+                "{}: {}. A maintained PQ Noise backend is not currently wired in.",
                 params_str, e
             ))
         } else {
@@ -350,7 +348,9 @@ pub fn classic_noise_params() -> Result<snow::params::NoiseParams> {
 pub fn pq_noise_params() -> Result<snow::params::NoiseParams> {
     #[cfg(feature = "pq")]
     {
-        parse_noise_params(NOISE_PARAMS_PQ, true)
+        Err(SessionNoiseError::NoiseParams(
+            "maintained Noise PQ backend unavailable; using classic Noise XX transport".to_string(),
+        ))
     }
     #[cfg(not(feature = "pq"))]
     {

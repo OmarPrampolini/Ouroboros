@@ -209,7 +209,15 @@ impl ConnectionManager {
         self.params = Some(params.clone());
 
         let cfg = Config::from_env();
-        match transport::establish_connection_with_orp(&params, &cfg, orp_node.as_deref()).await {
+        match transport::establish_connection_with_orp(
+            &params,
+            &cfg,
+            orp_node.as_deref(),
+            None,
+            None,
+        )
+        .await
+        {
             Ok(conn) => {
                 info!("Connection established successfully");
                 self.circuit_breaker.record_success();

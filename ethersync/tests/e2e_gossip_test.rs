@@ -5,7 +5,6 @@
 //! 2. Node B receives it via gossip + subscription routing
 
 use ethersync::{EtherNode, NodeConfig};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -13,9 +12,6 @@ use tokio::time::timeout;
 
 /// Timeout for the entire test
 const TEST_TIMEOUT_SECS: u64 = 5;
-
-/// Gossip interval - must be short for fast test
-const GOSSIP_INTERVAL_MS: u64 = 500;
 
 #[tokio::test]
 async fn test_e2e_gossip_message_propagation() {
@@ -242,7 +238,7 @@ async fn test_e2e_multiple_messages() {
     }
 
     // Verify all payloads received
-    for (expected, actual) in payloads.iter().zip(received.iter()) {
+    for (_expected, actual) in payloads.iter().zip(received.iter()) {
         assert!(payloads.contains(actual), "Received unexpected message");
     }
 

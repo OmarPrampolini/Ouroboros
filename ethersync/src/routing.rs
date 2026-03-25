@@ -559,7 +559,6 @@ mod tests {
     fn no_cross_space_cache_leakage() {
         let mut cache = RouteCache::new();
         let space_a = [0xAAu8; 32];
-        let space_b = [0xBBu8; 32];
         let tag = [5u8; 8];
 
         let ann = make_announcement(50, [1u8; 16], tag);

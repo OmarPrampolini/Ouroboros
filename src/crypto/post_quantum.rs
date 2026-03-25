@@ -1,5 +1,5 @@
 use hkdf::Hkdf;
-use pqcrypto_kyber::kyber768;
+use pqcrypto_mlkem::mlkem768;
 use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
 use rand::rngs::OsRng;
 use sha2::Sha256;
@@ -7,8 +7,6 @@ use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 pub const X25519_PUBLIC_KEY_BYTES: usize = 32;
-// Noise HFS in snow currently supports Kyber1024 (not Kyber768).
-pub const NOISE_PARAMS_PQ: &str = "Noise_XXhfs_25519+Kyber1024_ChaChaPoly_BLAKE2s";
 
 #[derive(Debug, Error)]
 pub enum PostQuantumError {
@@ -29,15 +27,15 @@ pub enum PostQuantumError {
 type Result<T> = std::result::Result<T, PostQuantumError>;
 
 pub fn kyber_public_key_bytes() -> usize {
-    kyber768::public_key_bytes()
+    mlkem768::public_key_bytes()
 }
 
 pub fn kyber_ciphertext_bytes() -> usize {
-    kyber768::ciphertext_bytes()
+    mlkem768::ciphertext_bytes()
 }
 
 pub fn kyber_shared_secret_bytes() -> usize {
-    kyber768::shared_secret_bytes()
+    mlkem768::shared_secret_bytes()
 }
 
 pub fn hybrid_public_key_bytes() -> usize {
@@ -46,7 +44,7 @@ pub fn hybrid_public_key_bytes() -> usize {
 
 pub struct HybridKeyExchange {
     x25519_secret: StaticSecret,
-    kyber_secret: kyber768::SecretKey,
+    kyber_secret: mlkem768::SecretKey,
 }
 
 impl HybridKeyExchange {
@@ -54,7 +52,7 @@ impl HybridKeyExchange {
         let x25519_secret = StaticSecret::random_from_rng(OsRng);
         let x25519_public = X25519PublicKey::from(&x25519_secret);
 
-        let (kyber_public, kyber_secret) = kyber768::keypair();
+        let (kyber_public, kyber_secret) = mlkem768::keypair();
 
         let mut public_key = Vec::with_capacity(hybrid_public_key_bytes());
         public_key.extend_from_slice(x25519_public.as_bytes());
@@ -73,7 +71,7 @@ impl HybridKeyExchange {
         let (peer_x25519, peer_kyber_pk) = parse_peer_public(peer_public)?;
 
         let x25519_shared = self.x25519_secret.diffie_hellman(&peer_x25519);
-        let (kyber_shared, kyber_ct) = kyber768::encapsulate(&peer_kyber_pk);
+        let (kyber_shared, kyber_ct) = mlkem768::encapsulate(&peer_kyber_pk);
 
         let combined = derive_hybrid_key(x25519_shared.as_bytes(), kyber_shared.as_bytes())?;
         Ok((kyber_ct.as_bytes().to_vec(), combined))
@@ -88,16 +86,16 @@ impl HybridKeyExchange {
             });
         }
 
-        let ct = kyber768::Ciphertext::from_bytes(kyber_ct)
+        let ct = mlkem768::Ciphertext::from_bytes(kyber_ct)
             .map_err(|_| PostQuantumError::InvalidKyberCiphertext)?;
-        let kyber_shared = kyber768::decapsulate(&ct, &self.kyber_secret);
+        let kyber_shared = mlkem768::decapsulate(&ct, &self.kyber_secret);
         let x25519_shared = self.x25519_secret.diffie_hellman(&peer_x25519);
 
         derive_hybrid_key(x25519_shared.as_bytes(), kyber_shared.as_bytes())
     }
 }
 
-fn parse_peer_public(peer_public: &[u8]) -> Result<(X25519PublicKey, kyber768::PublicKey)> {
+fn parse_peer_public(peer_public: &[u8]) -> Result<(X25519PublicKey, mlkem768::PublicKey)> {
     let expected = hybrid_public_key_bytes();
     if peer_public.len() != expected {
         return Err(PostQuantumError::HybridPublicKeyLengthMismatch {
@@ -111,7 +109,7 @@ fn parse_peer_public(peer_public: &[u8]) -> Result<(X25519PublicKey, kyber768::P
         .try_into()
         .map_err(|_| PostQuantumError::InvalidX25519PublicKeyLength)?;
     let x25519_pk = X25519PublicKey::from(x25519_bytes);
-    let kyber_pk = kyber768::PublicKey::from_bytes(kyber_bytes)
+    let kyber_pk = mlkem768::PublicKey::from_bytes(kyber_bytes)
         .map_err(|_| PostQuantumError::InvalidKyberPublicKey)?;
 
     Ok((x25519_pk, kyber_pk))

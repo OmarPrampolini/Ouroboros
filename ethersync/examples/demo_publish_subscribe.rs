@@ -9,7 +9,6 @@
 //! Run with: cargo run --example demo_publish_subscribe -p ethersync
 
 use ethersync::{EtherNode, EtherSyncError, NodeConfig};
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::timeout;
 

@@ -624,11 +624,6 @@ impl AppState {
             )
         };
 
-        // Activate ORP route announcements for this space when enabled.
-        if orp_enabled {
-            node.start_orp_for_space(&passphrase).await;
-        }
-
         if already_subscribed {
             let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
             tracing::info!(
@@ -643,6 +638,10 @@ impl AppState {
             .subscribe(&passphrase)
             .await
             .map_err(|e| anyhow::anyhow!("failed to subscribe ethersync space: {}", e))?;
+
+        if orp_enabled {
+            node.start_orp_for_space(&passphrase).await;
+        }
 
         let passphrase_for_task = passphrase.clone();
         let space_id_for_task = space_id.clone();

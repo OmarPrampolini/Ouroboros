@@ -342,9 +342,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.15.3"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e84ce723ab67259cfeb9877c6a639ee9eb7a27b28123abd71db7f0d5d0cc9d86"
+checksum = "a054912289d18629dc78375ba2c3726a3afe3ff71b4edba9dedfca0e3446d1fc"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -352,9 +352,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.36.0"
+version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43a442ece363113bd4bd4c8b18977a7798dd4d3c3383f34fb61936960e8f4ad8"
+checksum = "1fa7e52a4c5c547c741610a2c6f123f3881e409b714cd27e6798ef020c514f0a"
 dependencies = [
  "cc",
  "cmake",
@@ -1223,7 +1223,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1239,7 +1239,7 @@ dependencies = [
  "lz4",
  "metrics",
  "ouroboros-crypto",
- "quinn",
+ "quinn 0.11.10",
  "reed-solomon-erasure",
  "rusqlite",
  "serde",
@@ -1592,15 +1592,14 @@ dependencies = [
  "natpmp",
  "once_cell",
  "ouroboros-crypto",
- "pqcrypto-kyber",
+ "pqcrypto-mlkem",
  "pqcrypto-traits",
  "proptest",
- "quinn",
+ "quinn 0.11.10",
  "rand 0.8.5",
  "rcgen 0.12.1",
  "reqwest",
  "rustls",
- "rustls-pemfile",
  "scopeguard",
  "secrecy",
  "serde",
@@ -1893,7 +1892,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2503,7 +2502,7 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "libp2p-tls",
- "quinn",
+ "quinn 0.11.9",
  "rand 0.8.5",
  "ring",
  "rustls",
@@ -2990,7 +2989,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3136,7 +3135,7 @@ dependencies = [
  "chacha20poly1305",
  "getrandom 0.2.17",
  "hkdf",
- "pqcrypto-kyber",
+ "pqcrypto-mlkem",
  "pqcrypto-traits",
  "sha2",
  "thiserror 1.0.69",
@@ -3401,10 +3400,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "pqcrypto-kyber"
-version = "0.8.1"
+name = "pqcrypto-mlkem"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15c00293cf898859d0c771455388054fd69ab712263c73fdc7f287a39b1ba000"
+checksum = "eb14d207f3749e8a59a026c22ceaa72d70fff931cfbf4c8d9b08f3fc56dc6e60"
 dependencies = [
  "cc",
  "glob",
@@ -3517,11 +3516,30 @@ dependencies = [
  "cfg_aliases",
  "futures-io",
  "pin-project-lite",
- "quinn-proto",
- "quinn-udp",
+ "quinn-proto 0.11.13",
+ "quinn-udp 0.5.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-hash",
  "rustls",
- "socket2 0.6.1",
+ "socket2 0.5.10",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn"
+version = "0.11.10"
+source = "git+https://github.com/quinn-rs/quinn?rev=a2ab220#a2ab2208bd3ac61a72e4edb1eea184c190d9f3c7"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "pin-project-lite",
+ "quinn-proto 0.11.14",
+ "quinn-udp 0.5.14 (git+https://github.com/quinn-rs/quinn?rev=a2ab220)",
+ "rustc-hash",
+ "rustls",
+ "socket2 0.5.10",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -3533,6 +3551,26 @@ name = "quinn-proto"
 version = "0.11.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
+dependencies = [
+ "bytes",
+ "getrandom 0.3.4",
+ "lru-slab",
+ "rand 0.9.2",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "thiserror 2.0.17",
+ "tinyvec",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-proto"
+version = "0.11.14"
+source = "git+https://github.com/quinn-rs/quinn?rev=a2ab220#a2ab2208bd3ac61a72e4edb1eea184c190d9f3c7"
 dependencies = [
  "bytes",
  "fastbloom",
@@ -3560,9 +3598,22 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "quinn-udp"
+version = "0.5.14"
+source = "git+https://github.com/quinn-rs/quinn?rev=a2ab220#a2ab2208bd3ac61a72e4edb1eea184c190d9f3c7"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "once_cell",
+ "socket2 0.5.10",
+ "tracing",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3764,7 +3815,7 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
+ "quinn 0.11.9",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -3906,7 +3957,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3938,15 +3989,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3974,7 +4016,7 @@ dependencies = [
  "security-framework 3.5.1",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4291,8 +4333,6 @@ dependencies = [
  "blake2",
  "chacha20poly1305",
  "curve25519-dalek",
- "pqcrypto-kyber",
- "pqcrypto-traits",
  "rand_core 0.6.4",
  "ring",
  "rustc_version",
@@ -4473,7 +4513,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5316,7 +5356,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
