@@ -859,12 +859,15 @@ impl EtherNode {
 
         // Register the space once; repeated joins should not duplicate announcers.
         let already_active = {
+            use std::collections::hash_map::Entry;
+
             let mut spaces = self.orp_spaces.write().await;
-            if spaces.contains_key(&prefix) {
-                true
-            } else {
-                spaces.insert(prefix, passphrase.to_string());
-                false
+            match spaces.entry(prefix) {
+                Entry::Occupied(_) => true,
+                Entry::Vacant(entry) => {
+                    entry.insert(passphrase.to_string());
+                    false
+                }
             }
         };
 
