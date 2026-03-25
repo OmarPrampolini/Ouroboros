@@ -190,6 +190,8 @@ Strong today:
 - join-time space policy can now set retention tier, replication factor, and route bias per space
 - ORP candidate ranking now uses operator hints, region diversity, bootstrap bundle posture, and per-space route bias
 - ORP candidate inspection now exposes ranked route decisions, cache-versus-lookup provenance, and target-specific diagnostics through the local API
+- bootstrap bundle validation now exposes local usability, structural weakness, and advisory staleness
+- keeper endpoints from the bootstrap bundle now participate in runtime/bootstrap seeding when managed retention posture is active
 
 Explicitly not claimed yet:
 

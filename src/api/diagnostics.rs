@@ -54,6 +54,11 @@ pub(crate) struct NetworkCapabilities {
     pub bootstrap_bundle_relays: usize,
     pub bootstrap_bundle_bridges: usize,
     pub bootstrap_bundle_keepers: usize,
+    pub bootstrap_bundle_usable: bool,
+    pub bootstrap_bundle_structurally_weak: bool,
+    pub bootstrap_bundle_stale: bool,
+    pub bootstrap_bundle_warning_count: usize,
+    pub bootstrap_bundle_error_count: usize,
     pub api_version: String,
     pub wire_compatibility_window: String,
     pub deprecation_window: String,
@@ -167,6 +172,11 @@ pub(crate) struct KeeperStatusResponse {
     pub bootstrap_bundle_relays: usize,
     pub bootstrap_bundle_bridges: usize,
     pub bootstrap_bundle_keepers: usize,
+    pub bootstrap_bundle_usable: bool,
+    pub bootstrap_bundle_structurally_weak: bool,
+    pub bootstrap_bundle_stale: bool,
+    pub bootstrap_bundle_warning_count: usize,
+    pub bootstrap_bundle_error_count: usize,
     pub operator_id_hint: String,
     pub operator_region_hint: String,
     pub notes: Vec<String>,
@@ -312,6 +322,26 @@ pub(crate) async fn handle_capabilities(
             .as_ref()
             .map(|s| s.bootstrap_bundle_keepers)
             .unwrap_or(bootstrap_bundle.keepers),
+        bootstrap_bundle_usable: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_usable)
+            .unwrap_or(false),
+        bootstrap_bundle_structurally_weak: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_structurally_weak)
+            .unwrap_or(false),
+        bootstrap_bundle_stale: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_stale)
+            .unwrap_or(false),
+        bootstrap_bundle_warning_count: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_warning_count)
+            .unwrap_or(0),
+        bootstrap_bundle_error_count: ethersync_status
+            .as_ref()
+            .map(|s| s.bootstrap_bundle_error_count)
+            .unwrap_or(0),
         api_version: "/v1".to_string(),
         wire_compatibility_window: "CipherPacket V2 plus additive ORP frame extensions".to_string(),
         deprecation_window:
@@ -413,10 +443,13 @@ pub(crate) async fn handle_routes_discover(
 
     let mut used_bootstrap_bundle = false;
     if let Some(bundle) = crate::bootstrap_bundle::load_bootstrap_bundle(&cfg) {
-        backends.push(Arc::new(
-            crate::discovery::BootstrapDiscoveryProvider::from_bundle(&bundle),
-        ));
-        used_bootstrap_bundle = true;
+        let validation = bundle.validation_report();
+        if validation.is_usable {
+            backends.push(Arc::new(
+                crate::discovery::BootstrapDiscoveryProvider::from_bundle(&bundle),
+            ));
+            used_bootstrap_bundle = true;
+        }
     }
 
     let service = crate::discovery::DiscoveryService::with_bootstrap_peers(
@@ -720,6 +753,11 @@ pub(crate) async fn handle_keepers_status(
         bootstrap_bundle_relays: status.bootstrap_bundle_relays,
         bootstrap_bundle_bridges: status.bootstrap_bundle_bridges,
         bootstrap_bundle_keepers: status.bootstrap_bundle_keepers,
+        bootstrap_bundle_usable: status.bootstrap_bundle_usable,
+        bootstrap_bundle_structurally_weak: status.bootstrap_bundle_structurally_weak,
+        bootstrap_bundle_stale: status.bootstrap_bundle_stale,
+        bootstrap_bundle_warning_count: status.bootstrap_bundle_warning_count,
+        bootstrap_bundle_error_count: status.bootstrap_bundle_error_count,
         operator_id_hint: status.operator_id_hint,
         operator_region_hint: status.operator_region_hint,
         notes: vec![
@@ -729,6 +767,8 @@ pub(crate) async fn handle_keepers_status(
             "Bootstrap remains hybrid: static discovery peers, assist relays, and future bridge bundles"
                 .to_string(),
             "Keeper backfill currently restores archived encrypted envelopes into local replay storage"
+                .to_string(),
+            "Bootstrap bundle validation now exposes local usability, structural weakness, and advisory staleness"
                 .to_string(),
         ],
     }))

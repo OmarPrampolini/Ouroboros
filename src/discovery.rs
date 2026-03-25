@@ -75,6 +75,14 @@ pub fn parse_endpoint_hint(endpoint: &str) -> Option<SocketAddr> {
     without_scheme.parse::<SocketAddr>().ok()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootstrapEndpointPreference {
+    Balanced,
+    BridgeFirst,
+    KeeperFirst,
+    RelayFirst,
+}
+
 /// Abstraction layer for discovery backends (LAN cache, relay index, DHT/Kademlia).
 #[async_trait::async_trait]
 pub trait DiscoveryProvider: Send + Sync {
@@ -289,28 +297,104 @@ impl DiscoveryProvider for OrpDiscoveryProvider {
 
 /// Discovery provider backed by a managed bootstrap bundle.
 pub struct BootstrapDiscoveryProvider {
-    endpoints: Vec<SocketAddr>,
+    endpoints: Vec<BootstrapEndpointRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootstrapEndpointClass {
+    Relay,
+    Bridge,
+    Keeper,
+}
+
+#[derive(Clone, Debug)]
+struct BootstrapEndpointRecord {
+    addr: SocketAddr,
+    class: BootstrapEndpointClass,
 }
 
 impl BootstrapDiscoveryProvider {
     pub fn from_bundle(bundle: &crate::bootstrap_bundle::BootstrapBundle) -> Self {
+        Self::from_bundle_with_preference(bundle, BootstrapEndpointPreference::Balanced)
+    }
+
+    pub fn from_bundle_with_preference(
+        bundle: &crate::bootstrap_bundle::BootstrapBundle,
+        preference: BootstrapEndpointPreference,
+    ) -> Self {
         let mut endpoints = Vec::new();
         for relay in &bundle.relays {
             if let Some(addr) = parse_endpoint_hint(&relay.addr) {
-                if !endpoints.contains(&addr) {
-                    endpoints.push(addr);
+                if !endpoints
+                    .iter()
+                    .any(|entry: &BootstrapEndpointRecord| entry.addr == addr)
+                {
+                    endpoints.push(BootstrapEndpointRecord {
+                        addr,
+                        class: BootstrapEndpointClass::Relay,
+                    });
                 }
             }
         }
         for bridge in &bundle.bridges {
             if let Some(addr) = parse_endpoint_hint(&bridge.endpoint) {
-                if !endpoints.contains(&addr) {
-                    endpoints.push(addr);
+                if !endpoints
+                    .iter()
+                    .any(|entry: &BootstrapEndpointRecord| entry.addr == addr)
+                {
+                    endpoints.push(BootstrapEndpointRecord {
+                        addr,
+                        class: BootstrapEndpointClass::Bridge,
+                    });
+                }
+            }
+        }
+        for keeper in &bundle.keepers {
+            if let Some(addr) = parse_endpoint_hint(&keeper.endpoint) {
+                if !endpoints
+                    .iter()
+                    .any(|entry: &BootstrapEndpointRecord| entry.addr == addr)
+                {
+                    endpoints.push(BootstrapEndpointRecord {
+                        addr,
+                        class: BootstrapEndpointClass::Keeper,
+                    });
                 }
             }
         }
 
+        endpoints.sort_by(|a, b| {
+            bootstrap_preference_rank(preference, a.class)
+                .cmp(&bootstrap_preference_rank(preference, b.class))
+                .then_with(|| a.addr.to_string().cmp(&b.addr.to_string()))
+        });
+
         Self { endpoints }
+    }
+}
+
+fn bootstrap_preference_rank(
+    preference: BootstrapEndpointPreference,
+    class: BootstrapEndpointClass,
+) -> u8 {
+    match preference {
+        BootstrapEndpointPreference::Balanced | BootstrapEndpointPreference::RelayFirst => {
+            match class {
+                BootstrapEndpointClass::Relay => 0,
+                BootstrapEndpointClass::Bridge => 1,
+                BootstrapEndpointClass::Keeper => 2,
+            }
+        }
+        BootstrapEndpointPreference::BridgeFirst => match class {
+            BootstrapEndpointClass::Bridge => 0,
+            BootstrapEndpointClass::Relay => 1,
+            BootstrapEndpointClass::Keeper => 2,
+        },
+        BootstrapEndpointPreference::KeeperFirst => match class {
+            BootstrapEndpointClass::Keeper => 0,
+            BootstrapEndpointClass::Bridge => 1,
+            BootstrapEndpointClass::Relay => 2,
+        },
     }
 }
 
@@ -321,7 +405,12 @@ impl DiscoveryProvider for BootstrapDiscoveryProvider {
     }
 
     async fn discover(&self, _space_hash: [u8; 32], limit: usize) -> Result<Vec<SocketAddr>> {
-        Ok(self.endpoints.iter().copied().take(limit).collect())
+        Ok(self
+            .endpoints
+            .iter()
+            .map(|entry| entry.addr)
+            .take(limit)
+            .collect())
     }
 }
 

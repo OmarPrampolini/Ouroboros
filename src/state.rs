@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use zeroize::Zeroize;
 
-use crate::bootstrap_bundle::BootstrapBundleSummary;
+use crate::bootstrap_bundle::{BootstrapBundleSummary, BootstrapBundleValidationReport};
 use crate::config::PrivacyProfile;
 
 pub mod connection_manager;
@@ -150,6 +150,16 @@ pub struct EtherSyncStatus {
     pub bootstrap_bundle_bridges: usize,
     /// Number of keeper descriptors in the loaded bootstrap bundle.
     pub bootstrap_bundle_keepers: usize,
+    /// Whether the loaded bootstrap bundle is locally considered usable.
+    pub bootstrap_bundle_usable: bool,
+    /// Whether the loaded bootstrap bundle has structural warnings.
+    pub bootstrap_bundle_structurally_weak: bool,
+    /// Whether the loaded bootstrap bundle is locally considered stale.
+    pub bootstrap_bundle_stale: bool,
+    /// Number of bootstrap bundle validation warnings.
+    pub bootstrap_bundle_warning_count: usize,
+    /// Number of bootstrap bundle validation errors.
+    pub bootstrap_bundle_error_count: usize,
     /// Count of locally queued keeper envelopes awaiting backfill/replication.
     pub pending_keeper_envelopes: usize,
     /// Number of spaces that currently have pending keeper envelopes.
@@ -284,6 +294,7 @@ struct EtherSyncRuntime {
     operator_id_hint: String,
     operator_region_hint: String,
     bootstrap_bundle: BootstrapBundleSummary,
+    bootstrap_bundle_validation: Option<BootstrapBundleValidationReport>,
     keeper_envelopes: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
     keeper_archive: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
     space_policies: Arc<Mutex<HashMap<String, EtherSpacePolicy>>>,
@@ -301,6 +312,12 @@ struct DiscoverySeedReport {
     used_orp: bool,
     used_bootstrap_bundle: bool,
     used_static_bootstrap: bool,
+    bundle_usable: bool,
+    bundle_stale: bool,
+    bundle_relay_candidates: usize,
+    bundle_bridge_candidates: usize,
+    bundle_keeper_candidates: usize,
+    route_bias: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -559,7 +576,12 @@ impl AppState {
         }
 
         let runtime_cfg = crate::config::Config::from_env();
-        let bootstrap_bundle = crate::bootstrap_bundle::summarize_bootstrap_bundle(&runtime_cfg);
+        let bootstrap_bundle_validation =
+            crate::bootstrap_bundle::validate_loaded_bootstrap_bundle(&runtime_cfg);
+        let bootstrap_bundle = bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.summary.clone())
+            .unwrap_or_default();
         let resolved_bootstrap_peers =
             resolve_initial_bootstrap_peers(&runtime_cfg, &cfg.bootstrap_peers);
         let bootstrap_peer_count = resolved_bootstrap_peers.len();
@@ -643,6 +665,7 @@ impl AppState {
             operator_id_hint: runtime_cfg.operator_id.clone(),
             operator_region_hint: runtime_cfg.operator_region.clone(),
             bootstrap_bundle,
+            bootstrap_bundle_validation,
             keeper_envelopes,
             keeper_archive,
             space_policies,
@@ -712,6 +735,7 @@ impl AppState {
             operator_id_hint,
             operator_region_hint,
             bootstrap_bundle,
+            bootstrap_bundle_validation,
             keeper_envelopes,
             keeper_archive,
             space_policies,
@@ -731,6 +755,7 @@ impl AppState {
                     rt.operator_id_hint.clone(),
                     rt.operator_region_hint.clone(),
                     rt.bootstrap_bundle.clone(),
+                    rt.bootstrap_bundle_validation.clone(),
                     Some(rt.keeper_envelopes.clone()),
                     Some(rt.keeper_archive.clone()),
                     Some(rt.space_policies.clone()),
@@ -748,6 +773,7 @@ impl AppState {
                     "local-node".to_string(),
                     "unknown".to_string(),
                     BootstrapBundleSummary::default(),
+                    None,
                     None,
                     None,
                     None,
@@ -850,6 +876,26 @@ impl AppState {
             bootstrap_bundle_relays: bootstrap_bundle.relays,
             bootstrap_bundle_bridges: bootstrap_bundle.bridges,
             bootstrap_bundle_keepers: bootstrap_bundle.keepers,
+            bootstrap_bundle_usable: bootstrap_bundle_validation
+                .as_ref()
+                .map(|report| report.is_usable)
+                .unwrap_or(false),
+            bootstrap_bundle_structurally_weak: bootstrap_bundle_validation
+                .as_ref()
+                .map(|report| report.is_structurally_weak)
+                .unwrap_or(false),
+            bootstrap_bundle_stale: bootstrap_bundle_validation
+                .as_ref()
+                .map(|report| report.staleness.is_stale())
+                .unwrap_or(false),
+            bootstrap_bundle_warning_count: bootstrap_bundle_validation
+                .as_ref()
+                .map(|report| report.issue_counts.warning)
+                .unwrap_or(0),
+            bootstrap_bundle_error_count: bootstrap_bundle_validation
+                .as_ref()
+                .map(|report| report.issue_counts.error)
+                .unwrap_or(0),
             pending_keeper_envelopes,
             keeper_space_count,
             archived_keeper_envelopes,
@@ -937,8 +983,15 @@ impl AppState {
         )
         .await;
 
-        let discovery_report =
-            seed_space_from_discovery(&node, &events_tx, &passphrase, &space_id, orp_enabled).await;
+        let discovery_report = seed_space_from_discovery(
+            &node,
+            &events_tx,
+            &passphrase,
+            &space_id,
+            orp_enabled,
+            &applied_policy,
+        )
+        .await;
 
         if already_subscribed {
             let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
@@ -1664,15 +1717,31 @@ fn resolve_initial_bootstrap_peers(
     }
 
     if let Some(bundle) = crate::bootstrap_bundle::load_bootstrap_bundle(runtime_cfg) {
-        for relay in &bundle.relays {
-            if let Some(addr) = crate::discovery::parse_endpoint_hint(&relay.addr) {
-                push_unique_peer(&mut peers, addr);
+        let validation = bundle.validation_report();
+        if validation.is_usable {
+            for relay in &bundle.relays {
+                if let Some(addr) = crate::discovery::parse_endpoint_hint(&relay.addr) {
+                    push_unique_peer(&mut peers, addr);
+                }
             }
-        }
-        for bridge in &bundle.bridges {
-            if let Some(addr) = crate::discovery::parse_endpoint_hint(&bridge.endpoint) {
-                push_unique_peer(&mut peers, addr);
+            for bridge in &bundle.bridges {
+                if let Some(addr) = crate::discovery::parse_endpoint_hint(&bridge.endpoint) {
+                    push_unique_peer(&mut peers, addr);
+                }
             }
+            if runtime_cfg.keeper_replication_enabled && runtime_cfg.keeper_replication_factor > 0 {
+                for keeper in &bundle.keepers {
+                    if let Some(addr) = crate::discovery::parse_endpoint_hint(&keeper.endpoint) {
+                        push_unique_peer(&mut peers, addr);
+                    }
+                }
+            }
+        } else {
+            tracing::warn!(
+                "ignoring unusable bootstrap bundle during initial peer resolution (warnings={}, errors={})",
+                validation.issue_counts.warning,
+                validation.issue_counts.error
+            );
         }
     }
 
@@ -1691,12 +1760,16 @@ async fn seed_space_from_discovery(
     passphrase: &str,
     space_id: &str,
     orp_enabled: bool,
+    policy: &EtherSpacePolicy,
 ) -> DiscoverySeedReport {
     let runtime_cfg = crate::config::Config::from_env();
     let static_bootstrap =
         crate::discovery::parse_bootstrap_peers(&runtime_cfg.discovery_bootstrap_peers);
     let mut backends: Vec<Arc<dyn crate::discovery::DiscoveryProvider>> = Vec::new();
-    let mut report = DiscoverySeedReport::default();
+    let mut report = DiscoverySeedReport {
+        route_bias: policy.route_bias.as_str().to_string(),
+        ..DiscoverySeedReport::default()
+    };
 
     if orp_enabled {
         backends.push(Arc::new(crate::discovery::OrpDiscoveryProvider::new(
@@ -1706,10 +1779,52 @@ async fn seed_space_from_discovery(
     }
 
     if let Some(bundle) = crate::bootstrap_bundle::load_bootstrap_bundle(&runtime_cfg) {
-        backends.push(Arc::new(
-            crate::discovery::BootstrapDiscoveryProvider::from_bundle(&bundle),
-        ));
-        report.used_bootstrap_bundle = true;
+        report.bundle_relay_candidates = bundle.relays.len();
+        report.bundle_bridge_candidates = bundle.bridges.len();
+        report.bundle_keeper_candidates = bundle.keepers.len();
+        let validation = bundle.validation_report();
+        report.bundle_usable = validation.is_usable;
+        report.bundle_stale = validation.staleness.is_stale();
+        if validation.is_usable {
+            let preference = match policy.route_bias {
+                SpaceRouteBias::BridgePreferred => {
+                    crate::discovery::BootstrapEndpointPreference::BridgeFirst
+                }
+                SpaceRouteBias::KeeperPreferred if policy_enables_keeper_replication(policy) => {
+                    crate::discovery::BootstrapEndpointPreference::KeeperFirst
+                }
+                SpaceRouteBias::DirectPreferred => {
+                    crate::discovery::BootstrapEndpointPreference::RelayFirst
+                }
+                SpaceRouteBias::Balanced => crate::discovery::BootstrapEndpointPreference::Balanced,
+                _ => crate::discovery::BootstrapEndpointPreference::Balanced,
+            };
+            backends.push(Arc::new(
+                crate::discovery::BootstrapDiscoveryProvider::from_bundle_with_preference(
+                    &bundle, preference,
+                ),
+            ));
+            report.used_bootstrap_bundle = true;
+        } else {
+            emit_ethersync_event(
+                events_tx,
+                EtherSyncEvent {
+                    kind: "space_discovery_bundle_skipped".to_string(),
+                    ts_ms: now_ms(),
+                    space_id: Some(space_id.to_string()),
+                    slot_id: None,
+                    payload_b64: None,
+                    text: None,
+                    info: Some(
+                        "bootstrap bundle skipped because it is locally unusable".to_string(),
+                    ),
+                    error: Some(format!(
+                        "warnings={} errors={}",
+                        validation.issue_counts.warning, validation.issue_counts.error
+                    )),
+                },
+            );
+        }
     }
 
     report.used_static_bootstrap = !static_bootstrap.is_empty();
@@ -1760,11 +1875,17 @@ async fn seed_space_from_discovery(
                 payload_b64: None,
                 text: None,
                 info: Some(format!(
-                    "discovered {} endpoint(s) via orp={} bundle={} static={}",
+                    "discovered {} endpoint(s) via orp={} bundle={} static={} route_bias={} bundle_usable={} bundle_stale={} bundle(relays={}, bridges={}, keepers={})",
                     report.discovered,
                     report.used_orp,
                     report.used_bootstrap_bundle,
-                    report.used_static_bootstrap
+                    report.used_static_bootstrap,
+                    report.route_bias,
+                    report.bundle_usable,
+                    report.bundle_stale,
+                    report.bundle_relay_candidates,
+                    report.bundle_bridge_candidates,
+                    report.bundle_keeper_candidates
                 )),
                 error: None,
             },
@@ -2141,7 +2262,12 @@ fn default_high_risk_gate_reasons(
 
 fn default_ethersync_status() -> EtherSyncStatus {
     let runtime_cfg = crate::config::Config::from_env();
-    let bootstrap_bundle = crate::bootstrap_bundle::summarize_bootstrap_bundle(&runtime_cfg);
+    let bootstrap_bundle_validation =
+        crate::bootstrap_bundle::validate_loaded_bootstrap_bundle(&runtime_cfg);
+    let bootstrap_bundle = bootstrap_bundle_validation
+        .as_ref()
+        .map(|report| report.summary.clone())
+        .unwrap_or_default();
     let high_risk_gate_reasons = default_high_risk_gate_reasons(
         false,
         runtime_cfg.keeper_replication_enabled,
@@ -2179,6 +2305,26 @@ fn default_ethersync_status() -> EtherSyncStatus {
         bootstrap_bundle_relays: bootstrap_bundle.relays,
         bootstrap_bundle_bridges: bootstrap_bundle.bridges,
         bootstrap_bundle_keepers: bootstrap_bundle.keepers,
+        bootstrap_bundle_usable: bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.is_usable)
+            .unwrap_or(false),
+        bootstrap_bundle_structurally_weak: bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.is_structurally_weak)
+            .unwrap_or(false),
+        bootstrap_bundle_stale: bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.staleness.is_stale())
+            .unwrap_or(false),
+        bootstrap_bundle_warning_count: bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.issue_counts.warning)
+            .unwrap_or(0),
+        bootstrap_bundle_error_count: bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.issue_counts.error)
+            .unwrap_or(0),
         pending_keeper_envelopes: 0,
         keeper_space_count: 0,
         archived_keeper_envelopes: 0,

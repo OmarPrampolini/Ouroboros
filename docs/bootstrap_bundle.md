@@ -33,6 +33,26 @@ At this stage the bundle is used for:
 
 It is not yet used as a full routing authority or as a mandatory global directory.
 
+## Validation posture
+
+Bootstrap bundles now carry a local validation report that is intended for later runtime and API wiring.
+
+The report is machine-friendly and separates three concerns:
+
+- usability
+- structural weakness
+- freshness
+
+The current validation rules are intentionally local and conservative:
+
+- an empty bundle is treated as unusable
+- missing relay `id` or `addr`, missing bridge `id` or `endpoint`, and missing keeper `id` or `endpoint` are flagged as structural warnings
+- duplicate relay, bridge, and keeper IDs or endpoints are flagged as structural warnings
+- `generated_at_ms` is checked only for advisory staleness, using a conservative age threshold
+- if `generated_at_ms` is absent, freshness is unknown rather than failed
+
+This means a bundle can still be parsed and reported even when it is weak, while clearly surfacing the reasons it should not be trusted blindly.
+
 ## JSON shape
 
 ```json
@@ -73,6 +93,8 @@ It is not yet used as a full routing authority or as a mandatory global director
 }
 ```
 
+The bundle module exposes a validation report with the same shape for all callers, so runtime code can later attach policy without changing the bundle parser itself.
+
 ## Why this matters
 
 This gives Ouroboros a way to scale operationally without lying about decentralization:
@@ -81,6 +103,15 @@ This gives Ouroboros a way to scale operationally without lying about decentrali
 - bridge posture becomes visible
 - keeper posture becomes visible
 - future operator attestation has a concrete place to live
+
+## Not implemented yet
+
+The new validation layer is deliberately not pretending to be a trust system.
+
+- no signature verification yet
+- no remote refresh or re-fetch path yet
+- no authority or policy decision based on bundle origin alone
+- no automatic repair of weak or duplicate records yet
 
 ## Related surfaces
 

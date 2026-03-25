@@ -103,6 +103,8 @@ Shared cryptographic building blocks:
 - space join can now attach per-space retention and route-bias policy
 - ORP ranking now factors operator hints, region hints, bundle posture, and per-space route bias
 - ORP candidate inspection now exposes ranked target-specific route decisions and cache-versus-lookup provenance
+- bootstrap bundle validation now reports usability, structural weakness, and advisory staleness
+- keeper endpoints from the bootstrap bundle now participate in bootstrap seeding when managed retention is enabled
 
 ## Current truth
 
