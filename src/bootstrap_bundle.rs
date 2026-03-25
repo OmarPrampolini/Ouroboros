@@ -215,13 +215,15 @@ pub fn validate_bootstrap_bundle_at(
         push_issue(
             &mut issues,
             &mut counts,
-            BootstrapBundleValidationKind::EmptyBundle,
-            BootstrapBundleValidationSeverity::Error,
-            None,
-            None,
-            None,
-            None,
-            "bootstrap bundle has no relays, bridges, keepers, or mirrors",
+            BootstrapBundleValidationIssue {
+                kind: BootstrapBundleValidationKind::EmptyBundle,
+                severity: BootstrapBundleValidationSeverity::Error,
+                entry_kind: None,
+                entry_index: None,
+                field: None,
+                value: None,
+                message: "bootstrap bundle has no relays, bridges, keepers, or mirrors".to_owned(),
+            },
         );
     }
 
@@ -236,16 +238,18 @@ pub fn validate_bootstrap_bundle_at(
                 push_issue(
                     &mut issues,
                     &mut counts,
-                    BootstrapBundleValidationKind::StaleBundle,
-                    BootstrapBundleValidationSeverity::Info,
-                    None,
-                    None,
-                    Some("generated_at_ms".to_owned()),
-                    Some(generated_at_ms.to_string()),
-                    format!(
-                        "bootstrap bundle is older than the conservative freshness threshold (age {} ms, threshold {} ms)",
-                        age_ms, stale_after_ms
-                    ),
+                    BootstrapBundleValidationIssue {
+                        kind: BootstrapBundleValidationKind::StaleBundle,
+                        severity: BootstrapBundleValidationSeverity::Info,
+                        entry_kind: None,
+                        entry_index: None,
+                        field: Some("generated_at_ms".to_owned()),
+                        value: Some(generated_at_ms.to_string()),
+                        message: format!(
+                            "bootstrap bundle is older than the conservative freshness threshold (age {} ms, threshold {} ms)",
+                            age_ms, stale_after_ms
+                        ),
+                    },
                 );
                 BootstrapBundleStaleness::Stale {
                     age_ms,
@@ -313,25 +317,29 @@ fn validate_relays(
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::MissingId,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Relay),
-                Some(index),
-                Some("id".to_owned()),
-                Some(relay.id.clone()),
-                "relay entry is missing a usable id",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::MissingId,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Relay),
+                    entry_index: Some(index),
+                    field: Some("id".to_owned()),
+                    value: Some(relay.id.clone()),
+                    message: "relay entry is missing a usable id".to_owned(),
+                },
             );
         } else if !seen_ids.insert(id.to_owned()) {
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::DuplicateId,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Relay),
-                Some(index),
-                Some("id".to_owned()),
-                Some(id.to_owned()),
-                "duplicate relay id detected",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::DuplicateId,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Relay),
+                    entry_index: Some(index),
+                    field: Some("id".to_owned()),
+                    value: Some(id.to_owned()),
+                    message: "duplicate relay id detected".to_owned(),
+                },
             );
         }
 
@@ -340,25 +348,29 @@ fn validate_relays(
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::MissingEndpoint,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Relay),
-                Some(index),
-                Some("addr".to_owned()),
-                Some(relay.addr.clone()),
-                "relay entry is missing a usable addr",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::MissingEndpoint,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Relay),
+                    entry_index: Some(index),
+                    field: Some("addr".to_owned()),
+                    value: Some(relay.addr.clone()),
+                    message: "relay entry is missing a usable addr".to_owned(),
+                },
             );
         } else if !seen_addrs.insert(addr.to_owned()) {
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::DuplicateEndpoint,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Relay),
-                Some(index),
-                Some("addr".to_owned()),
-                Some(addr.to_owned()),
-                "duplicate relay addr detected",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::DuplicateEndpoint,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Relay),
+                    entry_index: Some(index),
+                    field: Some("addr".to_owned()),
+                    value: Some(addr.to_owned()),
+                    message: "duplicate relay addr detected".to_owned(),
+                },
             );
         }
     }
@@ -378,25 +390,29 @@ fn validate_bridges(
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::MissingId,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Bridge),
-                Some(index),
-                Some("id".to_owned()),
-                Some(bridge.id.clone()),
-                "bridge entry is missing a usable id",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::MissingId,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Bridge),
+                    entry_index: Some(index),
+                    field: Some("id".to_owned()),
+                    value: Some(bridge.id.clone()),
+                    message: "bridge entry is missing a usable id".to_owned(),
+                },
             );
         } else if !seen_ids.insert(id.to_owned()) {
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::DuplicateId,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Bridge),
-                Some(index),
-                Some("id".to_owned()),
-                Some(id.to_owned()),
-                "duplicate bridge id detected",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::DuplicateId,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Bridge),
+                    entry_index: Some(index),
+                    field: Some("id".to_owned()),
+                    value: Some(id.to_owned()),
+                    message: "duplicate bridge id detected".to_owned(),
+                },
             );
         }
 
@@ -405,25 +421,29 @@ fn validate_bridges(
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::MissingEndpoint,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Bridge),
-                Some(index),
-                Some("endpoint".to_owned()),
-                Some(bridge.endpoint.clone()),
-                "bridge entry is missing a usable endpoint",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::MissingEndpoint,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Bridge),
+                    entry_index: Some(index),
+                    field: Some("endpoint".to_owned()),
+                    value: Some(bridge.endpoint.clone()),
+                    message: "bridge entry is missing a usable endpoint".to_owned(),
+                },
             );
         } else if !seen_endpoints.insert(endpoint.to_owned()) {
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::DuplicateEndpoint,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Bridge),
-                Some(index),
-                Some("endpoint".to_owned()),
-                Some(endpoint.to_owned()),
-                "duplicate bridge endpoint detected",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::DuplicateEndpoint,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Bridge),
+                    entry_index: Some(index),
+                    field: Some("endpoint".to_owned()),
+                    value: Some(endpoint.to_owned()),
+                    message: "duplicate bridge endpoint detected".to_owned(),
+                },
             );
         }
     }
@@ -443,25 +463,29 @@ fn validate_keepers(
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::MissingId,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Keeper),
-                Some(index),
-                Some("id".to_owned()),
-                Some(keeper.id.clone()),
-                "keeper entry is missing a usable id",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::MissingId,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Keeper),
+                    entry_index: Some(index),
+                    field: Some("id".to_owned()),
+                    value: Some(keeper.id.clone()),
+                    message: "keeper entry is missing a usable id".to_owned(),
+                },
             );
         } else if !seen_ids.insert(id.to_owned()) {
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::DuplicateId,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Keeper),
-                Some(index),
-                Some("id".to_owned()),
-                Some(id.to_owned()),
-                "duplicate keeper id detected",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::DuplicateId,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Keeper),
+                    entry_index: Some(index),
+                    field: Some("id".to_owned()),
+                    value: Some(id.to_owned()),
+                    message: "duplicate keeper id detected".to_owned(),
+                },
             );
         }
 
@@ -470,25 +494,29 @@ fn validate_keepers(
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::MissingEndpoint,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Keeper),
-                Some(index),
-                Some("endpoint".to_owned()),
-                Some(keeper.endpoint.clone()),
-                "keeper entry is missing a usable endpoint",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::MissingEndpoint,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Keeper),
+                    entry_index: Some(index),
+                    field: Some("endpoint".to_owned()),
+                    value: Some(keeper.endpoint.clone()),
+                    message: "keeper entry is missing a usable endpoint".to_owned(),
+                },
             );
         } else if !seen_endpoints.insert(endpoint.to_owned()) {
             push_issue(
                 issues,
                 counts,
-                BootstrapBundleValidationKind::DuplicateEndpoint,
-                BootstrapBundleValidationSeverity::Warning,
-                Some(BootstrapBundleEntryKind::Keeper),
-                Some(index),
-                Some("endpoint".to_owned()),
-                Some(endpoint.to_owned()),
-                "duplicate keeper endpoint detected",
+                BootstrapBundleValidationIssue {
+                    kind: BootstrapBundleValidationKind::DuplicateEndpoint,
+                    severity: BootstrapBundleValidationSeverity::Warning,
+                    entry_kind: Some(BootstrapBundleEntryKind::Keeper),
+                    entry_index: Some(index),
+                    field: Some("endpoint".to_owned()),
+                    value: Some(endpoint.to_owned()),
+                    message: "duplicate keeper endpoint detected".to_owned(),
+                },
             );
         }
     }
@@ -497,29 +525,15 @@ fn validate_keepers(
 fn push_issue(
     issues: &mut Vec<BootstrapBundleValidationIssue>,
     counts: &mut BootstrapBundleValidationIssueCounts,
-    kind: BootstrapBundleValidationKind,
-    severity: BootstrapBundleValidationSeverity,
-    entry_kind: Option<BootstrapBundleEntryKind>,
-    entry_index: Option<usize>,
-    field: Option<String>,
-    value: Option<String>,
-    message: impl Into<String>,
+    issue: BootstrapBundleValidationIssue,
 ) {
-    match severity {
+    match issue.severity {
         BootstrapBundleValidationSeverity::Info => counts.info += 1,
         BootstrapBundleValidationSeverity::Warning => counts.warning += 1,
         BootstrapBundleValidationSeverity::Error => counts.error += 1,
     }
 
-    issues.push(BootstrapBundleValidationIssue {
-        kind,
-        severity,
-        entry_kind,
-        entry_index,
-        field,
-        value,
-        message: message.into(),
-    });
+    issues.push(issue);
 }
 
 fn current_time_ms() -> u64 {

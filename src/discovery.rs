@@ -495,9 +495,7 @@ fn bootstrap_region_policy_rank(
             }
         }
         _ => {
-            if region.is_empty() {
-                1
-            } else if is_local_region {
+            if region.is_empty() || is_local_region {
                 1
             } else {
                 0

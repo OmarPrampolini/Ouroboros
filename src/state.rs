@@ -2303,7 +2303,7 @@ async fn flush_keeper_pending_envelopes(
         match only_space {
             Some(space_id) => {
                 let drained_records = if let Some(entry) = guard.get_mut(space_id) {
-                    entry.drain(..).collect::<Vec<_>>()
+                    std::mem::take(entry)
                 } else {
                     Vec::new()
                 };
