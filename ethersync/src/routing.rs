@@ -340,16 +340,14 @@ impl RouteCache {
 
 /// Serialize an `OrpFrame` to bytes using bincode.
 pub fn encode_orp_frame(frame: &OrpFrame) -> Result<Vec<u8>, EtherSyncError> {
-    bincode::serialize(frame).map_err(|e| {
-        EtherSyncError::NetworkError(format!("ORP frame encode failed: {e}"))
-    })
+    bincode::serialize(frame)
+        .map_err(|e| EtherSyncError::NetworkError(format!("ORP frame encode failed: {e}")))
 }
 
 /// Deserialize an `OrpFrame` from bytes.
 pub fn decode_orp_frame(bytes: &[u8]) -> Result<OrpFrame, EtherSyncError> {
-    bincode::deserialize(bytes).map_err(|e| {
-        EtherSyncError::NetworkError(format!("ORP frame decode failed: {e}"))
-    })
+    bincode::deserialize(bytes)
+        .map_err(|e| EtherSyncError::NetworkError(format!("ORP frame decode failed: {e}")))
 }
 
 /// Score a `CachedOffer` based on freshness and hop quality.
@@ -515,9 +513,24 @@ mod tests {
         let sh = space_hash();
         let prefix = space_prefix();
 
-        cache.insert_announcement(make_announcement(10, [1u8; 16], [1u8; 8]), dummy_addr(), 10, &sh);
-        cache.insert_announcement(make_announcement(10, [2u8; 16], [2u8; 8]), dummy_addr(), 10, &sh);
-        cache.insert_announcement(make_announcement(11, [3u8; 16], [3u8; 8]), dummy_addr(), 11, &sh);
+        cache.insert_announcement(
+            make_announcement(10, [1u8; 16], [1u8; 8]),
+            dummy_addr(),
+            10,
+            &sh,
+        );
+        cache.insert_announcement(
+            make_announcement(10, [2u8; 16], [2u8; 8]),
+            dummy_addr(),
+            10,
+            &sh,
+        );
+        cache.insert_announcement(
+            make_announcement(11, [3u8; 16], [3u8; 8]),
+            dummy_addr(),
+            11,
+            &sh,
+        );
 
         let slot10 = cache.announcements_for_slot(&prefix, 10);
         assert_eq!(slot10.len(), 2);
@@ -567,9 +580,7 @@ mod tests {
             version: 1,
             lookup_id: [1u8; 16],
             responder_id: [2u8; 16],
-            next_hop: RouteHop::Direct {
-                addr: dummy_addr(),
-            },
+            next_hop: RouteHop::Direct { addr: dummy_addr() },
             score: 5000,
         };
         let frame = OrpFrame::Offer(offer.clone());
@@ -594,9 +605,7 @@ mod tests {
             version: 1,
             lookup_id,
             responder_id: [10u8; 16],
-            next_hop: RouteHop::Direct {
-                addr: dummy_addr(),
-            },
+            next_hop: RouteHop::Direct { addr: dummy_addr() },
             score: 5000,
         };
         cache.insert_offer(offer);

@@ -8,9 +8,9 @@ use crate::{
     message::EtherMessage,
     network::EtherUdpSocket,
     routing::{
-        decode_orp_frame, encode_orp_frame, OrpFrame, RouteAnnouncement, RouteCache,
-        RouteCapabilities, RouteHop, RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE,
-        SUBSPACE_ROUTE_LOOKUP, SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
+        encode_orp_frame, OrpFrame, RouteAnnouncement, RouteCache, RouteCapabilities, RouteHop,
+        RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_LOOKUP,
+        SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
     },
     storage::EtherStorage,
     EtherSyncError,
@@ -154,9 +154,8 @@ impl EtherNode {
 
         // Generate ephemeral node id for this session
         let mut node_id = [0u8; 16];
-        fill_random(&mut node_id).map_err(|_| {
-            EtherSyncError::NetworkError("failed to generate node id".to_string())
-        })?;
+        fill_random(&mut node_id)
+            .map_err(|_| EtherSyncError::NetworkError("failed to generate node id".to_string()))?;
 
         Ok(Self {
             config,
@@ -433,7 +432,8 @@ impl EtherNode {
                                 score: 5000, // direct = highest base score
                             };
                             let offer_frame = OrpFrame::Offer(offer);
-                            let offer_payload = match crate::routing::encode_orp_frame(&offer_frame) {
+                            let offer_payload = match crate::routing::encode_orp_frame(&offer_frame)
+                            {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
@@ -449,7 +449,8 @@ impl EtherNode {
                                 Err(_) => continue,
                             };
 
-                            let hash = ouroboros_crypto::hash::blake3_hash(&offer_msg.encrypted_payload);
+                            let hash =
+                                ouroboros_crypto::hash::blake3_hash(&offer_msg.encrypted_payload);
                             {
                                 let mut st = router_storage.lock().await;
                                 let _ = st.store(slot, hash, offer_msg.clone());
@@ -458,8 +459,11 @@ impl EtherNode {
                                 let mut seen = router_seen.write().await;
                                 seen.insert(hash);
                                 if seen.len() > router_max_seen {
-                                    let to_remove: Vec<_> = seen.iter().take(seen.len() / 2).cloned().collect();
-                                    for h in to_remove { seen.remove(&h); }
+                                    let to_remove: Vec<_> =
+                                        seen.iter().take(seen.len() / 2).cloned().collect();
+                                    for h in to_remove {
+                                        seen.remove(&h);
+                                    }
                                 }
                             }
 
@@ -688,10 +692,7 @@ impl EtherNode {
     /// The announcement is encrypted with the same passphrase on subspace 1
     /// and gossiped to all known peers, making this node discoverable by others
     /// in the same slot without relying on static bootstrap peers.
-    pub async fn publish_route_announcement(
-        &self,
-        passphrase: &str,
-    ) -> Result<(), EtherSyncError> {
+    pub async fn publish_route_announcement(&self, passphrase: &str) -> Result<(), EtherSyncError> {
         let slot = EtherCoordinate::current_slot();
         let local_addr = self.socket.local_addr();
 
@@ -722,7 +723,8 @@ impl EtherNode {
         let frame = OrpFrame::Announce(announcement);
         let payload = encode_orp_frame(&frame)?;
 
-        let msg = EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_ANNOUNCE)?;
+        let msg =
+            EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_ANNOUNCE)?;
 
         // Store locally and gossip
         let hash = Self::message_hash(&msg);
@@ -784,7 +786,8 @@ impl EtherNode {
         let frame = OrpFrame::Lookup(lookup);
         let payload = encode_orp_frame(&frame)?;
 
-        let msg = EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_LOOKUP)?;
+        let msg =
+            EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_LOOKUP)?;
 
         let hash = Self::message_hash(&msg);
         {
@@ -814,7 +817,11 @@ impl EtherNode {
             }
         });
 
-        trace!("Published ORP route lookup {:?} for tag {:?}", lookup_id, target_tag);
+        trace!(
+            "Published ORP route lookup {:?} for tag {:?}",
+            lookup_id,
+            target_tag
+        );
         Ok(lookup_id)
     }
 
@@ -950,7 +957,9 @@ impl EtherNode {
                     seen.insert(hash);
                     if seen.len() > max_seen_cache {
                         let to_remove: Vec<_> = seen.iter().take(seen.len() / 2).cloned().collect();
-                        for h in to_remove { seen.remove(&h); }
+                        for h in to_remove {
+                            seen.remove(&h);
+                        }
                     }
                 }
 
@@ -1102,7 +1111,10 @@ mod tests {
         let storage = node.storage().lock().await;
         let msgs = storage.get_slot_messages(slot).unwrap_or_default();
         // Should have at least 1 message (the route announcement)
-        assert!(!msgs.is_empty(), "ORP announcement should be stored locally");
+        assert!(
+            !msgs.is_empty(),
+            "ORP announcement should be stored locally"
+        );
     }
 
     #[tokio::test]
@@ -1116,11 +1128,17 @@ mod tests {
 
         let prefix1 = node.start_orp_for_space("deterministic-test").await;
         let prefix2 = node.start_orp_for_space("deterministic-test").await;
-        assert_eq!(prefix1, prefix2, "same passphrase must yield same space prefix");
+        assert_eq!(
+            prefix1, prefix2,
+            "same passphrase must yield same space prefix"
+        );
 
         // Different passphrase must produce different prefix
         let prefix3 = node.start_orp_for_space("other-passphrase").await;
-        assert_ne!(prefix1, prefix3, "different passphrases must yield different prefixes");
+        assert_ne!(
+            prefix1, prefix3,
+            "different passphrases must yield different prefixes"
+        );
     }
 
     #[tokio::test]

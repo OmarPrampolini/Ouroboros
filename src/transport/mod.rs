@@ -28,7 +28,6 @@ pub use wan::wan_tor;
 
 use crate::config::{Config, WanMode, UDP_MAX_PACKET_SIZE, WAN_ASSIST_GLOBAL_TIMEOUT_SECS};
 use crate::derive::RendezvousParams;
-use ethersync::EtherNode;
 use crate::network_telemetry;
 use crate::offer::{OfferPayload, RoleHint};
 use crate::resume::ResumeParams;
@@ -39,6 +38,7 @@ use crate::transport::nat_detection::{
     TransportPriority,
 };
 use crate::transport::stun::StunClient;
+use ethersync::EtherNode;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
