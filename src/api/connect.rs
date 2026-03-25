@@ -22,7 +22,7 @@ use super::{ApiError, ApiState, Streams};
 use crate::network_telemetry;
 use crate::transport::assist_inbox::{AssistInbox, AssistInboxRequest};
 use crate::{
-    config::{Config, ProductMode, TorRole, WanMode, DEFAULT_CHANNEL_CAPACITY},
+    config::{Config, PrivacyProfile, ProductMode, TorRole, WanMode, DEFAULT_CHANNEL_CAPACITY},
     crypto::SessionKeyState,
     derive::{derive_from_secret, derive_tag8_from_key},
     offer::{OfferPayload, RoleHint},
@@ -184,6 +184,13 @@ pub(crate) async fn handle_connect(
     let streams = state.streams.clone();
     if !app.api_allow(addr.ip(), 5.0).await {
         return Err(connect_err(StatusCode::TOO_MANY_REQUESTS, "rate limit"));
+    }
+    let privacy_profile = req.privacy_profile;
+    if privacy_profile == PrivacyProfile::HighRisk {
+        return Err(connect_err(
+            StatusCode::CONFLICT,
+            "high-risk profile unavailable: ORP high-risk circuits are not implemented yet",
+        ));
     }
     if req.offer.is_some() && req.passphrase.is_some() {
         return Err(connect_err(
@@ -408,6 +415,7 @@ pub(crate) async fn handle_connect(
         s.mode = Some("guaranteed".into());
         s.status = crate::state::ConnectionStatus::Connected;
         s.peer_address = None;
+        s.privacy_profile = privacy_profile;
         app.set_connection_state(s).await;
         record_connect_success().await;
 
@@ -417,6 +425,7 @@ pub(crate) async fn handle_connect(
             mode: "guaranteed".into(),
             peer: None,
             resume_status: None,
+            privacy_profile,
         }));
     }
 
@@ -535,6 +544,7 @@ pub(crate) async fn handle_connect(
         s.mode = Some(mode.clone());
         s.status = crate::state::ConnectionStatus::Connected;
         s.peer_address = peer.clone();
+        s.privacy_profile = privacy_profile;
         app.set_connection_state(s).await;
 
         let resume_status = match result.resume_used {
@@ -549,6 +559,7 @@ pub(crate) async fn handle_connect(
             mode,
             peer,
             resume_status,
+            privacy_profile,
         }));
     }
 
@@ -650,6 +661,7 @@ pub(crate) async fn handle_connect(
         s.mode = Some(mode.clone());
         s.status = crate::state::ConnectionStatus::Connected;
         s.peer_address = peer.clone();
+        s.privacy_profile = privacy_profile;
         app.set_connection_state(s).await;
         record_connect_success().await;
 
@@ -659,6 +671,7 @@ pub(crate) async fn handle_connect(
             mode,
             peer,
             resume_status: None,
+            privacy_profile,
         }));
     }
 
@@ -865,6 +878,7 @@ pub(crate) async fn handle_connect(
         s.mode = Some(mode.clone());
         s.status = crate::state::ConnectionStatus::Connected;
         s.peer_address = peer.clone();
+        s.privacy_profile = privacy_profile;
         app.set_connection_state(s).await;
         record_connect_success().await;
 
@@ -874,6 +888,7 @@ pub(crate) async fn handle_connect(
             mode,
             peer,
             resume_status: None,
+            privacy_profile,
         }));
     }
 
@@ -936,6 +951,7 @@ pub(crate) async fn handle_connect(
                         mode,
                         peer: state_snapshot.peer_address,
                         resume_status: None,
+                        privacy_profile: state_snapshot.privacy_profile,
                     }));
                 }
 
@@ -960,6 +976,7 @@ pub(crate) async fn handle_connect(
                 s.mode = Some("wan".into());
                 s.status = crate::state::ConnectionStatus::Connecting;
                 s.peer_address = None;
+                s.privacy_profile = privacy_profile;
                 app.set_connection_state(s).await;
                 record_connect_success().await;
 
@@ -969,6 +986,7 @@ pub(crate) async fn handle_connect(
                     mode: "wan".into(),
                     peer: None,
                     resume_status: None,
+                    privacy_profile,
                 }));
             }
 
@@ -1060,6 +1078,7 @@ pub(crate) async fn handle_connect(
             s.mode = Some(mode.clone());
             s.status = crate::state::ConnectionStatus::Connected;
             s.peer_address = peer_addr.clone();
+            s.privacy_profile = privacy_profile;
             app.set_connection_state(s).await;
             record_connect_success().await;
 
@@ -1069,11 +1088,13 @@ pub(crate) async fn handle_connect(
                 mode,
                 peer: peer_addr,
                 resume_status: None,
+                privacy_profile,
             }))
         }
         Err(e) => {
             let mut s = app.get_connection_state().await;
             s.status = crate::state::ConnectionStatus::Error(e.to_string());
+            s.privacy_profile = privacy_profile;
             app.set_connection_state(s).await;
 
             tracing::error!("Connect failed: {:?}", e);

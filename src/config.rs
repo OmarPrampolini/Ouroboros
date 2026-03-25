@@ -22,6 +22,15 @@ pub enum ProductMode {
     Classic,
 }
 
+/// Public privacy tier requested by API clients.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrivacyProfile {
+    #[default]
+    StandardPrivate,
+    HighRisk,
+}
+
 /// Egress routing for Guaranteed mode (A)
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]

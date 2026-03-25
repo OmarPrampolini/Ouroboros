@@ -50,6 +50,17 @@ Important note:
 
 This is intentional: the project keeps PQ primitives available without depending on an unmaintained Kyber stack in the live transport backend.
 
+### Runtime capability note
+
+Feature flags are only part of the truth. The daemon also reports runtime capability posture through `GET /v1/capabilities`.
+
+That surface distinguishes between:
+
+- compiled transports such as `quic` and `webrtc`
+- cryptographic capability such as `pq_primitives`
+- routing tiers such as `orp_standard` and `orp_highrisk`
+- managed-network scaffolding such as `keeper_replication` and `bridge_bootstrap`
+
 ### `full`
 
 Convenience profile that enables:

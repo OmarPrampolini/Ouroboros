@@ -10,6 +10,10 @@
 //! - `2`: route lookups        (`SUBSPACE_ROUTE_LOOKUP`)
 //! - `3`: route offers         (`SUBSPACE_ROUTE_OFFER`)
 //! - `4`: relay health beacons (`SUBSPACE_RELAY_BEACON`)
+//! - `5`: circuit open         (`SUBSPACE_CIRCUIT_OPEN`)
+//! - `6`: circuit extend       (`SUBSPACE_CIRCUIT_EXTEND`)
+//! - `7`: circuit close        (`SUBSPACE_CIRCUIT_CLOSE`)
+//! - `8`: cover traffic        (`SUBSPACE_COVER_TRAFFIC`)
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -33,6 +37,14 @@ pub const SUBSPACE_ROUTE_LOOKUP: u64 = 2;
 pub const SUBSPACE_ROUTE_OFFER: u64 = 3;
 /// Relay health beacon channel.
 pub const SUBSPACE_RELAY_BEACON: u64 = 4;
+/// Circuit establishment channel for future ORP-HighRisk overlays.
+pub const SUBSPACE_CIRCUIT_OPEN: u64 = 5;
+/// Circuit extension channel for future ORP-HighRisk overlays.
+pub const SUBSPACE_CIRCUIT_EXTEND: u64 = 6;
+/// Circuit teardown channel for future ORP-HighRisk overlays.
+pub const SUBSPACE_CIRCUIT_CLOSE: u64 = 7;
+/// Cover traffic channel for future ORP-HighRisk overlays.
+pub const SUBSPACE_COVER_TRAFFIC: u64 = 8;
 
 /// Maximum number of announcements to keep per (space_hash, slot).
 pub const MAX_ANNOUNCEMENTS_PER_SLOT: usize = 64;
@@ -100,6 +112,10 @@ pub enum OrpFrame {
     Offer(RouteOffer),
     Forward(RouteForward),
     Ack(RouteAck),
+    CircuitOpen(CircuitOpen),
+    CircuitExtend(CircuitExtend),
+    CircuitClose(CircuitClose),
+    Cover(CoverPacket),
 }
 
 /// Periodic advertisement that a peer is online and reachable within a slot.
@@ -162,6 +178,47 @@ pub struct RouteAck {
     pub version: u8,
     pub circuit_id: [u8; 16],
     pub delivered_hop: u8,
+}
+
+/// Opens a high-risk overlay circuit with a first hop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitOpen {
+    pub version: u8,
+    pub circuit_id: [u8; 16],
+    pub origin_id: [u8; 16],
+    pub first_hop: RouteHop,
+    /// Encrypted handshake material for the first hop only.
+    pub hop_payload: Vec<u8>,
+    pub expires_at_slot: u64,
+}
+
+/// Extends an existing high-risk circuit to the next hop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitExtend {
+    pub version: u8,
+    pub circuit_id: [u8; 16],
+    pub current_hop: u8,
+    pub next_hop: RouteHop,
+    /// Onion-layer payload only the next hop can open.
+    pub hop_payload: Vec<u8>,
+    pub expires_at_slot: u64,
+}
+
+/// Closes a previously opened high-risk circuit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitClose {
+    pub version: u8,
+    pub circuit_id: [u8; 16],
+    pub reason_code: u16,
+}
+
+/// Fixed-shape padding or cover packet for anti-correlation work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverPacket {
+    pub version: u8,
+    pub stream_id: [u8; 16],
+    pub cover_class: u8,
+    pub payload: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +604,10 @@ mod tests {
             SUBSPACE_ROUTE_LOOKUP,
             SUBSPACE_ROUTE_OFFER,
             SUBSPACE_RELAY_BEACON,
+            SUBSPACE_CIRCUIT_OPEN,
+            SUBSPACE_CIRCUIT_EXTEND,
+            SUBSPACE_CIRCUIT_CLOSE,
+            SUBSPACE_COVER_TRAFFIC,
         ];
         for i in 0..subs.len() {
             for j in (i + 1)..subs.len() {
@@ -589,6 +650,53 @@ mod tests {
             OrpFrame::Offer(o) => {
                 assert_eq!(o.lookup_id, offer.lookup_id);
                 assert_eq!(o.score, 5000);
+            }
+            _ => panic!("wrong frame type"),
+        }
+    }
+
+    #[test]
+    fn orp_frame_roundtrip_circuit_open() {
+        let open = CircuitOpen {
+            version: 1,
+            circuit_id: [3u8; 16],
+            origin_id: [4u8; 16],
+            first_hop: RouteHop::Relay {
+                relay_addr: dummy_addr(),
+                target_tag: [9u8; 8],
+            },
+            hop_payload: vec![1, 2, 3, 4],
+            expires_at_slot: 88,
+        };
+        let frame = OrpFrame::CircuitOpen(open.clone());
+        let bytes = encode_orp_frame(&frame).unwrap();
+        let decoded = decode_orp_frame(&bytes).unwrap();
+        match decoded {
+            OrpFrame::CircuitOpen(decoded_open) => {
+                assert_eq!(decoded_open.circuit_id, open.circuit_id);
+                assert_eq!(decoded_open.origin_id, open.origin_id);
+                assert_eq!(decoded_open.expires_at_slot, open.expires_at_slot);
+            }
+            _ => panic!("wrong frame type"),
+        }
+    }
+
+    #[test]
+    fn orp_frame_roundtrip_cover_packet() {
+        let cover = CoverPacket {
+            version: 1,
+            stream_id: [7u8; 16],
+            cover_class: 2,
+            payload: vec![0u8; 32],
+        };
+        let frame = OrpFrame::Cover(cover.clone());
+        let bytes = encode_orp_frame(&frame).unwrap();
+        let decoded = decode_orp_frame(&bytes).unwrap();
+        match decoded {
+            OrpFrame::Cover(decoded_cover) => {
+                assert_eq!(decoded_cover.stream_id, cover.stream_id);
+                assert_eq!(decoded_cover.cover_class, cover.cover_class);
+                assert_eq!(decoded_cover.payload.len(), 32);
             }
             _ => panic!("wrong frame type"),
         }

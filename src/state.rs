@@ -1,5 +1,6 @@
 use crate::security::RateLimiter;
 use base64::{engine::general_purpose, Engine as _};
+use ethersync::coordinate::LOOKBACK_SLOTS;
 use ethersync::{EtherCoordinate, EtherNode, NodeConfig};
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
@@ -12,6 +13,8 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use zeroize::Zeroize;
+
+use crate::config::PrivacyProfile;
 
 pub mod connection_manager;
 pub mod metrics;
@@ -30,6 +33,7 @@ pub struct ConnectionState {
     pub peer_address: Option<String>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub privacy_profile: PrivacyProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,6 +62,7 @@ impl Default for ConnectionState {
             peer_address: None,
             bytes_sent: 0,
             bytes_received: 0,
+            privacy_profile: PrivacyProfile::StandardPrivate,
         }
     }
 }
@@ -110,6 +115,26 @@ pub struct EtherSyncStatus {
     /// UNIX timestamp (ms) of the most recently seen route announcement,
     /// or `None` if the cache is empty or the node is not running.
     pub last_orp_activity_ms: Option<u64>,
+    /// Current retention tier exposed by the runtime.
+    pub retention_tier: String,
+    /// Number of slots scanned during local replay.
+    pub replay_window_slots: usize,
+    /// Whether keeper-backed encrypted replication is active.
+    pub keeper_replication_enabled: bool,
+    /// Configured replication factor for keeper-backed retention.
+    pub keeper_replication_factor: usize,
+    /// Count of bootstrap peers configured for the running EtherSync node.
+    pub bootstrap_peer_count: usize,
+    /// Count of discovery bootstrap peers configured for the main runtime.
+    pub discovery_bootstrap_peer_count: usize,
+    /// Whether a bridge bootstrap path is currently available.
+    pub bridge_bootstrap_enabled: bool,
+    /// Count of configured assist/bridge hints visible to the runtime.
+    pub bridge_hint_count: usize,
+    /// Whether the high-risk profile is available for activation.
+    pub high_risk_available: bool,
+    /// Blocking reasons preventing the high-risk profile from being enabled.
+    pub high_risk_gate_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,6 +191,7 @@ struct EtherSyncRuntime {
     events_tx: broadcast::Sender<String>,
     /// Whether ORP was enabled when this runtime was started.
     enable_orp: bool,
+    bootstrap_peer_count: usize,
 }
 
 const ETHERSYNC_FILE_CHUNK_DEFAULT: usize = 1024;
@@ -449,6 +475,7 @@ impl AppState {
             subscriptions: HashMap::new(),
             events_tx,
             enable_orp: cfg.enable_orp,
+            bootstrap_peer_count: cfg.bootstrap_peers.len(),
         };
 
         let mut inner = self.inner.lock().await;
@@ -466,18 +493,7 @@ impl AppState {
             inner.ethersync.take()
         };
         let Some(mut runtime) = runtime else {
-            return Ok(EtherSyncStatus {
-                running: false,
-                bind_addr: None,
-                local_addr: None,
-                peer_count: 0,
-                subscription_count: 0,
-                spaces: Vec::new(),
-                orp_enabled: false,
-                route_cache_size: 0,
-                route_offers_count: 0,
-                last_orp_activity_ms: None,
-            });
+            return Ok(default_ethersync_status());
         };
 
         emit_ethersync_event(
@@ -503,22 +519,11 @@ impl AppState {
         })
         .await;
 
-        Ok(EtherSyncStatus {
-            running: false,
-            bind_addr: None,
-            local_addr: None,
-            peer_count: 0,
-            subscription_count: 0,
-            spaces: Vec::new(),
-            orp_enabled: false,
-            route_cache_size: 0,
-            route_offers_count: 0,
-            last_orp_activity_ms: None,
-        })
+        Ok(default_ethersync_status())
     }
 
     pub async fn ethersync_status(&self) -> anyhow::Result<EtherSyncStatus> {
-        let (node, bind_addr, spaces, enable_orp) = {
+        let (node, bind_addr, spaces, enable_orp, bootstrap_peer_count) = {
             let inner = self.inner.lock().await;
             match inner.ethersync.as_ref() {
                 Some(rt) => (
@@ -526,25 +531,18 @@ impl AppState {
                     Some(rt.bind_addr.clone()),
                     rt.subscriptions.keys().cloned().collect::<Vec<_>>(),
                     rt.enable_orp,
+                    rt.bootstrap_peer_count,
                 ),
-                None => (None, None, Vec::new(), false),
+                None => (None, None, Vec::new(), false, 0),
             }
         };
 
         let Some(node) = node else {
-            return Ok(EtherSyncStatus {
-                running: false,
-                bind_addr: None,
-                local_addr: None,
-                peer_count: 0,
-                subscription_count: 0,
-                spaces: Vec::new(),
-                orp_enabled: false,
-                route_cache_size: 0,
-                route_offers_count: 0,
-                last_orp_activity_ms: None,
-            });
+            return Ok(default_ethersync_status());
         };
+
+        let runtime_cfg = crate::config::Config::from_env();
+        let high_risk_gate_reasons = default_high_risk_gate_reasons(enable_orp);
 
         // Collect ORP diagnostics from the route cache.
         let (route_cache_size, route_offers_count, last_orp_activity_ms) = {
@@ -573,6 +571,16 @@ impl AppState {
             route_cache_size,
             route_offers_count,
             last_orp_activity_ms,
+            retention_tier: "local-only".to_string(),
+            replay_window_slots: LOOKBACK_SLOTS,
+            keeper_replication_enabled: false,
+            keeper_replication_factor: 0,
+            bootstrap_peer_count,
+            discovery_bootstrap_peer_count: runtime_cfg.discovery_bootstrap_peers.len(),
+            bridge_bootstrap_enabled: !runtime_cfg.assist_relays.is_empty(),
+            bridge_hint_count: runtime_cfg.assist_relays.len(),
+            high_risk_available: high_risk_gate_reasons.is_empty(),
+            high_risk_gate_reasons,
         })
     }
 
@@ -1097,6 +1105,46 @@ fn derive_transfer_id(filename: &str, total_bytes: usize, ts_ms: u64) -> String 
     seed.extend_from_slice(&ts_ms.to_le_bytes());
     let hash = blake3_hash(&seed);
     hex::encode(&hash[..10])
+}
+
+fn default_high_risk_gate_reasons(orp_enabled: bool) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !orp_enabled {
+        reasons.push("ORP runtime is not enabled for this EtherSync node".to_string());
+    }
+    reasons.push("ORP-HighRisk circuits are not implemented in this build".to_string());
+    reasons.push("relay operator diversity telemetry is not available yet".to_string());
+    reasons.push("bridge bootstrap attestation is not available yet".to_string());
+    reasons.push("keeper-backed replicated retention is not available yet".to_string());
+    reasons
+}
+
+fn default_ethersync_status() -> EtherSyncStatus {
+    let runtime_cfg = crate::config::Config::from_env();
+    let high_risk_gate_reasons = default_high_risk_gate_reasons(false);
+
+    EtherSyncStatus {
+        running: false,
+        bind_addr: None,
+        local_addr: None,
+        peer_count: 0,
+        subscription_count: 0,
+        spaces: Vec::new(),
+        orp_enabled: false,
+        route_cache_size: 0,
+        route_offers_count: 0,
+        last_orp_activity_ms: None,
+        retention_tier: "local-only".to_string(),
+        replay_window_slots: LOOKBACK_SLOTS,
+        keeper_replication_enabled: false,
+        keeper_replication_factor: 0,
+        bootstrap_peer_count: 0,
+        discovery_bootstrap_peer_count: runtime_cfg.discovery_bootstrap_peers.len(),
+        bridge_bootstrap_enabled: !runtime_cfg.assist_relays.is_empty(),
+        bridge_hint_count: runtime_cfg.assist_relays.len(),
+        high_risk_available: false,
+        high_risk_gate_reasons,
+    }
 }
 
 fn now_ms() -> u64 {

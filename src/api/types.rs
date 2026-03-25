@@ -3,7 +3,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{GuaranteedEgress, ProductMode, TorRole, WanMode};
+use crate::config::{GuaranteedEgress, PrivacyProfile, ProductMode, TorRole, WanMode};
 use crate::offer::RoleHint;
 
 #[derive(Debug, Serialize)]
@@ -55,7 +55,10 @@ pub(crate) struct ConnectionRequest {
     pub offer: Option<String>,
     pub qr: Option<String>,
     pub local_role: Option<RoleHint>,
+    /// `ip:port` for direct target connect or `orp:<16-hex>` for ORP target lookup.
     pub target: Option<String>,
+    #[serde(default)]
+    pub privacy_profile: PrivacyProfile,
     #[serde(default)]
     pub wan_mode: WanMode,
     #[serde(default)]
@@ -76,6 +79,7 @@ pub(crate) struct ConnectionResponse {
     pub mode: String,
     pub peer: Option<String>,
     pub resume_status: Option<String>,
+    pub privacy_profile: PrivacyProfile,
 }
 
 #[derive(Debug, Deserialize)]

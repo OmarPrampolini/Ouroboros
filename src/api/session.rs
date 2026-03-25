@@ -8,6 +8,7 @@ use base64::{engine::general_purpose, Engine as _};
 use secrecy::SecretString;
 use std::{net::SocketAddr, sync::Arc};
 
+use crate::config::PrivacyProfile;
 use crate::crypto::{
     deserialize_cipher_packet_with_limit, now_ms, now_us, open, seal, serialize_cipher_packet,
     CipherPacket, ClearPayload, MAX_TCP_FRAME_BYTES,
@@ -136,6 +137,7 @@ pub(crate) async fn handle_disconnect(
 
     let mut current_state = state.app.get_connection_state().await;
     current_state.status = crate::state::ConnectionStatus::Disconnected;
+    current_state.privacy_profile = PrivacyProfile::StandardPrivate;
     state.app.set_connection_state(current_state).await;
 
     Ok(Json(ConnectionResponse {
@@ -144,5 +146,6 @@ pub(crate) async fn handle_disconnect(
         mode: "none".into(),
         peer: None,
         resume_status: None,
+        privacy_profile: PrivacyProfile::StandardPrivate,
     }))
 }

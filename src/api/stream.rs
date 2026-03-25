@@ -92,6 +92,7 @@ pub(crate) async fn handle_status(
         mode: s.mode.unwrap_or_else(|| "unknown".into()),
         peer: s.peer_address,
         resume_status: None,
+        privacy_profile: s.privacy_profile,
     }))
 }
 

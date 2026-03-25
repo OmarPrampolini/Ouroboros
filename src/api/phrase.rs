@@ -7,7 +7,7 @@ use secrecy::SecretString;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
-use crate::config::Config;
+use crate::config::{Config, PrivacyProfile};
 use crate::derive::derive_from_secret;
 use crate::onion::validate_onion_addr;
 use crate::phrase::PhraseInvite;
@@ -180,6 +180,7 @@ pub(crate) async fn handle_phrase_open(
             s.mode = Some(mode);
             s.status = crate::state::ConnectionStatus::Connected;
             s.peer_address = None;
+            s.privacy_profile = PrivacyProfile::StandardPrivate;
             state_bg.set_connection_state(s).await;
 
             state_bg.set_phrase_status(PhraseStatus::Connected).await;
@@ -219,6 +220,7 @@ pub(crate) async fn handle_phrase_close(
     state.app.set_phrase_status(PhraseStatus::Closed).await;
     let mut s = state.app.get_connection_state().await;
     s.status = crate::state::ConnectionStatus::Disconnected;
+    s.privacy_profile = PrivacyProfile::StandardPrivate;
     state.app.set_connection_state(s).await;
 
     Ok(axum::http::StatusCode::OK)
@@ -350,6 +352,7 @@ pub(crate) async fn handle_phrase_join(
     s.mode = Some(mode.clone());
     s.status = crate::state::ConnectionStatus::Connected;
     s.peer_address = Some(invite.onion);
+    s.privacy_profile = PrivacyProfile::StandardPrivate;
     app.set_connection_state(s).await;
 
     app.set_phrase_status(PhraseStatus::Connected).await;
@@ -360,6 +363,7 @@ pub(crate) async fn handle_phrase_join(
         mode,
         peer: None,
         resume_status: None,
+        privacy_profile: PrivacyProfile::StandardPrivate,
     }))
 }
 

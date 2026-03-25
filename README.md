@@ -1,227 +1,281 @@
 # Ouroboros, the snake that bit his tail
 
-Private, deterministic, serverless communication.
+Private communication, shared encrypted spaces, and in-band route discovery - built as one deterministic system.
 
-Ouroboros is not built around accounts, central directories, or a mandatory cloud control plane. It is built around a harder and stranger idea:
+Ouroboros is not a messenger that happens to have some crypto. It is not a protocol whitepaper detached from product reality either. It is an attempt to build a serious communications stack where the same private context can drive:
+
+- live encrypted sessions
+- asynchronous shared spaces
+- route discovery and future anonymity overlays
+
+The core thesis is simple and strange:
 
 > the same secret should recreate the same communication reality
 
-That means the passphrase is not just a password. It is coordination material. It is rendezvous input. It is shared-space identity. It is routing scope.
+That means a passphrase is not just a password. In Ouroboros it becomes derivation input, rendezvous scope, shared-space identity, and routing scope.
 
-From that idea, Ouroboros grows into three tightly connected layers:
+From that idea the system grows into three planes:
 
-- **Handshacke** for live encrypted peer sessions
-- **EtherSync** for encrypted shared spaces and asynchronous presence
-- **ORP** for in-band route discovery inside those same shared spaces
+- **Handshacke**: the live session plane
+- **EtherSync**: the encrypted shared-state plane
+- **ORP**: the Ouroboros Routing Protocol, the routing and anonymity control plane
 
 Repository: [github.com/OmarPrampolini/Ouroboros](https://github.com/OmarPrampolini/Ouroboros)  
 License: MIT
 
 ## What Ouroboros Is
 
-Ouroboros is a communications platform for people who want more than "a chat app with encryption."
+Ouroboros is a deterministic private communications platform for people who want more than "encrypted chat".
 
-It is for builders, operators, teams, and privacy-minded users who care about:
+It is meant for:
 
-- reducing dependency on centralized discovery
-- keeping transport strategy under local control
-- having both live sessions and asynchronous shared spaces
-- building on a protocol/runtime that treats hostile networks as a first-class problem
+- builders who care about protocol clarity
+- operators who care about fallback and network reality
+- teams who want shared encrypted spaces without mandatory cloud identity
+- privacy-minded users who do not want discovery and routing outsourced by default
 
-The name matters.
+The name is not decoration. The snake that bit his tail represents a loop that closes on itself. Ouroboros tries to coordinate from within its own derived context instead of depending on a permanent external center.
 
-The Ouroboros is the snake that bit his tail: a closed loop, self-derived, self-contained. That is the exact spirit of the project. The system tries to coordinate from within itself instead of outsourcing its identity and routing logic to an external center.
-
-## The Three Products In One
+## The Three Planes
 
 ### Handshacke
 
-Handshacke is the live session layer.
+Handshacke is the live session plane. It is the synchronous side of the product and the runtime still ships under the `handshacke` binary name for compatibility.
 
-Use it when you want:
+It covers:
 
-- immediate 1:1 encrypted connectivity
-- passphrase-, offer-, QR-, phrase-, or target-based pairing
-- real fallback logic across LAN, WAN direct, assist relays, ORP, and Tor
-- a daemon and desktop UX that behave like a product, not just a protocol demo
+- passphrase-based connect
+- offer and QR-based rendezvous
+- phrase and onion-based pairing
+- target-driven connect
+- live transport escalation across LAN, WAN direct, assist relays, ORP, and Tor
 
-In code, the binary is still named `handshacke`. In product terms, this is the synchronous communication side of Ouroboros.
+The important point is that transport is not hidden magic. Ouroboros treats real hostile-network conditions as part of the product.
 
 ### EtherSync
 
-EtherSync is the asynchronous shared-space layer.
+EtherSync is the encrypted shared-state substrate.
 
-A passphrase deterministically derives a logical encrypted space. Peers who know the same passphrase can enter the same gossip domain, publish encrypted messages, publish chunked files, and replay recent locally retained backlog when they rejoin.
+Peers who know the same passphrase can derive the same logical space and use it for:
 
-Use it when you want:
-
+- encrypted message publication
+- chunked file publication
 - intermittent presence
-- asynchronous collaboration
-- a shared encrypted space without a mandatory backend
-- file transfer over the same logical substrate
+- replay of recently retained local history
+- private metadata exchange
 
-EtherSync is not pretending to be a centralized database. History exists only if some node observed and retained it. That limitation is real, explicit, and foundational to understanding the system honestly.
+EtherSync is not pretending to be a centralized database. If nobody retained a message, that history is gone. That limitation is not hand-waved away because architectural honesty matters more than fake convenience.
 
 ### ORP
 
-ORP is the most ambitious part of the architecture.
+ORP is where the architecture becomes unusual.
 
-A normal system splits the world into separate layers:
+In most systems, messaging, peer discovery, routing, and anonymity live in separate worlds. ORP challenges that split. The same derived EtherSync space that already lets peers share encrypted context can also carry reachability metadata and route intent.
 
-- one system for messages
-- one system for peer discovery
-- one system for routing
-- one system for fallback or anonymity
+That is the real ORP idea:
 
-ORP challenges that split.
+> the shared space is not only where peers leave encrypted state; it can also become the control plane that tells the network how to find them
 
-The core intuition is this:
+This is why ORP matters. It is not "another overlay". It is an attempt to make routing emerge from the same private deterministic context that already binds participants together.
 
-> if peers can already derive the same encrypted shared space, that space can become more than storage or gossip; it can also become the control plane for reachability itself
+In practical terms, ORP currently does this:
 
-That is why ORP matters.
-
-ORP is not interesting because it is "yet another routing protocol." ORP is interesting because it tries to make routing emerge from the same deterministic shared context that already binds the participants together.
-
-In practical terms, ORP does the following:
-
-- joins the same EtherSync-derived scope as the peers
-- publishes route announcements inside that scope
-- resolves explicit target assist tags through lookup/offer exchange
+- publishes route announcements inside a shared EtherSync-derived scope
+- resolves explicit target assist tags through cache and lookup-offer exchange
 - feeds the transport stack before Tor
 
-The conceptual move is the important one:
+In architectural terms, it does something more important:
 
-- **EtherSync is no longer just a feature**
-- **it becomes infrastructure**
-- **it becomes the place where private asynchronous state and route discovery can coexist**
+- EtherSync stops being just a feature
+- EtherSync becomes infrastructure
+- routing starts living inside the same private shared world as messaging
 
-Today, the correct claim is:
+The current truthful claim is:
 
-- ORP is a serious deterministic private overlay routing layer
+- ORP is a serious deterministic private overlay routing direction
 - ORP is integrated as a target-aware, space-scoped transport fallback
 - ORP is not yet a finished global anonymity network
 
-That framing is strong, accurate, and worth defending.
+That boundary is deliberate. We do not unlock that claim until the system actually earns it.
+
+## Privacy Tiers
+
+Ouroboros has two permanent privacy tiers.
+
+### Standard Private
+
+This is the default operational tier.
+
+It optimizes for:
+
+- encrypted communication
+- deterministic coordination
+- resilient fallback
+- product usability
+
+### High-Risk
+
+This is the adversarial tier.
+
+It is designed to require:
+
+- multi-hop overlay circuits
+- layered encryption per hop
+- cover traffic and padding
+- operator diversity
+- bridge ingress
+- hard anonymity gating
+
+High-Risk is intentionally blocked today. The runtime surfaces that boundary instead of silently pretending.
+
+## Network Model
+
+Ouroboros is a hybrid network, not a fantasy about pure decentralization and not a surrender to centralized control either.
+
+The end-state network has four roles:
+
+- `edge peers`
+- `relay operators`
+- `bridge operators`
+- `keeper nodes`
+
+This matters because global scale requires explicit operations:
+
+- relays for forwarding and route diversity
+- bridges for ingress resilience and censorship resistance
+- keepers for encrypted managed retention
+
+No central directory is structurally required, but the system is not anti-operations. It is designed to combine deterministic coordination with real network stewardship.
+
+## Keeper Model
+
+The keeper model is intentionally pragmatic.
+
+- no token economy
+- no speculative governance fiction
+- first-party and partner-operated keepers first
+- protocol openness preserved for later third-party enrollment
+
+Free usage remains local and best-effort. Managed retention is where keeper-backed replay, replication factor, and availability SLOs enter the picture.
 
 ## Why This Is Different
 
-Most communication products assume at least one of these:
+Most communication products assume at least one of the following:
 
-- a trusted directory for peer discovery
-- a broker or relay as the default control plane
-- a cloud backend as the canonical source of history
+- a trusted global directory
+- a cloud backend as the source of truth
+- a relay layer that is also the mandatory control plane
 
-Ouroboros starts from the opposite direction.
+Ouroboros tries to do something harder.
 
-- If two peers are online together, **Handshacke** tries to connect them live.
+- If both peers are online, **Handshacke** tries to connect them live.
 - If presence is intermittent, **EtherSync** gives them a deterministic encrypted shared space.
-- If direct routing is difficult, **ORP** tries to recover a route from inside that same derived space before escalating to heavier infrastructure.
+- If routing gets hard, **ORP** tries to recover a path from inside that same derived scope before escalating to heavier infrastructure.
 
-This is why Ouroboros is more than a stack of features. The pieces reinforce each other.
+That is why the project is more than a pile of features. The pieces explain each other.
 
-## Architecture In One Pass
+## Current Runtime Truth
 
-### 1. Deterministic Derivation
+Strong today:
 
-Passphrases are canonicalized and fed into deterministic derivation pipelines.
+- deterministic derivation across the core stack
+- authenticated local API
+- multiple live connect flows
+- transport cascade with real fallback logic
+- EtherSync message and file publication with replay window
+- ORP target-aware route discovery before Tor
 
-- **Handshacke** derives rendezvous parameters, tags, and session inputs
-- **EtherSync** derives shared-space identity and slot-local entropy
-- **ORP** derives routing scope from active EtherSync spaces
+Explicitly not claimed yet:
 
-The same secret recreates the same logical place.
+- global anonymity network
+- production keeper-backed replicated retention
+- audited high-risk multi-hop overlay
 
-### 2. Transport Cascade
+## Public API
 
-When a live connection is needed, Ouroboros does not bet on one path.
+The local control plane lives under `/v1`.
 
-It can escalate through:
+Representative endpoints:
 
-- LAN discovery
-- WAN direct traversal
-- WAN assist relays
-- ORP route discovery
-- Tor fallback
+- `POST /v1/connect`
+- `GET /v1/status`
+- `GET /v1/capabilities`
+- `GET /v1/routes/status`
+- `GET /v1/keepers/status`
+- `GET /v1/ethersync/status`
+- `POST /v1/ethersync/start`
+- `POST /v1/ethersync/spaces/join`
+- `POST /v1/ethersync/spaces/publish`
+- `POST /v1/ethersync/files/publish`
+- `GET /v1/ethersync/events`
 
-This makes the system resilient to NAT asymmetry, blocked UDP, partial reachability, and hostile edge conditions.
+The API now exposes:
 
-### 3. Shared-Space Control Plane
+- privacy profile intent
+- route and ORP diagnostics
+- keeper and retention scaffolding
+- capability reporting for `quic`, `webrtc`, `pq`, ORP tiers, and bridge bootstrap posture
 
-EtherSync stores encrypted content in slot-based gossip windows.
+## Wire and Interop Posture
 
-ORP uses those same deterministic spaces as a routing control plane.
+Ouroboros is moving toward a documented wire contract, not tribal knowledge.
 
-That is the architectural twist:
+Current anchors:
 
-- messaging and route metadata can live in the same private scope
-- discovery does not have to begin with a global directory
-- route hints can be emitted, observed, and resolved by participants already inside the same derived context
+- CipherPacket V2 for session framing
+- stable EtherSync subspace meanings for user data and ORP metadata
+- additive ORP wire-family formalization for future high-risk circuits
 
-### 4. Product Surface
+The ORP family now has canonical frame names:
 
-The repository includes:
+- `Announce`
+- `Lookup`
+- `Offer`
+- `Forward`
+- `Ack`
+- `CircuitOpen`
+- `CircuitExtend`
+- `CircuitClose`
+- `Cover`
 
-- the Rust daemon and protocol crates
-- the Tauri desktop application
-- a local REST API surface
-- integration tests and fuzzing targets
-- technical documentation for security and architecture
+The last four are formalized as contract and roadmap, not presented as live high-risk anonymity guarantees.
 
-## What Is Strong Today
+## Canonical Documentation
 
-- Deterministic passphrase derivation across the core stack
-- Local authenticated API with in-memory bearer token flow
-- Multiple live connection flows: classic, offer, hybrid QR, phrase, guaranteed relay, and target-driven connect
-- Multi-transport orchestration with fallback escalation
-- EtherSync spaces with message publish, file chunk publish, join replay, and event streaming
-- Tauri desktop UX with robust daemon lifecycle handling
-- ORP integrated as a target-aware, space-scoped route discovery fallback
+If you want the system-level map, start here:
 
-## What Is Not Claimed Yet
+- [Architecture Book](./docs/ARCHITECTURE_BOOK.md)
+- [Roadmap and Gates](./docs/roadmap_gates.md)
+- [Interop and Versioning](./docs/interop.md)
+- [Operator Model](./docs/operators.md)
+- [Threat Model Book](./docs/threat_model_book.md)
+- [Feature Flags](./docs/feature_flags.md)
+- [Project Summary](./docs/PROJECT_SUMMARY.md)
 
-- Ouroboros does not guarantee permanent distributed retention by itself
-- EtherSync history is only recoverable if some node kept it
-- ORP is not being presented as a finished Tor replacement
+Architecture decisions:
 
-These are not weaknesses of the README. They are the boundaries of the current truth.
+- [ADR 0001 - Deterministic Scope](./docs/adr/0001-deterministic-scope.md)
+- [ADR 0002 - Dual-Tier Privacy](./docs/adr/0002-dual-tier-privacy.md)
+- [ADR 0003 - Hybrid Network](./docs/adr/0003-hybrid-network.md)
+- [ADR 0004 - Keeper Model](./docs/adr/0004-keeper-model.md)
+- [ADR 0005 - ORP Claim Boundary](./docs/adr/0005-orp-claim-boundary.md)
 
-## Security Posture
-
-Ouroboros uses modern primitives and hardened local control, but it does not pretend cryptography erases operational reality.
-
-Key characteristics:
-
-- encrypted payloads and deterministic derivation
-- replay and time-window protection
-- localhost daemon API with bearer authentication
-- no requirement to persist application secrets in plaintext
-- dependency policy enforced with `Cargo.lock` and `deny.toml`
-
-Relevant references:
-
-- [SECURITY.md](SECURITY.md)
-- [docs/threat_model_visibility.md](docs/threat_model_visibility.md)
-- [docs/feature_flags.md](docs/feature_flags.md)
-
-## Repository Structure
+## Repository Layout
 
 ```text
 Ouroboros/
-|-- src/                  # Main daemon / library surface
-|-- ethersync/            # Shared-space gossip crate
+|-- src/                  # Main daemon and API surface
+|-- ethersync/            # Shared-space substrate and ORP wire/control primitives
 |-- ouroboros-crypto/     # Shared cryptographic primitives
 |-- ui/                   # Tauri desktop application
-|-- docs/                 # Technical documentation
+|-- docs/                 # Canonical product, architecture, and operator documentation
 |-- tests/                # Integration tests
 `-- fuzz/                 # Fuzzing targets
 ```
 
-If you want the deeper technical inventory, see [docs/PROJECT_SUMMARY.md](docs/PROJECT_SUMMARY.md).
-
 ## Quick Start
 
-### Core Daemon
+### Build the daemon
 
 ```bash
 git clone https://github.com/OmarPrampolini/Ouroboros.git
@@ -232,13 +286,13 @@ cargo run --release
 
 Default API bind: `127.0.0.1:8731`
 
-### Tauri Desktop App
+### Build the desktop app
 
 ```bash
 cargo build --release
 
 # Windows
-# copy target\release\handshacke.exe ui\src-tauri\bin\handshacke.exe
+# copy target\\release\\handshacke.exe ui\\src-tauri\\bin\\handshacke.exe
 
 # Linux/macOS
 # cp target/release/handshacke ui/src-tauri/bin/handshacke
@@ -248,77 +302,17 @@ npm install
 npm run dev
 ```
 
-## Key Runtime Flows
-
-### Handshacke
-
-- classic passphrase connect
-- offer / hybrid QR flows
-- phrase mode over Tor
-- relay-assisted connect
-- target-driven connect
-
-### EtherSync
-
-- start a node
-- join a shared space
-- publish encrypted messages
-- publish files as chunks
-- consume the event stream
-- replay recent local backlog on rejoin
-
-### ORP
-
-- activate ORP inside an EtherSync space
-- publish direct reachability into that space
-- resolve an explicit target assist tag through cached announcements or lookup/offer exchange
-- fall back to Tor only after ORP fails
-
-## API Surface
-
-The daemon exposes a local `/v1/*` REST API.
-
-Representative endpoints:
-
-- `POST /v1/connect`
-- `GET /v1/status`
-- `POST /v1/disconnect`
-- `POST /v1/offer`
-- `POST /v1/qr/hybrid`
-- `POST /v1/phrase/open`
-- `POST /v1/phrase/join`
-- `GET /v1/phrase/status`
-- `POST /v1/ethersync/start`
-- `POST /v1/ethersync/stop`
-- `GET /v1/ethersync/status`
-- `POST /v1/ethersync/spaces/join`
-- `POST /v1/ethersync/spaces/publish`
-- `POST /v1/ethersync/files/publish`
-- `GET /v1/ethersync/events`
-- `GET /v1/connect/fallbacks`
-- `GET /v1/network/nat-metrics`
-
-## Feature Flags
-
-Default build:
-
-- `quic`
-
-Optional capabilities:
-
-- `webrtc`
-- `pq`
-- `full`
-
-Detailed semantics are documented in [docs/feature_flags.md](docs/feature_flags.md).
-
 ## Positioning
 
-If you are presenting or selling Ouroboros, the tightest honest line is:
+If you need the shortest honest line:
 
-> **Ouroboros is a deterministic private communications platform that combines live peer sessions, encrypted shared spaces, and in-band route discovery into one serverless-first architecture.**
+> **Ouroboros is a deterministic private communications platform that unifies live peer sessions, encrypted shared spaces, and in-band route discovery into one serverless-first architecture.**
 
-That is ambitious. It is also true.
+If you need the stronger architectural line:
+
+> **Ouroboros turns the same secret into rendezvous scope, shared-state identity, and routing scope, so communication can coordinate from inside its own derived context instead of depending on a permanent external center.**
+
+That is the bet.
 
 ## License
 
