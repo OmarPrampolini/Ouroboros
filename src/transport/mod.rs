@@ -11,6 +11,7 @@ pub mod lan;
 pub mod multipath;
 pub mod nat_detection;
 pub mod orp;
+pub mod orp_highrisk;
 pub mod pluggable;
 pub mod quic_rfc9000;
 pub mod stealth;

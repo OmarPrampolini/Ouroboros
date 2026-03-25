@@ -31,6 +31,7 @@ Keeper operators provide:
 - encrypted replicated retention
 - managed replay durability
 - availability SLOs for paid tiers
+- keeper candidate capacity that is now surfaced per space through local keeper manifests and shortfall diagnostics
 
 Keepers do not own the application plaintext. They store encrypted envelopes and minimal availability metadata.
 
@@ -66,9 +67,17 @@ Required long-term telemetry:
 - reachable capacity
 - software version
 - operator identity
+- region and deployment bucket hints
 - route diversity contribution
 - failure rate
 - maintenance windows
+
+Current runtime posture already surfaces:
+
+- operator identity hints
+- operator region hints
+- bridge/keeper bundle posture
+- per-space keeper manifest counts and candidate shortfall
 
 High-Risk must not be enabled unless operator diversity is sufficient and measurable.
 

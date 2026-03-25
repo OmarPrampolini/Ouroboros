@@ -77,7 +77,7 @@ Today:
 - ORP is target-aware and space-scoped
 - ORP feeds the transport stack before Tor
 - ORP inspection surfaces can expose ranked target candidates, route classes, operator hints, region hints, and lookup provenance
-- ORP-HighRisk is not implemented and not claimed
+- ORP-HighRisk now has circuit-planning and control-frame observability scaffolding, but the routed session data plane is not active and not claimed
 
 End-state:
 

@@ -1,18 +1,18 @@
 # Ouroboros, the snake that bit his tail
 
-Private communication, shared encrypted spaces, and in-band route discovery - built as one deterministic system.
+Private communication, encrypted shared spaces, and route emergence from inside the same secret context.
 
-Ouroboros is not a messenger that happens to have some crypto. It is not a protocol whitepaper detached from product reality either. It is an attempt to build a serious communications stack where the same private context can drive:
+Ouroboros is not a messenger with crypto sprinkled on top. It is not a whitepaper pretending to be a product either. It is an attempt to build a communications stack where the same private context can drive:
 
 - live encrypted sessions
 - asynchronous shared spaces
 - route discovery and future anonymity overlays
 
-The core thesis is simple and strange:
+The core thesis is simple, strange, and foundational:
 
 > the same secret should recreate the same communication reality
 
-That means a passphrase is not just a password. In Ouroboros it becomes derivation input, rendezvous scope, shared-space identity, and routing scope.
+That means a passphrase is not only a password. In Ouroboros it becomes derivation input, rendezvous scope, shared-space identity, bootstrap seed, and routing scope.
 
 From that idea the system grows into three planes:
 
@@ -84,17 +84,25 @@ In practical terms, ORP currently does this:
 - resolves explicit target assist tags through cache and lookup-offer exchange
 - feeds the transport stack before Tor
 
-In architectural terms, it does something more important:
+In architectural terms, it does something much more radical:
 
 - EtherSync stops being just a feature
 - EtherSync becomes infrastructure
-- routing starts living inside the same private shared world as messaging
+- routing starts living inside the same private shared world as messaging, retention posture, and operator hints
+
+What makes that powerful is the inversion of the usual model:
+
+- most networks ask a client to leave its private context in order to discover the network
+- ORP tries to let the network emerge from inside that private context instead
+
+That is the absurd, beautiful part of the idea. If it keeps holding under pressure, discovery stops being something that happens "outside" the secret world and becomes something the secret world can generate for itself.
 
 The current truthful claim is:
 
 - ORP is a serious deterministic private overlay routing direction
 - ORP is integrated as a target-aware, space-scoped transport fallback
-- ORP is not yet a finished global anonymity network
+- ORP now has a high-risk control-plane scaffold with circuit planning, gate telemetry, and observed control-frame tracking
+- ORP is not yet a finished global anonymity network because the routed high-risk session data plane is still intentionally inactive
 
 That boundary is deliberate. We do not unlock that claim until the system actually earns it.
 
@@ -187,16 +195,21 @@ Strong today:
 - bootstrap bundle and static discovery peers now seed EtherSync bootstrap state and space joins
 - federated discovery from ORP, bootstrap bundle, and static bootstrap peers
 - first keeper flow: publish enqueues encrypted keeper envelopes, a local replication task flushes them into a keeper replica archive, and backfill restores archived envelopes into local EtherSync storage
+- keeper posture is now tracked per space as a local manifest with desired targets, candidate shortfall, replication stage, and last local keeper activity
 - join-time space policy can now set retention tier, replication factor, and route bias per space
 - ORP candidate ranking now uses operator hints, region diversity, bootstrap bundle posture, and per-space route bias
 - ORP candidate inspection now exposes ranked route decisions, cache-versus-lookup provenance, and target-specific diagnostics through the local API
+- bootstrap discovery ordering now reacts more explicitly to bridge/operator posture instead of treating bundle endpoints as a flat list
+- ORP inspection now exposes preference buckets and ranking hints so bridge-heavy and operator-aware choices are legible
 - bootstrap bundle validation now exposes local usability, structural weakness, and advisory staleness
 - keeper endpoints from the bootstrap bundle now participate in runtime/bootstrap seeding when managed retention posture is active
+- ORP-HighRisk now has truthful circuit planning, hard-gate diagnostics, prepared-circuit telemetry, and observed control-frame tracking in the runtime
 
 Explicitly not claimed yet:
 
 - global anonymity network
-- production keeper-backed replicated retention
+- production keeper-backed replicated retention across independent remote keepers
+- active high-risk routed session data plane
 - audited high-risk multi-hop overlay
 
 ## Public API
@@ -228,16 +241,19 @@ The API now exposes:
 - privacy profile intent
 - route and ORP diagnostics
 - target-specific ORP candidate inspection with scores, route classes, operator hints, region hints, and lookup provenance
+- bridge/operator-aware discovery ordering and ORP preference buckets for explaining routing posture
 - keeper and retention scaffolding
 - machine-readable interop posture for `/v1`, CipherPacket V2, ORP frame families, and EtherSync subspace assignments
 - capability reporting for `quic`, `webrtc`, `pq`, ORP tiers, and bridge bootstrap posture
 - operator hints, route class counts, and bootstrap bundle visibility
 - high-risk gate telemetry for relay count, operator diversity, region diversity, operator concentration, and three-hop viability
+- high-risk circuit observability for prepared/observed circuits, control-frame counts, cover packets, and recent circuit snapshots
 - structured `high-risk` rejection details from `POST /v1/connect`, including gate reasons and the canonical diagnostics paths
 - federated discovery candidates resolved from ORP, bundle, and config bootstrap
 - pending-versus-archived keeper state plus a concrete backfill control path for managed-retention experimentation
 - managed-space counts and route-bias posture across joined spaces
 - per-space keeper policy inspection and updates for operator workflows
+- per-space keeper manifests surfaced through existing keeper policy/status APIs
 
 `POST /v1/ethersync/spaces/join` now accepts optional per-space policy hints:
 

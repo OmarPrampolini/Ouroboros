@@ -283,6 +283,44 @@ pub struct RouteCache {
     pub offers: HashMap<[u8; 16], Vec<CachedOffer>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighRiskCircuitHop {
+    pub node_id: [u8; 16],
+    pub assist_tag: [u8; 8],
+    pub addr: SocketAddr,
+    pub route_class: RouteClass,
+    pub operator_id_hint: String,
+    pub region_hint: String,
+    pub can_relay: bool,
+    pub bridge_capable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighRiskCircuitPlan {
+    pub space_prefix: [u8; 8],
+    pub target_tag: [u8; 8],
+    pub entry: HighRiskCircuitHop,
+    pub middle: HighRiskCircuitHop,
+    pub exit: HighRiskCircuitHop,
+    pub operator_diversity: usize,
+    pub region_diversity: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighRiskGateSnapshot {
+    pub relay_nodes_observed: usize,
+    pub distinct_operator_hints_observed: usize,
+    pub distinct_region_hints_observed: usize,
+    pub max_operator_share_observed_pct: Option<u8>,
+    pub valid_three_hop_path_observed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighRiskPlannerError {
+    pub reason: String,
+    pub gate: HighRiskGateSnapshot,
+}
+
 impl RouteCache {
     pub fn new() -> Self {
         Self::default()
@@ -417,6 +455,198 @@ impl RouteCache {
             .max_by_key(|o| score_offer(o, current_slot))
     }
 
+    pub fn high_risk_gate_snapshot(
+        &self,
+        space_prefix: &[u8; 8],
+        current_slot: u64,
+    ) -> HighRiskGateSnapshot {
+        let min_slot = current_slot.saturating_sub(ANNOUNCE_SLOT_LOOKBACK);
+        let relays = self
+            .announcements
+            .iter()
+            .filter(|(k, ann)| {
+                k.space_prefix == *space_prefix
+                    && k.slot >= min_slot
+                    && ann.frame.capabilities.can_relay
+                    && !ann.frame.reachable_udp.is_empty()
+            })
+            .map(|(_, ann)| ann);
+
+        let mut relay_nodes_observed = 0usize;
+        let mut operators = std::collections::BTreeSet::new();
+        let mut regions = std::collections::BTreeSet::new();
+        let mut relay_counts_by_operator = std::collections::BTreeMap::new();
+
+        for announcement in relays {
+            relay_nodes_observed = relay_nodes_observed.saturating_add(1);
+            let operator = announcement.frame.operator_id_hint.trim();
+            if !operator.is_empty() {
+                operators.insert(operator.to_string());
+                *relay_counts_by_operator
+                    .entry(operator.to_string())
+                    .or_insert(0usize) += 1;
+            }
+            let region = announcement.frame.region_hint.trim();
+            if !region.is_empty() {
+                regions.insert(region.to_string());
+            }
+        }
+
+        let max_operator_share_observed_pct = if relay_nodes_observed == 0 {
+            None
+        } else {
+            relay_counts_by_operator.values().max().map(|count| {
+                (((*count as f64) / (relay_nodes_observed as f64)) * 100.0).ceil() as u8
+            })
+        };
+
+        HighRiskGateSnapshot {
+            relay_nodes_observed,
+            distinct_operator_hints_observed: operators.len(),
+            distinct_region_hints_observed: regions.len(),
+            max_operator_share_observed_pct,
+            valid_three_hop_path_observed: relay_nodes_observed >= 3
+                && operators.len() >= 3
+                && regions.len() >= 3,
+        }
+    }
+
+    pub fn plan_high_risk_circuit(
+        &self,
+        space_prefix: &[u8; 8],
+        target_tag: &[u8; 8],
+        current_slot: u64,
+    ) -> Result<HighRiskCircuitPlan, HighRiskPlannerError> {
+        let gate = self.high_risk_gate_snapshot(space_prefix, current_slot);
+        if !gate.valid_three_hop_path_observed {
+            return Err(HighRiskPlannerError {
+                reason:
+                    "insufficient relay/operator/region diversity for a three-hop high-risk path"
+                        .to_string(),
+                gate,
+            });
+        }
+
+        let min_slot = current_slot.saturating_sub(ANNOUNCE_SLOT_LOOKBACK);
+        let mut target_exit = None;
+        let mut exit_score = 0u16;
+        let mut relay_candidates = Vec::new();
+
+        for (key, announcement) in &self.announcements {
+            if key.space_prefix != *space_prefix || key.slot < min_slot {
+                continue;
+            }
+            let Some(addr) = announcement.frame.reachable_udp.first().copied() else {
+                continue;
+            };
+            let announcement_score = score_announcement(announcement, current_slot);
+            if announcement.frame.assist_tag == *target_tag
+                && announcement.frame.capabilities.direct_udp
+            {
+                target_exit = Some(build_high_risk_hop(announcement, addr));
+                exit_score = announcement_score;
+            }
+            if announcement.frame.capabilities.can_relay {
+                relay_candidates
+                    .push((build_high_risk_hop(announcement, addr), announcement_score));
+            }
+        }
+
+        let Some(exit) = target_exit else {
+            return Err(HighRiskPlannerError {
+                reason: "no direct exit announcement found for the requested target assist tag"
+                    .to_string(),
+                gate,
+            });
+        };
+
+        relay_candidates.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| (b.0.bridge_capable as u8).cmp(&(a.0.bridge_capable as u8)))
+                .then_with(|| a.0.addr.to_string().cmp(&b.0.addr.to_string()))
+        });
+
+        let mut best_plan = None;
+        let mut best_score = i32::MIN;
+        for (entry_index, (entry, entry_score)) in relay_candidates.iter().enumerate() {
+            if entry.node_id == exit.node_id {
+                continue;
+            }
+            for (middle, middle_score) in relay_candidates.iter().skip(entry_index + 1) {
+                if middle.node_id == exit.node_id || middle.node_id == entry.node_id {
+                    continue;
+                }
+
+                let operator_diversity = distinct_non_empty([
+                    entry.operator_id_hint.as_str(),
+                    middle.operator_id_hint.as_str(),
+                    exit.operator_id_hint.as_str(),
+                ]);
+                let region_diversity = distinct_non_empty([
+                    entry.region_hint.as_str(),
+                    middle.region_hint.as_str(),
+                    exit.region_hint.as_str(),
+                ]);
+                if operator_diversity < 3 || region_diversity < 3 {
+                    continue;
+                }
+
+                let entry_role_bonus = match entry.route_class {
+                    RouteClass::Bridge => 220,
+                    RouteClass::Assisted => 150,
+                    RouteClass::Keeper => 90,
+                    RouteClass::Direct => 40,
+                };
+                let middle_role_bonus = match middle.route_class {
+                    RouteClass::Assisted => 180,
+                    RouteClass::Bridge => 140,
+                    RouteClass::Keeper => 80,
+                    RouteClass::Direct => 30,
+                };
+                let exit_role_bonus = match exit.route_class {
+                    RouteClass::Direct => 200,
+                    RouteClass::Assisted => 80,
+                    RouteClass::Bridge => 40,
+                    RouteClass::Keeper => 20,
+                };
+
+                let score = (*entry_score as i32)
+                    + (*middle_score as i32)
+                    + (exit_score as i32)
+                    + entry_role_bonus
+                    + middle_role_bonus
+                    + exit_role_bonus
+                    + (operator_diversity as i32 * 100)
+                    + (region_diversity as i32 * 100);
+                let score = score
+                    + (entry.bridge_capable as i32 * 180)
+                    + (middle.bridge_capable as i32 * 60)
+                    + (entry.can_relay as i32 * 40)
+                    + (middle.can_relay as i32 * 40);
+
+                if score > best_score {
+                    best_score = score;
+                    best_plan = Some(HighRiskCircuitPlan {
+                        space_prefix: *space_prefix,
+                        target_tag: *target_tag,
+                        entry: entry.clone(),
+                        middle: middle.clone(),
+                        exit: exit.clone(),
+                        operator_diversity,
+                        region_diversity,
+                    });
+                }
+            }
+        }
+
+        best_plan.ok_or_else(|| HighRiskPlannerError {
+            reason:
+                "no high-risk circuit plan satisfied three-hop operator and region distinctness"
+                    .to_string(),
+            gate,
+        })
+    }
+
     /// Evict expired announcements and offers older than `max_age_secs`.
     pub fn evict_stale(&mut self, current_slot: u64, max_age_secs: u64) {
         let max_age = std::time::Duration::from_secs(max_age_secs);
@@ -430,6 +660,27 @@ impl RouteCache {
             !offers.is_empty()
         });
     }
+}
+
+fn build_high_risk_hop(announcement: &CachedAnnouncement, addr: SocketAddr) -> HighRiskCircuitHop {
+    HighRiskCircuitHop {
+        node_id: announcement.frame.node_id,
+        assist_tag: announcement.frame.assist_tag,
+        addr,
+        route_class: announcement.frame.route_class,
+        operator_id_hint: announcement.frame.operator_id_hint.clone(),
+        region_hint: announcement.frame.region_hint.clone(),
+        can_relay: announcement.frame.capabilities.can_relay,
+        bridge_capable: announcement.frame.capabilities.bridge_capable,
+    }
+}
+
+fn distinct_non_empty<'a>(values: impl IntoIterator<Item = &'a str>) -> usize {
+    values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
 }
 
 // ---------------------------------------------------------------------------

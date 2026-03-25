@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::config::Config;
+
 #[cfg(feature = "dht")]
 mod kad;
 
@@ -311,6 +313,8 @@ enum BootstrapEndpointClass {
 struct BootstrapEndpointRecord {
     addr: SocketAddr,
     class: BootstrapEndpointClass,
+    operator_id_hint: String,
+    region_hint: String,
 }
 
 impl BootstrapDiscoveryProvider {
@@ -322,6 +326,7 @@ impl BootstrapDiscoveryProvider {
         bundle: &crate::bootstrap_bundle::BootstrapBundle,
         preference: BootstrapEndpointPreference,
     ) -> Self {
+        let cfg = Config::from_env();
         let mut endpoints = Vec::new();
         for relay in &bundle.relays {
             if let Some(addr) = parse_endpoint_hint(&relay.addr) {
@@ -332,6 +337,8 @@ impl BootstrapDiscoveryProvider {
                     endpoints.push(BootstrapEndpointRecord {
                         addr,
                         class: BootstrapEndpointClass::Relay,
+                        operator_id_hint: relay.operator_id.clone().unwrap_or_default(),
+                        region_hint: relay.region.clone().unwrap_or_default(),
                     });
                 }
             }
@@ -345,6 +352,8 @@ impl BootstrapDiscoveryProvider {
                     endpoints.push(BootstrapEndpointRecord {
                         addr,
                         class: BootstrapEndpointClass::Bridge,
+                        operator_id_hint: bridge.operator_id.clone().unwrap_or_default(),
+                        region_hint: bridge.region.clone().unwrap_or_default(),
                     });
                 }
             }
@@ -358,6 +367,8 @@ impl BootstrapDiscoveryProvider {
                     endpoints.push(BootstrapEndpointRecord {
                         addr,
                         class: BootstrapEndpointClass::Keeper,
+                        operator_id_hint: keeper.operator_id.clone().unwrap_or_default(),
+                        region_hint: keeper.region.clone().unwrap_or_default(),
                     });
                 }
             }
@@ -366,6 +377,15 @@ impl BootstrapDiscoveryProvider {
         endpoints.sort_by(|a, b| {
             bootstrap_preference_rank(preference, a.class)
                 .cmp(&bootstrap_preference_rank(preference, b.class))
+                .then_with(|| {
+                    bootstrap_operator_policy_rank(preference, &cfg, a)
+                        .cmp(&bootstrap_operator_policy_rank(preference, &cfg, b))
+                })
+                .then_with(|| {
+                    bootstrap_region_policy_rank(preference, &cfg, a)
+                        .cmp(&bootstrap_region_policy_rank(preference, &cfg, b))
+                })
+                .then_with(|| bootstrap_hint_presence_rank(a).cmp(&bootstrap_hint_presence_rank(b)))
                 .then_with(|| a.addr.to_string().cmp(&b.addr.to_string()))
         });
 
@@ -395,6 +415,105 @@ fn bootstrap_preference_rank(
             BootstrapEndpointClass::Bridge => 1,
             BootstrapEndpointClass::Relay => 2,
         },
+    }
+}
+
+fn bootstrap_operator_policy_rank(
+    preference: BootstrapEndpointPreference,
+    cfg: &Config,
+    entry: &BootstrapEndpointRecord,
+) -> u8 {
+    let operator = entry.operator_id_hint.trim();
+    let is_local_operator =
+        !operator.is_empty() && operator.eq_ignore_ascii_case(cfg.operator_id.trim());
+
+    match preference {
+        BootstrapEndpointPreference::BridgeFirst
+            if entry.class == BootstrapEndpointClass::Bridge =>
+        {
+            if operator.is_empty() {
+                1
+            } else if is_local_operator {
+                2
+            } else {
+                0
+            }
+        }
+        BootstrapEndpointPreference::KeeperFirst
+            if entry.class == BootstrapEndpointClass::Keeper =>
+        {
+            if operator.is_empty() {
+                1
+            } else if is_local_operator {
+                2
+            } else {
+                0
+            }
+        }
+        _ => {
+            if operator.is_empty() {
+                2
+            } else if is_local_operator {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn bootstrap_region_policy_rank(
+    preference: BootstrapEndpointPreference,
+    cfg: &Config,
+    entry: &BootstrapEndpointRecord,
+) -> u8 {
+    let region = entry.region_hint.trim();
+    let is_local_region =
+        !region.is_empty() && region.eq_ignore_ascii_case(cfg.operator_region.trim());
+
+    match preference {
+        BootstrapEndpointPreference::BridgeFirst
+            if entry.class == BootstrapEndpointClass::Bridge =>
+        {
+            if region.is_empty() {
+                1
+            } else if is_local_region {
+                2
+            } else {
+                0
+            }
+        }
+        BootstrapEndpointPreference::KeeperFirst
+            if entry.class == BootstrapEndpointClass::Keeper =>
+        {
+            if region.is_empty() {
+                1
+            } else if is_local_region {
+                2
+            } else {
+                0
+            }
+        }
+        _ => {
+            if region.is_empty() {
+                1
+            } else if is_local_region {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn bootstrap_hint_presence_rank(entry: &BootstrapEndpointRecord) -> u8 {
+    let operator_present = !entry.operator_id_hint.trim().is_empty();
+    let region_present = !entry.region_hint.trim().is_empty();
+
+    match (operator_present, region_present) {
+        (true, true) => 0,
+        (true, false) | (false, true) => 1,
+        (false, false) => 2,
     }
 }
 

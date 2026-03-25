@@ -90,7 +90,7 @@ Shared cryptographic building blocks:
 - route cache for ORP-Standard
 - target connect through `orp:<16-hex>`
 - route classes, operator hints, and region hints in announcements
-- future wire contract formalized for high-risk circuits
+- high-risk circuit wire contract formalized and tracked in runtime telemetry
 
 ### Bootstrap and keeper posture
 
@@ -100,11 +100,15 @@ Shared cryptographic building blocks:
 - federated route discovery can combine ORP, bundle, and static bootstrap peers
 - keeper replication can flush encrypted envelopes into a local replica archive
 - keeper backfill can restore archived envelopes into local EtherSync storage
+- keeper manifests now model per-space desired targets, candidate shortfall, replication stage, and local activity
 - space join can now attach per-space retention and route-bias policy
 - ORP ranking now factors operator hints, region hints, bundle posture, and per-space route bias
 - ORP candidate inspection now exposes ranked target-specific route decisions and cache-versus-lookup provenance
+- bootstrap discovery ordering now reacts explicitly to bridge/operator posture and no longer treats bundle endpoints as a flat list
+- ORP candidate inspection now exposes preference buckets and ranking hints for bridge-heavy and operator-aware decisions
 - bootstrap bundle validation now reports usability, structural weakness, and advisory staleness
 - keeper endpoints from the bootstrap bundle now participate in bootstrap seeding when managed retention is enabled
+- high-risk circuit planning and observed control-frame telemetry now exist, while the routed session data plane remains intentionally inactive
 
 ## Current truth
 
@@ -118,6 +122,7 @@ What is not claimed yet:
 
 - global anonymity network
 - production multi-node keeper-backed retention
+- active high-risk routed session data plane
 - audited high-risk overlay
 
 ## Public API highlights

@@ -188,11 +188,19 @@ pub(crate) async fn handle_connect(
     }
     let privacy_profile = req.privacy_profile;
     if privacy_profile == PrivacyProfile::HighRisk {
-        let details = match app.ethersync_status().await {
+        let mut details = match app.ethersync_status().await {
             Ok(status) => serde_json::json!({
                 "requested_privacy_profile": "high-risk",
                 "available": status.high_risk_available,
                 "gate_reasons": status.high_risk_gate_reasons,
+                "control_plane_active": status.high_risk_circuits_observed > 0
+                    || status.high_risk_control_frames_observed > 0,
+                "circuits_observed": status.high_risk_circuits_observed,
+                "active_circuits": status.high_risk_active_circuits,
+                "closed_circuits": status.high_risk_closed_circuits,
+                "control_frames_observed": status.high_risk_control_frames_observed,
+                "cover_packets_observed": status.high_risk_cover_packets_observed,
+                "last_high_risk_activity_ms": status.high_risk_last_activity_ms,
                 "routes_status_path": "/v1/routes/status",
                 "interop_path": "/v1/interop",
             }),
@@ -206,11 +214,77 @@ pub(crate) async fn handle_connect(
                 "interop_path": "/v1/interop",
             }),
         };
-        return Err(connect_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "high-risk profile unavailable: ORP high-risk circuits are not implemented yet; inspect /v1/routes/status for gate state",
+        details["requirements"] = serde_json::json!({
+            "passphrase_required": true,
+            "target_format": "orp:<16-hex>",
+            "active_orp_runtime_required": true,
+        });
+
+        let Some(passphrase) = req.passphrase.as_deref() else {
+            return Err(connect_err(
+                StatusCode::BAD_REQUEST,
+                "high-risk profile requires a passphrase-bound ORP target",
+            )
+            .with_details(details));
+        };
+        let Some(target) = req.target.as_deref() else {
+            return Err(connect_err(
+                StatusCode::BAD_REQUEST,
+                "high-risk profile requires target in orp:<16-hex> form",
+            )
+            .with_details(details));
+        };
+        let Some(target_tag) = parse_orp_target_tag(target) else {
+            return Err(connect_err(
+                StatusCode::BAD_REQUEST,
+                "high-risk profile requires target in orp:<16-hex> form",
+            )
+            .with_details(details));
+        };
+        let Some(orp_node) = app.orp_node().await else {
+            details["planning_error"] =
+                serde_json::json!("active ORP-enabled EtherSync runtime unavailable");
+            return Err(connect_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "high-risk profile unavailable: ORP runtime is not active",
+            )
+            .with_details(details));
+        };
+
+        match crate::transport::orp_highrisk::prepare_high_risk_connect(
+            orp_node.as_ref(),
+            passphrase,
+            target_tag,
         )
-        .with_details(details));
+        .await
+        {
+            Ok(preparation) => {
+                let circuit_id = preparation.circuit_id.clone();
+                details["prepared_circuit"] = serde_json::to_value(&preparation)
+                    .unwrap_or_else(|_| serde_json::json!({"prepared": true}));
+                let _ = crate::transport::orp_highrisk::cancel_prepared_high_risk_circuit(
+                    orp_node.as_ref(),
+                    passphrase,
+                    &circuit_id,
+                    1,
+                )
+                .await;
+                return Err(connect_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "high-risk circuit prepared, but the routed session data plane is not active yet",
+                )
+                .with_details(details));
+            }
+            Err(err) => {
+                details["planning_error"] =
+                    serde_json::to_value(&err).unwrap_or_else(|_| serde_json::json!(err.reason));
+                return Err(connect_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "high-risk profile unavailable: no eligible three-hop ORP circuit could be prepared",
+                )
+                .with_details(details));
+            }
+        }
     }
     if req.offer.is_some() && req.passphrase.is_some() {
         return Err(connect_err(

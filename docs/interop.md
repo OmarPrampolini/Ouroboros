@@ -33,8 +33,10 @@ Behavioral expectations:
 - EtherSync startup may enrich bootstrap peers from configured discovery peers, bridge hints, and bootstrap bundles
 - joining a space may seed peer knowledge from federated discovery before replay
 - keeper status must distinguish pending replication from archived replicated envelopes
+- keeper APIs may expose per-space manifests, candidate shortfall, and managed-ready posture without claiming remote keeper guarantees that do not yet exist
 - joining a space may carry per-space retention and route-bias policy without changing the underlying passphrase scope
 - route inspection must expose target-scoped ORP ranking inputs without inventing route semantics that the runtime does not actually use
+- route status may expose high-risk circuit planning and control-frame telemetry without advertising a live high-risk routed data plane
 
 ## CipherPacket and Session Compatibility
 
@@ -64,6 +66,12 @@ Reserved and formalized for ORP-HighRisk:
 - `CircuitExtend`
 - `CircuitClose`
 - `Cover`
+
+Current implementation truth:
+
+- these frames are formalized and surfaced in interop/capability documentation
+- the runtime can plan and publish high-risk control frames and observe them locally
+- the routed high-risk session data plane is still intentionally inactive
 
 Compatibility rule:
 

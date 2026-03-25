@@ -8,9 +8,11 @@ use crate::{
     message::EtherMessage,
     network::EtherUdpSocket,
     routing::{
-        encode_orp_frame, OrpFrame, RouteAnnouncement, RouteCache, RouteCapabilities, RouteClass,
-        RouteHop, RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_LOOKUP,
-        SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
+        encode_orp_frame, CircuitClose, CircuitExtend, CircuitOpen, CoverPacket,
+        HighRiskCircuitPlan, HighRiskGateSnapshot, OrpFrame, RouteAnnouncement, RouteCache,
+        RouteCapabilities, RouteClass, RouteHop, RouteLookup, RouteOffer, SUBSPACE_CIRCUIT_CLOSE,
+        SUBSPACE_CIRCUIT_EXTEND, SUBSPACE_CIRCUIT_OPEN, SUBSPACE_COVER_TRAFFIC,
+        SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_LOOKUP, SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
     },
     storage::EtherStorage,
     EtherSyncError,
@@ -18,10 +20,12 @@ use crate::{
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
 use ouroboros_crypto::random::fill_random;
+use serde::Serialize;
 use std::collections::{HashMap as StdHashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::interval;
 use tracing::{error, info, trace, warn};
@@ -102,6 +106,53 @@ struct Subscription {
     _last_slot: RwLock<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HighRiskCircuitSnapshot {
+    pub circuit_id: String,
+    pub space_prefix: String,
+    pub origin_id: Option<String>,
+    pub active: bool,
+    pub opened_at_slot: Option<u64>,
+    pub expires_at_slot: Option<u64>,
+    pub first_hop: Option<String>,
+    pub last_hop: Option<String>,
+    pub extend_count: usize,
+    pub highest_hop_index: u8,
+    pub cover_packets: usize,
+    pub control_frames_seen: usize,
+    pub close_reason: Option<u16>,
+    pub last_updated_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct HighRiskCircuitStats {
+    pub circuits_observed: usize,
+    pub active_circuits: usize,
+    pub closed_circuits: usize,
+    pub control_frames_observed: usize,
+    pub cover_packets_observed: usize,
+    pub last_activity_ms: Option<u64>,
+    pub recent_circuits: Vec<HighRiskCircuitSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedHighRiskCircuit {
+    circuit_id: [u8; 16],
+    space_prefix: [u8; 8],
+    origin_id: Option<[u8; 16]>,
+    active: bool,
+    opened_at_slot: Option<u64>,
+    expires_at_slot: Option<u64>,
+    first_hop: Option<String>,
+    last_hop: Option<String>,
+    extend_count: usize,
+    highest_hop_index: u8,
+    cover_packets: usize,
+    control_frames_seen: usize,
+    close_reason: Option<u16>,
+    last_updated_ms: u64,
+}
+
 /// EtherNode - main entry point for EtherSync protocol
 #[derive(Debug)]
 pub struct EtherNode {
@@ -131,6 +182,8 @@ pub struct EtherNode {
     /// Handles for ORP announce tasks keyed by space prefix, so duplicate joins
     /// do not spawn duplicate announcers and shutdown can abort them cleanly.
     orp_announce_tasks: Arc<Mutex<StdHashMap<[u8; 8], tokio::task::JoinHandle<()>>>>,
+    /// Observed and locally prepared high-risk circuits.
+    high_risk_circuits: Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
 }
 
 impl EtherNode {
@@ -197,6 +250,7 @@ impl EtherNode {
             node_id,
             orp_spaces: Arc::new(RwLock::new(StdHashMap::new())),
             orp_announce_tasks: Arc::new(Mutex::new(StdHashMap::new())),
+            high_risk_circuits: Arc::new(Mutex::new(StdHashMap::new())),
         })
     }
 
@@ -371,6 +425,7 @@ impl EtherNode {
         let router_seen = Arc::clone(&self.seen_messages);
         let router_max_seen = self.max_seen_cache;
         let router_enable_orp = self.config.enable_orp;
+        let router_high_risk_circuits = Arc::clone(&self.high_risk_circuits);
 
         // Spawn subscription router task
         let router_handle = tokio::spawn(async move {
@@ -422,6 +477,8 @@ impl EtherNode {
                     let passphrase_bytes =
                         ouroboros_crypto::derive::canonicalize_passphrase(&sub._passphrase);
                     let space_hash = ouroboros_crypto::hash::blake3_hash(&passphrase_bytes);
+                    let mut space_prefix = [0u8; 8];
+                    space_prefix.copy_from_slice(&space_hash[..8]);
                     let dummy_src: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
 
                     let mut cache = route_cache_router.lock().await;
@@ -431,6 +488,51 @@ impl EtherNode {
                         }
                         OrpFrame::Offer(offer) => {
                             cache.insert_offer(offer);
+                        }
+                        OrpFrame::Forward(_) | OrpFrame::Ack(_) => {}
+                        OrpFrame::CircuitOpen(open) => {
+                            drop(cache);
+                            record_high_risk_open(
+                                &router_high_risk_circuits,
+                                space_prefix,
+                                msg.header.slot_id,
+                                &open,
+                            )
+                            .await;
+                            continue;
+                        }
+                        OrpFrame::CircuitExtend(extend) => {
+                            drop(cache);
+                            record_high_risk_extend(
+                                &router_high_risk_circuits,
+                                space_prefix,
+                                msg.header.slot_id,
+                                &extend,
+                            )
+                            .await;
+                            continue;
+                        }
+                        OrpFrame::CircuitClose(close) => {
+                            drop(cache);
+                            record_high_risk_close(
+                                &router_high_risk_circuits,
+                                space_prefix,
+                                msg.header.slot_id,
+                                &close,
+                            )
+                            .await;
+                            continue;
+                        }
+                        OrpFrame::Cover(cover) => {
+                            drop(cache);
+                            record_high_risk_cover(
+                                &router_high_risk_circuits,
+                                space_prefix,
+                                msg.header.slot_id,
+                                &cover,
+                            )
+                            .await;
+                            continue;
                         }
                         OrpFrame::Lookup(lookup) if router_enable_orp => {
                             // Check if OUR assist_tag matches the lookup target_tag.
@@ -711,6 +813,47 @@ impl EtherNode {
         }
     }
 
+    async fn publish_orp_frame(
+        &self,
+        passphrase: &str,
+        frame: OrpFrame,
+        subspace: u64,
+        slot: u64,
+    ) -> Result<(), EtherSyncError> {
+        let payload = encode_orp_frame(&frame)?;
+        let msg = EtherMessage::new_control_message(passphrase, slot, &payload, subspace)?;
+
+        let hash = Self::message_hash(&msg);
+        {
+            let mut storage = self.storage.lock().await;
+            storage.store(slot, hash, msg.clone())?;
+        }
+        {
+            let mut seen = self.seen_messages.write().await;
+            seen.insert(hash);
+            self.cleanup_seen_cache(&mut seen).await;
+        }
+
+        let gossip_engine = self.gossip_engine.clone();
+        let msg_clone = msg.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                {
+                    let engine_guard = gossip_engine.read().await;
+                    if let Some(ref engine) = *engine_guard {
+                        if let Err(e) = engine.publish(msg_clone).await {
+                            trace!("ORP control-frame gossip failed: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // ORP — Ouroboros Routing Protocol
     // -----------------------------------------------------------------------
@@ -754,40 +897,13 @@ impl EtherNode {
             expires_at_slot: slot + 4,
         };
 
-        let frame = OrpFrame::Announce(announcement);
-        let payload = encode_orp_frame(&frame)?;
-
-        let msg =
-            EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_ANNOUNCE)?;
-
-        // Store locally and gossip
-        let hash = Self::message_hash(&msg);
-        {
-            let mut storage = self.storage.lock().await;
-            storage.store(slot, hash, msg.clone())?;
-        }
-        {
-            let mut seen = self.seen_messages.write().await;
-            seen.insert(hash);
-            self.cleanup_seen_cache(&mut seen).await;
-        }
-
-        let gossip_engine = self.gossip_engine.clone();
-        let msg_clone = msg.clone();
-        tokio::spawn(async move {
-            for _ in 0..50 {
-                {
-                    let engine_guard = gossip_engine.read().await;
-                    if let Some(ref engine) = *engine_guard {
-                        if let Err(e) = engine.publish(msg_clone).await {
-                            trace!("ORP announce gossip failed: {:?}", e);
-                        }
-                        return;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        });
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::Announce(announcement),
+            SUBSPACE_ROUTE_ANNOUNCE,
+            slot,
+        )
+        .await?;
 
         trace!("Published ORP route announcement for slot {}", slot);
         Ok(())
@@ -802,8 +918,6 @@ impl EtherNode {
         passphrase: &str,
         target_tag: [u8; 8],
     ) -> Result<[u8; 16], EtherSyncError> {
-        let slot = EtherCoordinate::current_slot();
-
         let mut lookup_id = [0u8; 16];
         fill_random(&mut lookup_id).map_err(|_| {
             EtherSyncError::NetworkError("failed to generate lookup id".to_string())
@@ -817,39 +931,14 @@ impl EtherNode {
             ttl: 3,
         };
 
-        let frame = OrpFrame::Lookup(lookup);
-        let payload = encode_orp_frame(&frame)?;
-
-        let msg =
-            EtherMessage::new_control_message(passphrase, slot, &payload, SUBSPACE_ROUTE_LOOKUP)?;
-
-        let hash = Self::message_hash(&msg);
-        {
-            let mut storage = self.storage.lock().await;
-            storage.store(slot, hash, msg.clone())?;
-        }
-        {
-            let mut seen = self.seen_messages.write().await;
-            seen.insert(hash);
-            self.cleanup_seen_cache(&mut seen).await;
-        }
-
-        let gossip_engine = self.gossip_engine.clone();
-        let msg_clone = msg.clone();
-        tokio::spawn(async move {
-            for _ in 0..50 {
-                {
-                    let engine_guard = gossip_engine.read().await;
-                    if let Some(ref engine) = *engine_guard {
-                        if let Err(e) = engine.publish(msg_clone).await {
-                            trace!("ORP lookup gossip failed: {:?}", e);
-                        }
-                        return;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        });
+        let slot = EtherCoordinate::current_slot();
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::Lookup(lookup),
+            SUBSPACE_ROUTE_LOOKUP,
+            slot,
+        )
+        .await?;
 
         trace!(
             "Published ORP route lookup {:?} for tag {:?}",
@@ -857,6 +946,161 @@ impl EtherNode {
             target_tag
         );
         Ok(lookup_id)
+    }
+
+    pub async fn high_risk_gate_snapshot(
+        &self,
+        passphrase: &str,
+    ) -> Result<HighRiskGateSnapshot, EtherSyncError> {
+        let passphrase_bytes = canonicalize_passphrase(passphrase);
+        let space_hash = blake3_hash(&passphrase_bytes);
+        let mut space_prefix = [0u8; 8];
+        space_prefix.copy_from_slice(&space_hash[..8]);
+        let cache = self.route_cache.lock().await;
+        Ok(cache.high_risk_gate_snapshot(&space_prefix, EtherCoordinate::current_slot()))
+    }
+
+    pub async fn plan_high_risk_circuit(
+        &self,
+        passphrase: &str,
+        target_tag: [u8; 8],
+    ) -> Result<HighRiskCircuitPlan, EtherSyncError> {
+        let passphrase_bytes = canonicalize_passphrase(passphrase);
+        let space_hash = blake3_hash(&passphrase_bytes);
+        let mut space_prefix = [0u8; 8];
+        space_prefix.copy_from_slice(&space_hash[..8]);
+        let cache = self.route_cache.lock().await;
+        cache
+            .plan_high_risk_circuit(&space_prefix, &target_tag, EtherCoordinate::current_slot())
+            .map_err(|err| EtherSyncError::NetworkError(err.reason))
+    }
+
+    pub async fn publish_high_risk_circuit_plan(
+        &self,
+        passphrase: &str,
+        plan: &HighRiskCircuitPlan,
+    ) -> Result<[u8; 16], EtherSyncError> {
+        let slot = EtherCoordinate::current_slot();
+        let mut circuit_id = [0u8; 16];
+        fill_random(&mut circuit_id).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate high-risk circuit id".to_string())
+        })?;
+
+        let open = CircuitOpen {
+            version: 1,
+            circuit_id,
+            origin_id: self.node_id,
+            first_hop: RouteHop::Relay {
+                relay_addr: plan.entry.addr,
+                target_tag: plan.entry.assist_tag,
+            },
+            hop_payload: format!(
+                "orp-highrisk:entry:{}:{}",
+                plan.entry.operator_id_hint, plan.entry.region_hint
+            )
+            .into_bytes(),
+            expires_at_slot: slot + 4,
+        };
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::CircuitOpen(open.clone()),
+            SUBSPACE_CIRCUIT_OPEN,
+            slot,
+        )
+        .await?;
+        record_high_risk_open_for_passphrase(&self.high_risk_circuits, passphrase, slot, &open)
+            .await;
+
+        let middle = CircuitExtend {
+            version: 1,
+            circuit_id,
+            current_hop: 1,
+            next_hop: RouteHop::Relay {
+                relay_addr: plan.middle.addr,
+                target_tag: plan.middle.assist_tag,
+            },
+            hop_payload: format!(
+                "orp-highrisk:middle:{}:{}",
+                plan.middle.operator_id_hint, plan.middle.region_hint
+            )
+            .into_bytes(),
+            expires_at_slot: slot + 4,
+        };
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::CircuitExtend(middle.clone()),
+            SUBSPACE_CIRCUIT_EXTEND,
+            slot,
+        )
+        .await?;
+        record_high_risk_extend_for_passphrase(&self.high_risk_circuits, passphrase, slot, &middle)
+            .await;
+
+        let exit = CircuitExtend {
+            version: 1,
+            circuit_id,
+            current_hop: 2,
+            next_hop: RouteHop::Direct {
+                addr: plan.exit.addr,
+            },
+            hop_payload: format!(
+                "orp-highrisk:exit:{}:{}",
+                plan.exit.operator_id_hint, plan.exit.region_hint
+            )
+            .into_bytes(),
+            expires_at_slot: slot + 4,
+        };
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::CircuitExtend(exit.clone()),
+            SUBSPACE_CIRCUIT_EXTEND,
+            slot,
+        )
+        .await?;
+        record_high_risk_extend_for_passphrase(&self.high_risk_circuits, passphrase, slot, &exit)
+            .await;
+
+        let cover = CoverPacket {
+            version: 1,
+            stream_id: circuit_id,
+            cover_class: 1,
+            payload: vec![0u8; 256],
+        };
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::Cover(cover.clone()),
+            SUBSPACE_COVER_TRAFFIC,
+            slot,
+        )
+        .await?;
+        record_high_risk_cover_for_passphrase(&self.high_risk_circuits, passphrase, slot, &cover)
+            .await;
+
+        Ok(circuit_id)
+    }
+
+    pub async fn close_high_risk_circuit(
+        &self,
+        passphrase: &str,
+        circuit_id: [u8; 16],
+        reason_code: u16,
+    ) -> Result<(), EtherSyncError> {
+        let slot = EtherCoordinate::current_slot();
+        let close = CircuitClose {
+            version: 1,
+            circuit_id,
+            reason_code,
+        };
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::CircuitClose(close.clone()),
+            SUBSPACE_CIRCUIT_CLOSE,
+            slot,
+        )
+        .await?;
+        record_high_risk_close_for_passphrase(&self.high_risk_circuits, passphrase, slot, &close)
+            .await;
+        Ok(())
     }
 
     /// Return the best cached route offer for the given lookup id, if any.
@@ -939,6 +1183,40 @@ impl EtherNode {
         self.orp_spaces.read().await.keys().cloned().collect()
     }
 
+    pub async fn high_risk_circuit_stats(&self) -> HighRiskCircuitStats {
+        let current_slot = EtherCoordinate::current_slot();
+        let mut circuits = self.high_risk_circuits.lock().await;
+        prune_high_risk_circuits(&mut circuits, current_slot);
+
+        let circuits_observed = circuits.len();
+        let active_circuits = circuits.values().filter(|record| record.active).count();
+        let closed_circuits = circuits_observed.saturating_sub(active_circuits);
+        let control_frames_observed = circuits
+            .values()
+            .map(|record| record.control_frames_seen)
+            .sum();
+        let cover_packets_observed = circuits.values().map(|record| record.cover_packets).sum();
+        let last_activity_ms = circuits.values().map(|record| record.last_updated_ms).max();
+
+        let mut recent_circuits = circuits
+            .values()
+            .cloned()
+            .map(snapshot_high_risk_circuit)
+            .collect::<Vec<_>>();
+        recent_circuits.sort_by(|a, b| b.last_updated_ms.cmp(&a.last_updated_ms));
+        recent_circuits.truncate(8);
+
+        HighRiskCircuitStats {
+            circuits_observed,
+            active_circuits,
+            closed_circuits,
+            control_frames_observed,
+            cover_packets_observed,
+            last_activity_ms,
+            recent_circuits,
+        }
+    }
+
     async fn abort_orp_announce_tasks(&self) {
         let handles = {
             let mut tasks = self.orp_announce_tasks.lock().await;
@@ -950,6 +1228,7 @@ impl EtherNode {
         }
 
         self.orp_spaces.write().await.clear();
+        self.high_risk_circuits.lock().await.clear();
     }
 
     /// Spawn the ORP periodic announcement task.
@@ -1084,6 +1363,292 @@ impl EtherNode {
     pub fn node_id(&self) -> [u8; 16] {
         self.node_id
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn space_prefix_for_passphrase(passphrase: &str) -> [u8; 8] {
+    let passphrase_bytes = canonicalize_passphrase(passphrase);
+    let space_hash = blake3_hash(&passphrase_bytes);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&space_hash[..8]);
+    prefix
+}
+
+fn route_hop_label(hop: &RouteHop) -> String {
+    match hop {
+        RouteHop::Direct { addr } => format!("direct:{addr}"),
+        RouteHop::Relay {
+            relay_addr,
+            target_tag,
+        } => format!("relay:{}#{}", relay_addr, hex::encode(target_tag)),
+        RouteHop::Tor { onion_address } => format!("tor:{onion_address}"),
+    }
+}
+
+fn push_control_frame_label(record: &mut ObservedHighRiskCircuit, _label: &str) {
+    record.control_frames_seen = record.control_frames_seen.saturating_add(1);
+}
+
+fn prune_high_risk_circuits(
+    circuits: &mut StdHashMap<[u8; 16], ObservedHighRiskCircuit>,
+    current_slot: u64,
+) {
+    let stale_before_ms = now_ms().saturating_sub(15 * 60 * 1000);
+    circuits.retain(|_, record| {
+        let slot_live = record
+            .expires_at_slot
+            .map(|expires_at_slot| expires_at_slot.saturating_add(2) >= current_slot)
+            .unwrap_or(true);
+        record.active || slot_live || record.last_updated_ms >= stale_before_ms
+    });
+}
+
+fn snapshot_high_risk_circuit(record: ObservedHighRiskCircuit) -> HighRiskCircuitSnapshot {
+    HighRiskCircuitSnapshot {
+        circuit_id: hex::encode(record.circuit_id),
+        space_prefix: hex::encode(record.space_prefix),
+        origin_id: record.origin_id.map(hex::encode),
+        active: record.active,
+        opened_at_slot: record.opened_at_slot,
+        expires_at_slot: record.expires_at_slot,
+        first_hop: record.first_hop,
+        last_hop: record.last_hop,
+        extend_count: record.extend_count,
+        highest_hop_index: record.highest_hop_index,
+        cover_packets: record.cover_packets,
+        control_frames_seen: record.control_frames_seen,
+        close_reason: record.close_reason,
+        last_updated_ms: record.last_updated_ms,
+    }
+}
+
+async fn record_high_risk_open_for_passphrase(
+    circuits: &Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    passphrase: &str,
+    slot: u64,
+    frame: &CircuitOpen,
+) {
+    record_high_risk_open(
+        circuits,
+        space_prefix_for_passphrase(passphrase),
+        slot,
+        frame,
+    )
+    .await;
+}
+
+async fn record_high_risk_extend_for_passphrase(
+    circuits: &Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    passphrase: &str,
+    slot: u64,
+    frame: &CircuitExtend,
+) {
+    record_high_risk_extend(
+        circuits,
+        space_prefix_for_passphrase(passphrase),
+        slot,
+        frame,
+    )
+    .await;
+}
+
+async fn record_high_risk_close_for_passphrase(
+    circuits: &Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    passphrase: &str,
+    slot: u64,
+    frame: &CircuitClose,
+) {
+    record_high_risk_close(
+        circuits,
+        space_prefix_for_passphrase(passphrase),
+        slot,
+        frame,
+    )
+    .await;
+}
+
+async fn record_high_risk_cover_for_passphrase(
+    circuits: &Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    passphrase: &str,
+    slot: u64,
+    frame: &CoverPacket,
+) {
+    record_high_risk_cover(
+        circuits,
+        space_prefix_for_passphrase(passphrase),
+        slot,
+        frame,
+    )
+    .await;
+}
+
+async fn record_high_risk_open(
+    circuits: &Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    space_prefix: [u8; 8],
+    slot: u64,
+    frame: &CircuitOpen,
+) {
+    let mut circuits = circuits.lock().await;
+    prune_high_risk_circuits(&mut circuits, slot);
+    let record = circuits
+        .entry(frame.circuit_id)
+        .or_insert_with(|| ObservedHighRiskCircuit {
+            circuit_id: frame.circuit_id,
+            space_prefix,
+            origin_id: Some(frame.origin_id),
+            active: true,
+            opened_at_slot: Some(slot),
+            expires_at_slot: Some(frame.expires_at_slot),
+            first_hop: Some(route_hop_label(&frame.first_hop)),
+            last_hop: Some(route_hop_label(&frame.first_hop)),
+            extend_count: 0,
+            highest_hop_index: 0,
+            cover_packets: 0,
+            control_frames_seen: 0,
+            close_reason: None,
+            last_updated_ms: now_ms(),
+        });
+    record.space_prefix = space_prefix;
+    record.origin_id = Some(frame.origin_id);
+    record.active = true;
+    record.opened_at_slot.get_or_insert(slot);
+    record.expires_at_slot = Some(
+        record
+            .expires_at_slot
+            .unwrap_or(frame.expires_at_slot)
+            .max(frame.expires_at_slot),
+    );
+    record.first_hop = Some(route_hop_label(&frame.first_hop));
+    record
+        .last_hop
+        .get_or_insert_with(|| route_hop_label(&frame.first_hop));
+    record.close_reason = None;
+    record.last_updated_ms = now_ms();
+    push_control_frame_label(record, "CircuitOpen");
+}
+
+async fn record_high_risk_extend(
+    circuits: &Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    space_prefix: [u8; 8],
+    slot: u64,
+    frame: &CircuitExtend,
+) {
+    let mut circuits = circuits.lock().await;
+    prune_high_risk_circuits(&mut circuits, slot);
+    let record = circuits
+        .entry(frame.circuit_id)
+        .or_insert_with(|| ObservedHighRiskCircuit {
+            circuit_id: frame.circuit_id,
+            space_prefix,
+            origin_id: None,
+            active: true,
+            opened_at_slot: Some(slot),
+            expires_at_slot: Some(frame.expires_at_slot),
+            first_hop: None,
+            last_hop: Some("CircuitExtend".to_string()),
+            extend_count: 0,
+            highest_hop_index: frame.current_hop.saturating_add(1),
+            cover_packets: 0,
+            control_frames_seen: 0,
+            close_reason: None,
+            last_updated_ms: now_ms(),
+        });
+    record.space_prefix = space_prefix;
+    record.active = true;
+    record.opened_at_slot.get_or_insert(slot);
+    record.expires_at_slot = Some(
+        record
+            .expires_at_slot
+            .unwrap_or(frame.expires_at_slot)
+            .max(frame.expires_at_slot),
+    );
+    record.extend_count = record.extend_count.saturating_add(1);
+    record.highest_hop_index = record
+        .highest_hop_index
+        .max(frame.current_hop.saturating_add(1));
+    record.last_hop = Some(route_hop_label(&frame.next_hop));
+    record.close_reason = None;
+    record.last_updated_ms = now_ms();
+    push_control_frame_label(record, "CircuitExtend");
+}
+
+async fn record_high_risk_close(
+    circuits: &Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    space_prefix: [u8; 8],
+    slot: u64,
+    frame: &CircuitClose,
+) {
+    let mut circuits = circuits.lock().await;
+    prune_high_risk_circuits(&mut circuits, slot);
+    let record = circuits
+        .entry(frame.circuit_id)
+        .or_insert_with(|| ObservedHighRiskCircuit {
+            circuit_id: frame.circuit_id,
+            space_prefix,
+            origin_id: None,
+            active: false,
+            opened_at_slot: Some(slot),
+            expires_at_slot: Some(slot),
+            first_hop: None,
+            last_hop: None,
+            extend_count: 0,
+            highest_hop_index: 0,
+            cover_packets: 0,
+            control_frames_seen: 0,
+            close_reason: Some(frame.reason_code),
+            last_updated_ms: now_ms(),
+        });
+    record.space_prefix = space_prefix;
+    record.active = false;
+    record.close_reason = Some(frame.reason_code);
+    record.expires_at_slot = Some(record.expires_at_slot.unwrap_or(slot).max(slot));
+    record.last_updated_ms = now_ms();
+    push_control_frame_label(record, "CircuitClose");
+}
+
+async fn record_high_risk_cover(
+    circuits: &Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    space_prefix: [u8; 8],
+    slot: u64,
+    frame: &CoverPacket,
+) {
+    let mut circuits = circuits.lock().await;
+    prune_high_risk_circuits(&mut circuits, slot);
+    let record = circuits
+        .entry(frame.stream_id)
+        .or_insert_with(|| ObservedHighRiskCircuit {
+            circuit_id: frame.stream_id,
+            space_prefix,
+            origin_id: None,
+            active: true,
+            opened_at_slot: Some(slot),
+            expires_at_slot: Some(slot.saturating_add(2)),
+            first_hop: None,
+            last_hop: None,
+            extend_count: 0,
+            highest_hop_index: 0,
+            cover_packets: 0,
+            control_frames_seen: 0,
+            close_reason: None,
+            last_updated_ms: now_ms(),
+        });
+    record.space_prefix = space_prefix;
+    record.active = record.close_reason.is_none();
+    record.expires_at_slot = Some(
+        record
+            .expires_at_slot
+            .unwrap_or(slot.saturating_add(2))
+            .max(slot.saturating_add(2)),
+    );
+    record.cover_packets = record.cover_packets.saturating_add(1);
+    record.last_updated_ms = now_ms();
+    push_control_frame_label(record, "Cover");
 }
 
 #[cfg(feature = "handshake-fallback")]

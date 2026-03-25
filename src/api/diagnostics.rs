@@ -132,6 +132,14 @@ pub(crate) struct RouteStatusResponse {
     pub route_cache_size: usize,
     pub route_offers_count: usize,
     pub last_orp_activity_ms: Option<u64>,
+    pub high_risk_control_plane_active: bool,
+    pub high_risk_circuits_observed: usize,
+    pub high_risk_active_circuits: usize,
+    pub high_risk_closed_circuits: usize,
+    pub high_risk_control_frames_observed: usize,
+    pub high_risk_cover_packets_observed: usize,
+    pub high_risk_last_activity_ms: Option<u64>,
+    pub high_risk_recent_circuits: Vec<ethersync::HighRiskCircuitSnapshot>,
     pub active_spaces: usize,
     pub route_classes: Vec<String>,
     pub route_class_counts: BTreeMap<String, usize>,
@@ -156,6 +164,10 @@ pub(crate) struct KeeperStatusResponse {
     pub keeper_space_count: usize,
     pub archived_keeper_envelopes: usize,
     pub keeper_archive_space_count: usize,
+    pub keeper_manifest_space_count: usize,
+    pub keeper_candidate_shortfall_space_count: usize,
+    pub managed_ready_space_count: usize,
+    pub last_keeper_activity_ms: Option<u64>,
     pub managed_space_count: usize,
     pub bridge_preferred_space_count: usize,
     pub keeper_preferred_space_count: usize,
@@ -544,6 +556,7 @@ pub(crate) async fn handle_routes_status(
         max_operator_share_observed_pct,
         valid_three_hop_path_observed,
         route_class_counts,
+        high_risk_recent_circuits,
     ) = if let Some(node) = state.app.orp_node().await {
         let cache = node.route_cache().lock().await;
         let relay_nodes = cache
@@ -615,6 +628,8 @@ pub(crate) async fn handle_routes_status(
             let key = format!("{:?}", announcement.frame.route_class).to_lowercase();
             *class_counts.entry(key).or_insert(0) += 1;
         }
+        drop(cache);
+        let high_risk_circuit_stats = node.high_risk_circuit_stats().await;
 
         (
             Some(relay_nodes),
@@ -625,14 +640,23 @@ pub(crate) async fn handle_routes_status(
             max_operator_share_observed_pct,
             valid_three_hop_path_observed,
             class_counts,
+            high_risk_circuit_stats.recent_circuits,
         )
     } else {
-        (None, None, None, 0, 0, None, None, BTreeMap::new())
+        (
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            BTreeMap::new(),
+            Vec::new(),
+        )
     };
 
     let mut gate_reasons = status.high_risk_gate_reasons.clone();
-    gate_reasons
-        .retain(|reason| reason != "relay operator diversity telemetry is not available yet");
     if relay_nodes_observed.unwrap_or_default() < 64 {
         gate_reasons.push(format!(
             "observed relay nodes below hard gate: {} / 64",
@@ -689,6 +713,15 @@ pub(crate) async fn handle_routes_status(
         route_cache_size: status.route_cache_size,
         route_offers_count: status.route_offers_count,
         last_orp_activity_ms: status.last_orp_activity_ms,
+        high_risk_control_plane_active: status.high_risk_circuits_observed > 0
+            || status.high_risk_control_frames_observed > 0,
+        high_risk_circuits_observed: status.high_risk_circuits_observed,
+        high_risk_active_circuits: status.high_risk_active_circuits,
+        high_risk_closed_circuits: status.high_risk_closed_circuits,
+        high_risk_control_frames_observed: status.high_risk_control_frames_observed,
+        high_risk_cover_packets_observed: status.high_risk_cover_packets_observed,
+        high_risk_last_activity_ms: status.high_risk_last_activity_ms,
+        high_risk_recent_circuits,
         active_spaces: status.spaces.len(),
         route_classes: vec![
             "direct".to_string(),
@@ -734,6 +767,10 @@ pub(crate) async fn handle_keepers_status(
         keeper_space_count: status.keeper_space_count,
         archived_keeper_envelopes: status.archived_keeper_envelopes,
         keeper_archive_space_count: status.keeper_archive_space_count,
+        keeper_manifest_space_count: status.keeper_manifest_space_count,
+        keeper_candidate_shortfall_space_count: status.keeper_candidate_shortfall_space_count,
+        managed_ready_space_count: status.managed_ready_space_count,
+        last_keeper_activity_ms: status.last_keeper_activity_ms,
         managed_space_count: status.managed_space_count,
         bridge_preferred_space_count: status.bridge_preferred_space_count,
         keeper_preferred_space_count: status.keeper_preferred_space_count,
@@ -769,6 +806,8 @@ pub(crate) async fn handle_keepers_status(
             "Keeper backfill currently restores archived encrypted envelopes into local replay storage"
                 .to_string(),
             "Bootstrap bundle validation now exposes local usability, structural weakness, and advisory staleness"
+                .to_string(),
+            "Per-space keeper manifests now expose desired targets, local stage, and candidate shortfall"
                 .to_string(),
         ],
     }))

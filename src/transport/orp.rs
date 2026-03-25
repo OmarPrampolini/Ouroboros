@@ -32,6 +32,8 @@ struct RouteCandidate {
     operator_id_hint: String,
     region_hint: String,
     via_lookup: bool,
+    preference_bucket: String,
+    ranking_hints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +46,15 @@ pub struct OrpCandidateSnapshot {
     pub operator_id_hint: String,
     pub region_hint: String,
     pub via_lookup: bool,
+    pub preference_bucket: String,
+    pub ranking_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidatePosture {
+    score: u16,
+    preference_bucket: String,
+    ranking_hints: Vec<String>,
 }
 
 fn score_with_bias(
@@ -51,24 +62,30 @@ fn score_with_bias(
     cfg: &Config,
     announcement: &CachedAnnouncement,
     route_bias: Option<&crate::state::SpaceRouteBias>,
-) -> u16 {
+    bridge_heavy_space: bool,
+) -> CandidatePosture {
     let mut bonus = 0i32;
+    let mut ranking_hints = Vec::new();
 
     let operator = announcement.frame.operator_id_hint.trim();
     let region = announcement.frame.region_hint.trim();
 
     if !operator.is_empty() && operator != "local-node" {
         bonus += 80;
+        ranking_hints.push("external-operator-hint".to_string());
     }
     if !region.is_empty() && region != "unknown" {
         if region.eq_ignore_ascii_case(&cfg.operator_region) {
             bonus += 20;
+            ranking_hints.push("same-region-hint".to_string());
         } else {
             bonus += 180;
+            ranking_hints.push("cross-region-hint".to_string());
         }
     }
     if !operator.is_empty() && operator.eq_ignore_ascii_case(&cfg.operator_id) {
         bonus -= 260;
+        ranking_hints.push("local-operator-penalty".to_string());
     }
 
     match announcement.frame.route_class {
@@ -78,6 +95,7 @@ fn score_with_bias(
                     || crate::bootstrap_bundle::summarize_bootstrap_bundle(cfg).bridges > 0) =>
         {
             bonus += 420;
+            ranking_hints.push("bridge-capable-bundle-posture".to_string());
         }
         RouteClass::Keeper
             if announcement.frame.capabilities.keeper_capable
@@ -85,12 +103,15 @@ fn score_with_bias(
                 && cfg.keeper_replication_factor > 0 =>
         {
             bonus += 280 + (cfg.keeper_replication_factor.min(8) as i32 * 25);
+            ranking_hints.push("keeper-capable-managed-posture".to_string());
         }
         RouteClass::Assisted if announcement.frame.capabilities.can_relay => {
             bonus += 140;
+            ranking_hints.push("relay-capable".to_string());
         }
         RouteClass::Direct if announcement.frame.capabilities.direct_udp => {
             bonus += 60;
+            ranking_hints.push("direct-udp".to_string());
         }
         _ => {}
     }
@@ -109,6 +130,7 @@ fn score_with_bias(
                     .unwrap_or(false)
         }) {
             bonus += 140;
+            ranking_hints.push("bundle-relay-match".to_string());
         }
         if bundle.bridges.iter().any(|bridge| {
             bridge
@@ -123,6 +145,7 @@ fn score_with_bias(
                     .unwrap_or(false)
         }) {
             bonus += 180;
+            ranking_hints.push("bundle-bridge-match".to_string());
         }
         if bundle.keepers.iter().any(|keeper| {
             keeper
@@ -137,12 +160,22 @@ fn score_with_bias(
                     .unwrap_or(false)
         }) {
             bonus += 160;
+            ranking_hints.push("bundle-keeper-match".to_string());
         }
     }
 
     if announcement.frame.capabilities.tor_capable && cfg.wan_mode != crate::config::WanMode::Direct
     {
         bonus += 40;
+        ranking_hints.push("tor-capable".to_string());
+    }
+
+    if bridge_heavy_space
+        && matches!(announcement.frame.route_class, RouteClass::Bridge)
+        && announcement.frame.capabilities.bridge_capable
+    {
+        bonus += 140;
+        ranking_hints.push("bridge-heavy-space".to_string());
     }
 
     match route_bias {
@@ -150,39 +183,81 @@ fn score_with_bias(
             if matches!(announcement.frame.route_class, RouteClass::Bridge) =>
         {
             bonus += 320;
+            ranking_hints.push("bridge-preferred-policy".to_string());
         }
         Some(crate::state::SpaceRouteBias::BridgePreferred)
             if matches!(announcement.frame.route_class, RouteClass::Keeper) =>
         {
             bonus -= 120;
+            ranking_hints.push("bridge-policy-keeper-penalty".to_string());
         }
         Some(crate::state::SpaceRouteBias::KeeperPreferred)
             if matches!(announcement.frame.route_class, RouteClass::Keeper) =>
         {
             bonus += 360;
+            ranking_hints.push("keeper-preferred-policy".to_string());
         }
         Some(crate::state::SpaceRouteBias::KeeperPreferred)
             if matches!(announcement.frame.route_class, RouteClass::Direct) =>
         {
             bonus -= 80;
+            ranking_hints.push("keeper-policy-direct-penalty".to_string());
         }
         Some(crate::state::SpaceRouteBias::DirectPreferred)
             if matches!(announcement.frame.route_class, RouteClass::Direct) =>
         {
             bonus += 280;
+            ranking_hints.push("direct-preferred-policy".to_string());
         }
         Some(crate::state::SpaceRouteBias::DirectPreferred)
             if !matches!(announcement.frame.route_class, RouteClass::Direct) =>
         {
             bonus -= 160;
+            ranking_hints.push("direct-policy-non-direct-penalty".to_string());
         }
         _ => {}
     }
 
-    if bonus >= 0 {
+    let score = if bonus >= 0 {
         base_score.saturating_add(bonus as u16)
     } else {
         base_score.saturating_sub((-bonus) as u16)
+    };
+
+    let preference_bucket = match route_bias {
+        Some(crate::state::SpaceRouteBias::BridgePreferred)
+            if matches!(announcement.frame.route_class, RouteClass::Bridge)
+                && bridge_heavy_space =>
+        {
+            "bridge-heavy-preferred"
+        }
+        Some(crate::state::SpaceRouteBias::BridgePreferred)
+            if matches!(announcement.frame.route_class, RouteClass::Bridge) =>
+        {
+            "bridge-preferred"
+        }
+        Some(crate::state::SpaceRouteBias::KeeperPreferred)
+            if matches!(announcement.frame.route_class, RouteClass::Keeper) =>
+        {
+            "keeper-preferred"
+        }
+        Some(crate::state::SpaceRouteBias::DirectPreferred)
+            if matches!(announcement.frame.route_class, RouteClass::Direct) =>
+        {
+            "direct-preferred"
+        }
+        _ if matches!(announcement.frame.route_class, RouteClass::Bridge) && bridge_heavy_space => {
+            "bridge-heavy"
+        }
+        _ => "balanced",
+    }
+    .to_string();
+    ranking_hints.push(format!("bucket={preference_bucket}"));
+
+    CandidatePosture {
+        score,
+        preference_bucket,
+        ranking_hints,
     }
 }
 
@@ -196,6 +271,8 @@ fn push_candidate(
     operator_id_hint: String,
     region_hint: String,
     via_lookup: bool,
+    preference_bucket: String,
+    ranking_hints: Vec<String>,
 ) {
     match out.get_mut(&addr) {
         Some(existing) if existing.score >= score => {}
@@ -207,6 +284,8 @@ fn push_candidate(
             existing.operator_id_hint = operator_id_hint;
             existing.region_hint = region_hint;
             existing.via_lookup = via_lookup;
+            existing.preference_bucket = preference_bucket;
+            existing.ranking_hints = ranking_hints;
         }
         None => {
             out.insert(
@@ -220,6 +299,8 @@ fn push_candidate(
                     operator_id_hint,
                     region_hint,
                     via_lookup,
+                    preference_bucket,
+                    ranking_hints,
                 },
             );
         }
@@ -234,8 +315,38 @@ fn sort_candidates(candidates: &mut [RouteCandidate]) {
     candidates.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
+            .then_with(|| a.preference_bucket.cmp(&b.preference_bucket))
             .then_with(|| a.addr.to_string().cmp(&b.addr.to_string()))
     });
+}
+
+fn bridge_heavy_space(
+    cache: &ethersync::routing::RouteCache,
+    active_spaces: &[([u8; 8], String)],
+    min_slot: u64,
+) -> bool {
+    let mut bridge_count = 0usize;
+    let mut relay_count = 0usize;
+
+    for (key, announcement) in &cache.announcements {
+        if announcement.frame.slot < min_slot {
+            continue;
+        }
+        if !active_spaces
+            .iter()
+            .any(|(space_prefix, _)| key.space_prefix == *space_prefix)
+        {
+            continue;
+        }
+        if announcement.frame.capabilities.bridge_capable {
+            bridge_count += 1;
+        }
+        if announcement.frame.capabilities.can_relay {
+            relay_count += 1;
+        }
+    }
+
+    bridge_count >= 2 && bridge_count >= relay_count.saturating_sub(1)
 }
 
 async fn resolve_orp_candidates(
@@ -283,6 +394,7 @@ async fn resolve_orp_candidates(
 
     {
         let cache = node.route_cache().lock().await;
+        let bridge_heavy = bridge_heavy_space(&cache, &active_spaces, min_slot);
         for (space_prefix, _) in &active_spaces {
             if let Some(announcement) = cache.find_by_tag(space_prefix, &target_tag, current_slot) {
                 if announcement.frame.slot < min_slot
@@ -293,28 +405,32 @@ async fn resolve_orp_candidates(
                 }
 
                 for addr in &announcement.frame.reachable_udp {
-                    let score = score_with_bias(
+                    let posture = score_with_bias(
                         ethersync::score_announcement(announcement, current_slot),
                         cfg,
                         announcement,
                         route_bias.as_ref(),
+                        bridge_heavy,
                     );
                     push_candidate(
                         &mut candidates,
                         *addr,
-                        score,
+                        posture.score,
                         format!(
-                            "space={} class={:?} operator={} region={}",
+                            "space={} class={:?} operator={} region={} bucket={}",
                             hex::encode(space_prefix),
                             announcement.frame.route_class,
                             announcement.frame.operator_id_hint,
-                            announcement.frame.region_hint
+                            announcement.frame.region_hint,
+                            posture.preference_bucket
                         ),
                         *space_prefix,
                         Some(route_class_label(announcement.frame.route_class)),
                         announcement.frame.operator_id_hint.clone(),
                         announcement.frame.region_hint.clone(),
                         false,
+                        posture.preference_bucket,
+                        posture.ranking_hints,
                     );
                 }
             }
@@ -352,30 +468,44 @@ async fn resolve_orp_candidates(
             match node.best_route(&passphrase, lookup_id).await {
                 Ok(Some(offer)) => {
                     if let RouteHop::Direct { addr } = offer.next_hop {
-                        let (score, source, route_class, operator_id_hint, region_hint) = {
+                        let (
+                            score,
+                            source,
+                            route_class,
+                            operator_id_hint,
+                            region_hint,
+                            preference_bucket,
+                            ranking_hints,
+                        ) = {
                             let cache = node.route_cache().lock().await;
+                            let bridge_heavy = bridge_heavy_space(&cache, &active_spaces, min_slot);
                             if let Some(announcement) = cache.announcement_for_node(
                                 &space_prefix,
                                 &offer.responder_id,
                                 current_slot,
                             ) {
+                                let posture = score_with_bias(
+                                    offer.score,
+                                    cfg,
+                                    announcement,
+                                    route_bias.as_ref(),
+                                    bridge_heavy,
+                                );
                                 (
-                                    score_with_bias(
-                                        offer.score,
-                                        cfg,
-                                        announcement,
-                                        route_bias.as_ref(),
-                                    ),
+                                    posture.score,
                                     format!(
-                                        "lookup={} class={:?} operator={} region={}",
+                                        "lookup={} class={:?} operator={} region={} bucket={}",
                                         hex::encode(lookup_id),
                                         announcement.frame.route_class,
                                         announcement.frame.operator_id_hint,
-                                        announcement.frame.region_hint
+                                        announcement.frame.region_hint,
+                                        posture.preference_bucket
                                     ),
                                     Some(route_class_label(announcement.frame.route_class)),
                                     announcement.frame.operator_id_hint.clone(),
                                     announcement.frame.region_hint.clone(),
+                                    posture.preference_bucket,
+                                    posture.ranking_hints,
                                 )
                             } else {
                                 (
@@ -384,6 +514,8 @@ async fn resolve_orp_candidates(
                                     None,
                                     String::new(),
                                     String::new(),
+                                    "lookup-direct-offer".to_string(),
+                                    vec!["lookup-direct-offer".to_string()],
                                 )
                             }
                         };
@@ -397,6 +529,8 @@ async fn resolve_orp_candidates(
                             operator_id_hint,
                             region_hint,
                             true,
+                            preference_bucket,
+                            ranking_hints,
                         );
                     }
                 }
@@ -460,6 +594,8 @@ pub async fn inspect_orp_candidates(
             operator_id_hint: candidate.operator_id_hint,
             region_hint: candidate.region_hint,
             via_lookup: candidate.via_lookup,
+            preference_bucket: candidate.preference_bucket,
+            ranking_hints: candidate.ranking_hints,
         })
         .collect())
 }
