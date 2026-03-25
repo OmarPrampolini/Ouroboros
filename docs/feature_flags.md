@@ -1,47 +1,74 @@
 # Feature Flags
 
-This project uses optional feature flags to keep the core lightweight and allow
-opt-in transport and PQ dependencies.
+Ouroboros uses feature flags to keep the default build practical while still allowing optional transports and post-quantum primitives.
 
-## Default features
-By default the crate enables:
-- quic
+## Default Profile
 
-The default profile is intentionally conservative: it excludes `webrtc` and `pq`
-to reduce attack/dependency surface for first deploy.
+The default build enables:
 
-Use full profile when you explicitly want all optional transports/crypto:
+- `quic`
+
+This gives the project a strong transport option out of the box without automatically pulling in every experimental or heavyweight capability.
+
+Build it with:
+
+```bash
+cargo build
 ```
+
+## Available Features
+
+### `quic`
+
+Enables QUIC transport support.
+
+- Module: `transport::quic_rfc9000`
+- Dependency path: `quinn` + `rcgen`
+- Status: supported
+
+### `webrtc`
+
+Enables WebRTC DataChannel transport support.
+
+- Module: `transport::webrtc`
+- Dependency path: `webrtc`
+- Status: optional
+
+### `pq`
+
+Enables post-quantum hybrid primitives based on ML-KEM.
+
+- Module: `crypto::post_quantum`
+- Shared crypto crate: `ouroboros-crypto::pq`
+- Status: optional
+
+Important note:
+
+- The `pq` feature currently enables ML-KEM-based hybrid cryptographic primitives.
+- It does **not** currently wire a maintained PQ Noise backend into the live Noise transport path.
+- When live session setup asks for PQ Noise parameters and none are available, the runtime falls back to classic Noise XX.
+
+This is intentional: the project keeps PQ primitives available without depending on an unmaintained Kyber stack in the live transport backend.
+
+### `full`
+
+Convenience profile that enables:
+
+- `quic`
+- `webrtc`
+- `pq`
+
+Build it with:
+
+```bash
 cargo build --no-default-features --features full
 ```
 
-You can disable them with:
-```
-cargo test --no-default-features
-```
+## Suggested Builds
 
-## Available features
-- `quic`
-  - Enables QUIC RFC9000 transport via `quinn` + `rcgen`
-  - Module: `transport::quic_rfc9000`
-
-- `full`
-  - Convenience profile: enables `quic,webrtc,pq`
-
-- `webrtc`
-  - Enables WebRTC DataChannel transport via `webrtc`
-  - Module: `transport::webrtc`
-
-- `pq`
-  - Enables Kyber hybrid primitives and Noise HFS params
-  - Module: `crypto::post_quantum`
-  - Noise uses PQ only on stream transports
-  - If PQ fails/unavailable, classic XX is used as fallback
-
-## Suggested builds
 - Safe default: `cargo build`
 - Core only: `cargo build --no-default-features`
-- Full profile: `cargo build --no-default-features --features full`
 - QUIC only: `cargo build --no-default-features --features quic`
 - WebRTC only: `cargo build --no-default-features --features webrtc`
-- PQ only: `cargo build --no-default-features --features pq`
+- PQ primitives only: `cargo build --no-default-features --features pq`
+- Full optional stack: `cargo build --no-default-features --features full`
