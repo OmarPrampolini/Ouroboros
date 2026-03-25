@@ -12,6 +12,7 @@ use ethersync::routing::{CachedAnnouncement, RouteClass, RouteHop, ANNOUNCE_SLOT
 use ethersync::{EtherCoordinate, EtherNode};
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
+use serde::Serialize;
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::config::Config;
@@ -26,6 +27,23 @@ struct RouteCandidate {
     addr: SocketAddr,
     score: u16,
     source: String,
+    space_prefix: [u8; 8],
+    route_class: Option<String>,
+    operator_id_hint: String,
+    region_hint: String,
+    via_lookup: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrpCandidateSnapshot {
+    pub addr: String,
+    pub score: u16,
+    pub source: String,
+    pub space_prefix: String,
+    pub route_class: Option<String>,
+    pub operator_id_hint: String,
+    pub region_hint: String,
+    pub via_lookup: bool,
 }
 
 fn score_with_bias(
@@ -173,12 +191,22 @@ fn push_candidate(
     addr: SocketAddr,
     score: u16,
     source: String,
+    space_prefix: [u8; 8],
+    route_class: Option<String>,
+    operator_id_hint: String,
+    region_hint: String,
+    via_lookup: bool,
 ) {
     match out.get_mut(&addr) {
         Some(existing) if existing.score >= score => {}
         Some(existing) => {
             existing.score = score;
             existing.source = source;
+            existing.space_prefix = space_prefix;
+            existing.route_class = route_class;
+            existing.operator_id_hint = operator_id_hint;
+            existing.region_hint = region_hint;
+            existing.via_lookup = via_lookup;
         }
         None => {
             out.insert(
@@ -187,21 +215,36 @@ fn push_candidate(
                     addr,
                     score,
                     source,
+                    space_prefix,
+                    route_class,
+                    operator_id_hint,
+                    region_hint,
+                    via_lookup,
                 },
             );
         }
     }
 }
 
-/// Try to establish a connection via ORP for a specific assist tag.
-pub async fn try_orp_route(
+fn route_class_label(route_class: RouteClass) -> String {
+    format!("{route_class:?}").to_lowercase()
+}
+
+fn sort_candidates(candidates: &mut [RouteCandidate]) {
+    candidates.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.addr.to_string().cmp(&b.addr.to_string()))
+    });
+}
+
+async fn resolve_orp_candidates(
     node: &EtherNode,
-    params: &RendezvousParams,
     cfg: &Config,
     passphrase: Option<&str>,
     target_tag: Option<[u8; 8]>,
     route_bias: Option<crate::state::SpaceRouteBias>,
-) -> Result<Connection> {
+) -> Result<Vec<RouteCandidate>> {
     let Some(target_tag) = target_tag else {
         tracing::debug!("ORP: skipping route discovery without a target assist tag");
         network_telemetry::record_fallback_event("orp", "missing_target_tag", None);
@@ -267,6 +310,11 @@ pub async fn try_orp_route(
                             announcement.frame.operator_id_hint,
                             announcement.frame.region_hint
                         ),
+                        *space_prefix,
+                        Some(route_class_label(announcement.frame.route_class)),
+                        announcement.frame.operator_id_hint.clone(),
+                        announcement.frame.region_hint.clone(),
+                        false,
                     );
                 }
             }
@@ -304,7 +352,7 @@ pub async fn try_orp_route(
             match node.best_route(&passphrase, lookup_id).await {
                 Ok(Some(offer)) => {
                     if let RouteHop::Direct { addr } = offer.next_hop {
-                        let (score, source) = {
+                        let (score, source, route_class, operator_id_hint, region_hint) = {
                             let cache = node.route_cache().lock().await;
                             if let Some(announcement) = cache.announcement_for_node(
                                 &space_prefix,
@@ -325,15 +373,31 @@ pub async fn try_orp_route(
                                         announcement.frame.operator_id_hint,
                                         announcement.frame.region_hint
                                     ),
+                                    Some(route_class_label(announcement.frame.route_class)),
+                                    announcement.frame.operator_id_hint.clone(),
+                                    announcement.frame.region_hint.clone(),
                                 )
                             } else {
                                 (
                                     offer.score,
                                     format!("lookup={} direct-offer", hex::encode(lookup_id)),
+                                    None,
+                                    String::new(),
+                                    String::new(),
                                 )
                             }
                         };
-                        push_candidate(&mut candidates, addr, score, source);
+                        push_candidate(
+                            &mut candidates,
+                            addr,
+                            score,
+                            source,
+                            space_prefix,
+                            route_class,
+                            operator_id_hint,
+                            region_hint,
+                            true,
+                        );
                     }
                 }
                 Ok(None) => {}
@@ -367,18 +431,51 @@ pub async fn try_orp_route(
     }
 
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
-    candidates.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.addr.to_string().cmp(&b.addr.to_string()))
-    });
-
+    sort_candidates(&mut candidates);
     tracing::debug!(
         "ORP: {} candidate(s) resolved for assist_tag={} across {} active space(s)",
         candidates.len(),
         hex::encode(target_tag),
         active_spaces.len()
     );
+    Ok(candidates)
+}
+
+pub async fn inspect_orp_candidates(
+    node: &EtherNode,
+    cfg: &Config,
+    passphrase: Option<&str>,
+    target_tag: Option<[u8; 8]>,
+    route_bias: Option<crate::state::SpaceRouteBias>,
+) -> Result<Vec<OrpCandidateSnapshot>> {
+    let candidates = resolve_orp_candidates(node, cfg, passphrase, target_tag, route_bias).await?;
+    Ok(candidates
+        .into_iter()
+        .map(|candidate| OrpCandidateSnapshot {
+            addr: candidate.addr.to_string(),
+            score: candidate.score,
+            source: candidate.source,
+            space_prefix: hex::encode(candidate.space_prefix),
+            route_class: candidate.route_class,
+            operator_id_hint: candidate.operator_id_hint,
+            region_hint: candidate.region_hint,
+            via_lookup: candidate.via_lookup,
+        })
+        .collect())
+}
+
+/// Try to establish a connection via ORP for a specific assist tag.
+pub async fn try_orp_route(
+    node: &EtherNode,
+    params: &RendezvousParams,
+    cfg: &Config,
+    passphrase: Option<&str>,
+    target_tag: Option<[u8; 8]>,
+    route_bias: Option<crate::state::SpaceRouteBias>,
+) -> Result<Connection> {
+    let candidates =
+        resolve_orp_candidates(node, cfg, passphrase, target_tag, route_bias.clone()).await?;
+    let target_tag = target_tag.expect("resolve_orp_candidates validates missing target tag");
 
     let dial_timeout = Duration::from_millis(cfg.wan_connect_timeout_ms.clamp(500, 5_000));
     for candidate in &candidates {

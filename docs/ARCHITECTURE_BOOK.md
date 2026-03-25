@@ -76,6 +76,7 @@ Today:
 - ORP-Standard is the active design target
 - ORP is target-aware and space-scoped
 - ORP feeds the transport stack before Tor
+- ORP inspection surfaces can expose ranked target candidates, route classes, operator hints, region hints, and lookup provenance
 - ORP-HighRisk is not implemented and not claimed
 
 End-state:

@@ -189,6 +189,7 @@ Strong today:
 - first keeper flow: publish enqueues encrypted keeper envelopes, a local replication task flushes them into a keeper replica archive, and backfill restores archived envelopes into local EtherSync storage
 - join-time space policy can now set retention tier, replication factor, and route bias per space
 - ORP candidate ranking now uses operator hints, region diversity, bootstrap bundle posture, and per-space route bias
+- ORP candidate inspection now exposes ranked route decisions, cache-versus-lookup provenance, and target-specific diagnostics through the local API
 
 Explicitly not claimed yet:
 
@@ -205,7 +206,9 @@ Representative endpoints:
 - `POST /v1/connect`
 - `GET /v1/status`
 - `GET /v1/capabilities`
+- `GET /v1/interop`
 - `GET /v1/routes/discover`
+- `GET /v1/routes/inspect`
 - `GET /v1/routes/status`
 - `GET /v1/keepers/status`
 - `GET /v1/keepers/policies`
@@ -222,9 +225,12 @@ The API now exposes:
 
 - privacy profile intent
 - route and ORP diagnostics
+- target-specific ORP candidate inspection with scores, route classes, operator hints, region hints, and lookup provenance
 - keeper and retention scaffolding
+- machine-readable interop posture for `/v1`, CipherPacket V2, ORP frame families, and EtherSync subspace assignments
 - capability reporting for `quic`, `webrtc`, `pq`, ORP tiers, and bridge bootstrap posture
 - operator hints, route class counts, and bootstrap bundle visibility
+- high-risk gate telemetry for relay count, operator diversity, region diversity, operator concentration, and three-hop viability
 - federated discovery candidates resolved from ORP, bundle, and config bootstrap
 - pending-versus-archived keeper state plus a concrete backfill control path for managed-retention experimentation
 - managed-space counts and route-bias posture across joined spaces

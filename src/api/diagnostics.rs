@@ -60,6 +60,19 @@ pub(crate) struct NetworkCapabilities {
     pub interop_matrix: String,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct InteropResponse {
+    pub api_version: String,
+    pub local_api_scope: String,
+    pub cipher_packet_anchor: String,
+    pub wire_compatibility_window: String,
+    pub deprecation_window: String,
+    pub interop_matrix: String,
+    pub orp_frames: Vec<String>,
+    pub reserved_highrisk_frames: Vec<String>,
+    pub ethersync_subspaces: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct FallbackQuery {
     pub limit: Option<usize>,
@@ -68,6 +81,13 @@ pub(crate) struct FallbackQuery {
 #[derive(Debug, Deserialize)]
 pub(crate) struct RouteDiscoverQuery {
     pub passphrase: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RouteInspectQuery {
+    pub passphrase: String,
+    pub target_tag: String,
     pub limit: Option<usize>,
 }
 
@@ -159,6 +179,37 @@ pub(crate) struct RouteDiscoverResponse {
     pub used_orp: bool,
     pub used_bootstrap_bundle: bool,
     pub used_static_bootstrap: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RouteInspectResponse {
+    pub space_prefix: String,
+    pub target_tag: String,
+    pub route_bias: Option<String>,
+    pub candidate_count: usize,
+    pub candidates: Vec<crate::transport::orp::OrpCandidateSnapshot>,
+}
+
+fn parse_target_tag(raw: &str) -> Option<[u8; 8]> {
+    let candidate = raw.trim().strip_prefix("orp:").unwrap_or(raw.trim());
+    if candidate.len() != 16 || !candidate.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let bytes = hex::decode(candidate).ok()?;
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&bytes);
+    Some(tag)
+}
+
+fn route_bias_label(bias: crate::state::SpaceRouteBias) -> String {
+    match bias {
+        crate::state::SpaceRouteBias::Balanced => "balanced",
+        crate::state::SpaceRouteBias::BridgePreferred => "bridge-preferred",
+        crate::state::SpaceRouteBias::KeeperPreferred => "keeper-preferred",
+        crate::state::SpaceRouteBias::DirectPreferred => "direct-preferred",
+    }
+    .to_string()
 }
 
 /// Handle /v1/metrics - In-memory debugging metrics (zero persistence)
@@ -272,6 +323,65 @@ pub(crate) async fn handle_capabilities(
     Ok(Json(snapshot))
 }
 
+/// Handle /v1/interop - machine-readable local API and wire compatibility posture
+pub(crate) async fn handle_interop(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(state): Extension<Arc<ApiState>>,
+) -> Result<Json<InteropResponse>, StatusCode> {
+    if !state.app.api_allow(addr.ip(), 1.0).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    let mut ethersync_subspaces = BTreeMap::new();
+    ethersync_subspaces.insert("user".to_string(), ethersync::SUBSPACE_USER);
+    ethersync_subspaces.insert(
+        "route-announce".to_string(),
+        ethersync::SUBSPACE_ROUTE_ANNOUNCE,
+    );
+    ethersync_subspaces.insert("route-lookup".to_string(), ethersync::SUBSPACE_ROUTE_LOOKUP);
+    ethersync_subspaces.insert("route-offer".to_string(), ethersync::SUBSPACE_ROUTE_OFFER);
+    ethersync_subspaces.insert("relay-beacon".to_string(), ethersync::SUBSPACE_RELAY_BEACON);
+    ethersync_subspaces.insert("circuit-open".to_string(), ethersync::SUBSPACE_CIRCUIT_OPEN);
+    ethersync_subspaces.insert(
+        "circuit-extend".to_string(),
+        ethersync::SUBSPACE_CIRCUIT_EXTEND,
+    );
+    ethersync_subspaces.insert(
+        "circuit-close".to_string(),
+        ethersync::SUBSPACE_CIRCUIT_CLOSE,
+    );
+    ethersync_subspaces.insert(
+        "cover-traffic".to_string(),
+        ethersync::SUBSPACE_COVER_TRAFFIC,
+    );
+
+    Ok(Json(InteropResponse {
+        api_version: "/v1".to_string(),
+        local_api_scope: "Authenticated local control plane with additive evolution inside /v1"
+            .to_string(),
+        cipher_packet_anchor: "CipherPacket V2".to_string(),
+        wire_compatibility_window: "CipherPacket V2 plus additive ORP frame extensions".to_string(),
+        deprecation_window:
+            "One additive minor line; breaking wire changes require explicit migration notes"
+                .to_string(),
+        interop_matrix: "docs/interop.md".to_string(),
+        orp_frames: vec![
+            "Announce".to_string(),
+            "Lookup".to_string(),
+            "Offer".to_string(),
+            "Forward".to_string(),
+            "Ack".to_string(),
+        ],
+        reserved_highrisk_frames: vec![
+            "CircuitOpen".to_string(),
+            "CircuitExtend".to_string(),
+            "CircuitClose".to_string(),
+            "Cover".to_string(),
+        ],
+        ethersync_subspaces,
+    }))
+}
+
 /// Handle /v1/routes/discover - resolve candidates from ORP, bundle, and static bootstrap
 pub(crate) async fn handle_routes_discover(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -330,6 +440,54 @@ pub(crate) async fn handle_routes_discover(
     }))
 }
 
+/// Handle /v1/routes/inspect - inspect ranked ORP candidates for a specific assist tag
+pub(crate) async fn handle_routes_inspect(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<RouteInspectQuery>,
+    Extension(state): Extension<Arc<ApiState>>,
+) -> Result<Json<RouteInspectResponse>, StatusCode> {
+    if !state.app.api_allow(addr.ip(), 1.0).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if query.passphrase.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let target_tag = parse_target_tag(&query.target_tag).ok_or(StatusCode::BAD_REQUEST)?;
+    let limit = query.limit.unwrap_or(16).clamp(1, 64);
+    let canonical = ouroboros_crypto::derive::canonicalize_passphrase(&query.passphrase);
+    let space_hash = ouroboros_crypto::hash::blake3_hash(&canonical);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&space_hash[..8]);
+
+    let node = state
+        .app
+        .orp_node()
+        .await
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let cfg = Config::from_env();
+    let route_bias = state.app.orp_space_route_bias(&query.passphrase).await;
+    let candidates = crate::transport::orp::inspect_orp_candidates(
+        node.as_ref(),
+        &cfg,
+        Some(&query.passphrase),
+        Some(target_tag),
+        route_bias.clone(),
+    )
+    .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let candidate_count = candidates.len();
+    let candidates = candidates.into_iter().take(limit).collect();
+
+    Ok(Json(RouteInspectResponse {
+        space_prefix: hex::encode(prefix),
+        target_tag: hex::encode(target_tag),
+        route_bias: route_bias.map(route_bias_label),
+        candidate_count,
+        candidates,
+    }))
+}
+
 /// Handle /v1/routes/status - ORP control-plane diagnostics and high-risk gate status
 pub(crate) async fn handle_routes_status(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -349,6 +507,9 @@ pub(crate) async fn handle_routes_status(
         bridge_nodes_observed,
         keeper_nodes_observed,
         distinct_operator_hints_observed,
+        distinct_region_hints_observed,
+        max_operator_share_observed_pct,
+        valid_three_hop_path_observed,
         route_class_counts,
     ) = if let Some(node) = state.app.orp_node().await {
         let cache = node.route_cache().lock().await;
@@ -370,10 +531,51 @@ pub(crate) async fn handle_routes_status(
         let distinct_operators = cache
             .announcements
             .values()
-            .filter(|ann| !ann.frame.operator_id_hint.trim().is_empty())
+            .filter(|ann| {
+                ann.frame.capabilities.can_relay && !ann.frame.operator_id_hint.trim().is_empty()
+            })
             .map(|ann| ann.frame.operator_id_hint.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .len();
+        let distinct_regions = cache
+            .announcements
+            .values()
+            .filter(|ann| {
+                ann.frame.capabilities.can_relay && !ann.frame.region_hint.trim().is_empty()
+            })
+            .map(|ann| ann.frame.region_hint.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+
+        let mut relay_counts_by_operator = BTreeMap::new();
+        for announcement in cache
+            .announcements
+            .values()
+            .filter(|ann| ann.frame.capabilities.can_relay)
+        {
+            let operator = announcement.frame.operator_id_hint.trim();
+            if !operator.is_empty() {
+                *relay_counts_by_operator
+                    .entry(operator.to_string())
+                    .or_insert(0usize) += 1;
+            }
+        }
+        let max_operator_share_observed_pct = if relay_nodes > 0 {
+            relay_counts_by_operator
+                .values()
+                .max()
+                .map(|count| (((*count as f64) / (relay_nodes as f64)) * 100.0).ceil() as u8)
+        } else {
+            None
+        };
+        let valid_three_hop_path_observed =
+            if relay_nodes >= 3 && distinct_operators >= 3 && distinct_regions >= 3 {
+                Some(true)
+            } else if relay_nodes == 0 {
+                None
+            } else {
+                Some(false)
+            };
 
         let mut class_counts = BTreeMap::new();
         for announcement in cache.announcements.values() {
@@ -386,11 +588,50 @@ pub(crate) async fn handle_routes_status(
             Some(bridge_nodes),
             Some(keeper_nodes),
             distinct_operators,
+            distinct_regions,
+            max_operator_share_observed_pct,
+            valid_three_hop_path_observed,
             class_counts,
         )
     } else {
-        (None, None, None, 0, BTreeMap::new())
+        (None, None, None, 0, 0, None, None, BTreeMap::new())
     };
+
+    let mut gate_reasons = status.high_risk_gate_reasons.clone();
+    gate_reasons
+        .retain(|reason| reason != "relay operator diversity telemetry is not available yet");
+    if relay_nodes_observed.unwrap_or_default() < 64 {
+        gate_reasons.push(format!(
+            "observed relay nodes below hard gate: {} / 64",
+            relay_nodes_observed.unwrap_or_default()
+        ));
+    }
+    if distinct_operator_hints_observed < 16 {
+        gate_reasons.push(format!(
+            "observed relay operators below hard gate: {} / 16",
+            distinct_operator_hints_observed
+        ));
+    }
+    if distinct_region_hints_observed < 6 {
+        gate_reasons.push(format!(
+            "observed relay region buckets below hard gate: {} / 6",
+            distinct_region_hints_observed
+        ));
+    }
+    if let Some(max_share) = max_operator_share_observed_pct {
+        if max_share > 15 {
+            gate_reasons.push(format!(
+                "largest observed relay operator share exceeds hard gate: {}% / 15%",
+                max_share
+            ));
+        }
+    }
+    if matches!(valid_three_hop_path_observed, Some(false)) {
+        gate_reasons.push(
+            "no distinct three-hop relay path observed across operator and region hints"
+                .to_string(),
+        );
+    }
 
     let high_risk = HighRiskGateStatus {
         available: status.high_risk_available,
@@ -398,16 +639,16 @@ pub(crate) async fn handle_routes_status(
         relay_nodes_required: 64,
         relay_nodes_observed,
         operator_identities_required: 16,
-        operator_identities_observed: None,
+        operator_identities_observed: Some(distinct_operator_hints_observed),
         region_buckets_required: 6,
-        region_buckets_observed: None,
+        region_buckets_observed: Some(distinct_region_hints_observed),
         max_operator_share_allowed_pct: 15,
-        max_operator_share_observed_pct: None,
+        max_operator_share_observed_pct,
         requires_distinct_three_hop_path: true,
-        valid_three_hop_path_observed: None,
+        valid_three_hop_path_observed,
         active_participants_required: 1024,
         active_participants_observed: Some(status.route_cache_size.max(status.peer_count)),
-        gate_reasons: status.high_risk_gate_reasons.clone(),
+        gate_reasons,
     };
 
     Ok(Json(RouteStatusResponse {

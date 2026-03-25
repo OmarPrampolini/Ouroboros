@@ -102,6 +102,7 @@ Shared cryptographic building blocks:
 - keeper backfill can restore archived envelopes into local EtherSync storage
 - space join can now attach per-space retention and route-bias policy
 - ORP ranking now factors operator hints, region hints, bundle posture, and per-space route bias
+- ORP candidate inspection now exposes ranked target-specific route decisions and cache-versus-lookup provenance
 
 ## Current truth
 
@@ -122,7 +123,9 @@ What is not claimed yet:
 - `POST /v1/connect`
 - `GET /v1/status`
 - `GET /v1/capabilities`
+- `GET /v1/interop`
 - `GET /v1/routes/discover`
+- `GET /v1/routes/inspect`
 - `GET /v1/routes/status`
 - `GET /v1/keepers/status`
 - `GET /v1/keepers/policies`

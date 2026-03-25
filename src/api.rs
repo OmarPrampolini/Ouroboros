@@ -87,9 +87,14 @@ fn build_router(state: Arc<ApiState>, api_token: Option<String>) -> Router {
         .route("/v1/disconnect", post(session::handle_disconnect))
         .route("/v1/metrics", get(diagnostics::handle_metrics))
         .route("/v1/capabilities", get(diagnostics::handle_capabilities))
+        .route("/v1/interop", get(diagnostics::handle_interop))
         .route(
             "/v1/routes/discover",
             get(diagnostics::handle_routes_discover),
+        )
+        .route(
+            "/v1/routes/inspect",
+            get(diagnostics::handle_routes_inspect),
         )
         .route("/v1/routes/status", get(diagnostics::handle_routes_status))
         .route(

@@ -19,7 +19,9 @@ Key surfaces:
 - `/v1/connect`
 - `/v1/status`
 - `/v1/capabilities`
+- `/v1/interop`
 - `/v1/routes/discover`
+- `/v1/routes/inspect`
 - `/v1/routes/status`
 - `/v1/keepers/status`
 - `/v1/keepers/policies`
@@ -32,6 +34,7 @@ Behavioral expectations:
 - joining a space may seed peer knowledge from federated discovery before replay
 - keeper status must distinguish pending replication from archived replicated envelopes
 - joining a space may carry per-space retention and route-bias policy without changing the underlying passphrase scope
+- route inspection must expose target-scoped ORP ranking inputs without inventing route semantics that the runtime does not actually use
 
 ## CipherPacket and Session Compatibility
 
