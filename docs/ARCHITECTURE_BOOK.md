@@ -214,6 +214,8 @@ Current truth:
 - local replay exists
 - a local keeper replica archive exists as a managed-retention scaffold
 - backfill can restore archived encrypted envelopes into local replay storage
+- retention and route bias can now be expressed per joined space
+- ORP-Standard ranking now reacts to operator posture, bundle posture, and region diversity hints
 - multi-node keeper-backed retention is not active yet
 
 This distinction must remain explicit in product language and in API surfaces.

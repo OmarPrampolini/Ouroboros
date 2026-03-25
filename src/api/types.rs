@@ -179,6 +179,9 @@ pub(crate) struct EtherSyncPeerAddRequest {
 pub(crate) struct EtherSyncJoinRequest {
     pub passphrase: String,
     pub label: Option<String>,
+    pub retention_tier: Option<String>,
+    pub replication_factor: Option<usize>,
+    pub route_bias: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

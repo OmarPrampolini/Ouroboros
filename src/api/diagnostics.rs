@@ -115,6 +115,9 @@ pub(crate) struct RouteStatusResponse {
     pub bridge_nodes_observed: Option<usize>,
     pub keeper_nodes_observed: Option<usize>,
     pub distinct_operator_hints_observed: usize,
+    pub managed_space_count: usize,
+    pub bridge_preferred_space_count: usize,
+    pub keeper_preferred_space_count: usize,
     pub high_risk: HighRiskGateStatus,
 }
 
@@ -128,6 +131,9 @@ pub(crate) struct KeeperStatusResponse {
     pub keeper_space_count: usize,
     pub archived_keeper_envelopes: usize,
     pub keeper_archive_space_count: usize,
+    pub managed_space_count: usize,
+    pub bridge_preferred_space_count: usize,
+    pub keeper_preferred_space_count: usize,
     pub operator_model: String,
     pub operator_enrollment: String,
     pub monetization_model: String,
@@ -424,6 +430,9 @@ pub(crate) async fn handle_routes_status(
         bridge_nodes_observed,
         keeper_nodes_observed,
         distinct_operator_hints_observed,
+        managed_space_count: status.managed_space_count,
+        bridge_preferred_space_count: status.bridge_preferred_space_count,
+        keeper_preferred_space_count: status.keeper_preferred_space_count,
         high_risk,
     }))
 }
@@ -451,6 +460,9 @@ pub(crate) async fn handle_keepers_status(
         keeper_space_count: status.keeper_space_count,
         archived_keeper_envelopes: status.archived_keeper_envelopes,
         keeper_archive_space_count: status.keeper_archive_space_count,
+        managed_space_count: status.managed_space_count,
+        bridge_preferred_space_count: status.bridge_preferred_space_count,
+        keeper_preferred_space_count: status.keeper_preferred_space_count,
         operator_model: "managed-plus-open".to_string(),
         operator_enrollment: "first-party and partner-operated; third-party enrollment not open yet"
             .to_string(),
@@ -472,6 +484,7 @@ pub(crate) async fn handle_keepers_status(
         notes: vec![
             "Current runtime can stage encrypted envelopes and flush them into a keeper replica archive"
                 .to_string(),
+            "Retention and route posture can now be tuned per space at join time".to_string(),
             "Bootstrap remains hybrid: static discovery peers, assist relays, and future bridge bundles"
                 .to_string(),
             "Keeper backfill currently restores archived encrypted envelopes into local replay storage"

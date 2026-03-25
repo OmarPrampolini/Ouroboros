@@ -393,6 +393,22 @@ impl RouteCache {
             .max_by_key(|a| score_announcement(a, current_slot))
     }
 
+    /// Find the freshest announcement for a given responder within a space.
+    pub fn announcement_for_node(
+        &self,
+        space_prefix: &[u8; 8],
+        responder_id: &[u8; 16],
+        current_slot: u64,
+    ) -> Option<&CachedAnnouncement> {
+        let min_slot = current_slot.saturating_sub(ANNOUNCE_SLOT_LOOKBACK);
+        self.announcements
+            .iter()
+            .filter(|(k, _)| k.space_prefix == *space_prefix && k.slot >= min_slot)
+            .map(|(_, v)| v)
+            .filter(|a| &a.frame.node_id == responder_id)
+            .max_by_key(|a| score_announcement(a, current_slot))
+    }
+
     /// Return the best scored offer for a lookup id (highest score wins).
     pub fn best_offer(&self, lookup_id: &[u8; 16], current_slot: u64) -> Option<&CachedOffer> {
         self.offers

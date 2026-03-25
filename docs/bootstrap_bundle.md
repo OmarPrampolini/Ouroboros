@@ -28,6 +28,7 @@ At this stage the bundle is used for:
 - EtherSync bootstrap peer seeding at runtime start
 - federated route discovery together with ORP and static bootstrap peers
 - space-join seeding before replay and ORP activity
+- ORP candidate ranking bias for known relay, bridge, and keeper posture
 - operator-facing bootstrap inventory that can later be signed and mirrored
 
 It is not yet used as a full routing authority or as a mandatory global directory.

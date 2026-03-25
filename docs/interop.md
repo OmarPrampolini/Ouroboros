@@ -30,6 +30,7 @@ Behavioral expectations:
 - EtherSync startup may enrich bootstrap peers from configured discovery peers, bridge hints, and bootstrap bundles
 - joining a space may seed peer knowledge from federated discovery before replay
 - keeper status must distinguish pending replication from archived replicated envelopes
+- joining a space may carry per-space retention and route-bias policy without changing the underlying passphrase scope
 
 ## CipherPacket and Session Compatibility
 

@@ -158,11 +158,55 @@ pub struct EtherSyncStatus {
     pub archived_keeper_envelopes: usize,
     /// Number of spaces currently represented in the keeper replica archive.
     pub keeper_archive_space_count: usize,
+    /// Number of spaces whose policy enables managed keeper replication.
+    pub managed_space_count: usize,
+    /// Number of spaces whose route bias prefers bridge-capable paths.
+    pub bridge_preferred_space_count: usize,
+    /// Number of spaces whose route bias prefers keeper-capable paths.
+    pub keeper_preferred_space_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EtherSyncJoinResult {
     pub space_id: String,
+    pub retention_tier: String,
+    pub replication_factor: usize,
+    pub route_bias: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SpaceRouteBias {
+    Balanced,
+    BridgePreferred,
+    KeeperPreferred,
+    DirectPreferred,
+}
+
+impl SpaceRouteBias {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::BridgePreferred => "bridge-preferred",
+            Self::KeeperPreferred => "keeper-preferred",
+            Self::DirectPreferred => "direct-preferred",
+        }
+    }
+
+    fn from_optional(raw: Option<&str>) -> Self {
+        match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "bridge" | "bridge-preferred" => Self::BridgePreferred,
+            "keeper" | "keeper-preferred" => Self::KeeperPreferred,
+            "direct" | "direct-preferred" => Self::DirectPreferred,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EtherSpacePolicy {
+    retention_tier: String,
+    replication_factor: usize,
+    route_bias: SpaceRouteBias,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -232,6 +276,7 @@ struct EtherSyncRuntime {
     bootstrap_bundle: BootstrapBundleSummary,
     keeper_envelopes: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
     keeper_archive: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    space_policies: Arc<Mutex<HashMap<String, EtherSpacePolicy>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +433,20 @@ impl AppState {
         }
     }
 
+    pub async fn orp_space_route_bias(&self, passphrase: &str) -> Option<SpaceRouteBias> {
+        let policies = {
+            let inner = self.inner.lock().await;
+            let rt = inner.ethersync.as_ref()?;
+            rt.space_policies.clone()
+        };
+        let space_key = derive_space_key(passphrase);
+        policies
+            .lock()
+            .await
+            .get(&space_key)
+            .map(|policy| policy.route_bias.clone())
+    }
+
     pub async fn set_stop_tx(&self, tx: tokio::sync::watch::Sender<bool>) {
         let mut inner = self.inner.lock().await;
         inner.stop_tx = Some(tx);
@@ -529,6 +588,7 @@ impl AppState {
         let (events_tx, _) = broadcast::channel(512);
         let keeper_envelopes = Arc::new(Mutex::new(HashMap::new()));
         let keeper_archive = Arc::new(Mutex::new(HashMap::new()));
+        let space_policies = Arc::new(Mutex::new(HashMap::new()));
         let keeper_replication_task = if runtime_cfg.keeper_replication_enabled {
             Some(spawn_keeper_replication_task(
                 shutdown_tx.subscribe(),
@@ -575,6 +635,7 @@ impl AppState {
             bootstrap_bundle,
             keeper_envelopes,
             keeper_archive,
+            space_policies,
         };
 
         let mut inner = self.inner.lock().await;
@@ -643,6 +704,7 @@ impl AppState {
             bootstrap_bundle,
             keeper_envelopes,
             keeper_archive,
+            space_policies,
         ) = {
             let inner = self.inner.lock().await;
             match inner.ethersync.as_ref() {
@@ -661,6 +723,7 @@ impl AppState {
                     rt.bootstrap_bundle.clone(),
                     Some(rt.keeper_envelopes.clone()),
                     Some(rt.keeper_archive.clone()),
+                    Some(rt.space_policies.clone()),
                 ),
                 None => (
                     None,
@@ -675,6 +738,7 @@ impl AppState {
                     "local-node".to_string(),
                     "unknown".to_string(),
                     BootstrapBundleSummary::default(),
+                    None,
                     None,
                     None,
                 ),
@@ -709,6 +773,25 @@ impl AppState {
                 (archived, spaces)
             } else {
                 (0, 0)
+            };
+        let (managed_space_count, bridge_preferred_space_count, keeper_preferred_space_count) =
+            if let Some(space_policies) = space_policies {
+                let guard = space_policies.lock().await;
+                let managed = guard
+                    .values()
+                    .filter(|policy| policy.replication_factor > 0)
+                    .count();
+                let bridge = guard
+                    .values()
+                    .filter(|policy| matches!(policy.route_bias, SpaceRouteBias::BridgePreferred))
+                    .count();
+                let keeper = guard
+                    .values()
+                    .filter(|policy| matches!(policy.route_bias, SpaceRouteBias::KeeperPreferred))
+                    .count();
+                (managed, bridge, keeper)
+            } else {
+                (0, 0, 0)
             };
 
         // Collect ORP diagnostics from the route cache.
@@ -761,6 +844,9 @@ impl AppState {
             keeper_space_count,
             archived_keeper_envelopes,
             keeper_archive_space_count,
+            managed_space_count,
+            bridge_preferred_space_count,
+            keeper_preferred_space_count,
         })
     }
 
@@ -793,13 +879,32 @@ impl AppState {
         &self,
         passphrase: String,
         label: Option<String>,
+        retention_tier: Option<String>,
+        replication_factor: Option<usize>,
+        route_bias: Option<String>,
     ) -> anyhow::Result<EtherSyncJoinResult> {
         if passphrase.trim().is_empty() {
             return Err(anyhow::anyhow!("passphrase required"));
         }
         let space_id = derive_space_id(&passphrase, label.as_deref());
+        let space_key = derive_space_key(&passphrase);
+        let has_explicit_policy =
+            retention_tier.is_some() || replication_factor.is_some() || route_bias.is_some();
+        let requested_policy = build_space_policy(
+            retention_tier.as_deref(),
+            replication_factor,
+            route_bias.as_deref(),
+        );
 
-        let (node, events_tx, already_subscribed, orp_enabled, keeper_envelopes, keeper_archive) = {
+        let (
+            node,
+            events_tx,
+            already_subscribed,
+            orp_enabled,
+            keeper_envelopes,
+            keeper_archive,
+            space_policies,
+        ) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
                 return Err(anyhow::anyhow!("ethersync is not running"));
@@ -811,23 +916,36 @@ impl AppState {
                 rt.enable_orp,
                 rt.keeper_envelopes.clone(),
                 rt.keeper_archive.clone(),
+                rt.space_policies.clone(),
             )
         };
+        let applied_policy = upsert_space_policy(
+            &space_policies,
+            &space_key,
+            requested_policy.clone(),
+            has_explicit_policy,
+        )
+        .await;
 
         let discovery_report =
             seed_space_from_discovery(&node, &events_tx, &passphrase, &space_id, orp_enabled).await;
 
         if already_subscribed {
             let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
-            emit_keeper_pending_hint(&events_tx, &keeper_envelopes, &space_id).await;
-            emit_keeper_archive_hint(&events_tx, &keeper_archive, &space_id).await;
+            emit_keeper_pending_hint(&events_tx, &keeper_envelopes, &space_key, &space_id).await;
+            emit_keeper_archive_hint(&events_tx, &keeper_archive, &space_key, &space_id).await;
             tracing::info!(
                 "ethersync join replayed {} message(s) for existing subscription {} (discovered {} endpoint(s))",
                 replayed,
                 space_id,
                 discovery_report.discovered
             );
-            return Ok(EtherSyncJoinResult { space_id });
+            return Ok(EtherSyncJoinResult {
+                space_id,
+                retention_tier: applied_policy.retention_tier,
+                replication_factor: applied_policy.replication_factor,
+                route_bias: applied_policy.route_bias.as_str().to_string(),
+            });
         }
 
         let mut rx = node
@@ -953,8 +1071,8 @@ impl AppState {
 
         if inserted {
             let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
-            emit_keeper_pending_hint(&events_tx, &keeper_envelopes, &space_id).await;
-            emit_keeper_archive_hint(&events_tx, &keeper_archive, &space_id).await;
+            emit_keeper_pending_hint(&events_tx, &keeper_envelopes, &space_key, &space_id).await;
+            emit_keeper_archive_hint(&events_tx, &keeper_archive, &space_key, &space_id).await;
             tracing::info!(
                 "ethersync join replayed {} message(s) for new subscription {} (discovered {} endpoint(s))",
                 replayed,
@@ -963,7 +1081,12 @@ impl AppState {
             );
         }
 
-        Ok(EtherSyncJoinResult { space_id })
+        Ok(EtherSyncJoinResult {
+            space_id,
+            retention_tier: applied_policy.retention_tier,
+            replication_factor: applied_policy.replication_factor,
+            route_bias: applied_policy.route_bias.as_str().to_string(),
+        })
     }
 
     pub async fn ethersync_publish(
@@ -977,8 +1100,8 @@ impl AppState {
         if payload.is_empty() {
             return Err(anyhow::anyhow!("payload is empty"));
         }
-        let space_id = derive_space_id(&passphrase, None);
-        let (node, events_tx, keeper_enabled, keeper_envelopes) = {
+        let space_id = derive_space_key(&passphrase);
+        let (node, events_tx, keeper_enabled_runtime, keeper_envelopes, space_policies) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
                 return Err(anyhow::anyhow!("ethersync is not running"));
@@ -988,8 +1111,17 @@ impl AppState {
                 rt.events_tx.clone(),
                 rt.keeper_replication_enabled,
                 rt.keeper_envelopes.clone(),
+                rt.space_policies.clone(),
             )
         };
+        let space_policy = space_policies
+            .lock()
+            .await
+            .get(&space_id)
+            .cloned()
+            .unwrap_or_else(default_space_policy);
+        let keeper_enabled =
+            keeper_enabled_runtime && policy_enables_keeper_replication(&space_policy);
 
         let message = node
             .publish(&passphrase, &payload)
@@ -1063,9 +1195,9 @@ impl AppState {
             .clamp(ETHERSYNC_FILE_CHUNK_MIN, ETHERSYNC_FILE_CHUNK_MAX);
         let total_chunks = file_bytes.len().div_ceil(chunk_size);
         let transfer_id = derive_transfer_id(&clean_filename, file_bytes.len(), now_ms());
-        let space_id = derive_space_id(&passphrase, None);
+        let space_id = derive_space_key(&passphrase);
 
-        let (node, events_tx, keeper_enabled, keeper_envelopes) = {
+        let (node, events_tx, keeper_enabled_runtime, keeper_envelopes, space_policies) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
                 return Err(anyhow::anyhow!("ethersync is not running"));
@@ -1075,8 +1207,17 @@ impl AppState {
                 rt.events_tx.clone(),
                 rt.keeper_replication_enabled,
                 rt.keeper_envelopes.clone(),
+                rt.space_policies.clone(),
             )
         };
+        let space_policy = space_policies
+            .lock()
+            .await
+            .get(&space_id)
+            .cloned()
+            .unwrap_or_else(default_space_policy);
+        let keeper_enabled =
+            keeper_enabled_runtime && policy_enables_keeper_replication(&space_policy);
 
         emit_ethersync_event(
             &events_tx,
@@ -1190,7 +1331,7 @@ impl AppState {
         if passphrase.trim().is_empty() {
             return Err(anyhow::anyhow!("passphrase required"));
         }
-        let space_id = derive_space_id(&passphrase, None);
+        let space_id = derive_space_key(&passphrase);
         let (node, events_tx, keeper_envelopes, keeper_archive) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
@@ -1665,11 +1806,12 @@ async fn flush_keeper_pending_envelopes(
 async fn emit_keeper_pending_hint(
     events_tx: &broadcast::Sender<String>,
     keeper_envelopes: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
-    space_id: &str,
+    space_key: &str,
+    event_space_id: &str,
 ) {
     let pending = {
         let guard = keeper_envelopes.lock().await;
-        guard.get(space_id).map(|items| items.len()).unwrap_or(0)
+        guard.get(space_key).map(|items| items.len()).unwrap_or(0)
     };
 
     if pending == 0 {
@@ -1681,7 +1823,7 @@ async fn emit_keeper_pending_hint(
         EtherSyncEvent {
             kind: "space_keeper_backfill_available".to_string(),
             ts_ms: now_ms(),
-            space_id: Some(space_id.to_string()),
+            space_id: Some(event_space_id.to_string()),
             slot_id: None,
             payload_b64: None,
             text: None,
@@ -1697,11 +1839,12 @@ async fn emit_keeper_pending_hint(
 async fn emit_keeper_archive_hint(
     events_tx: &broadcast::Sender<String>,
     keeper_archive: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
-    space_id: &str,
+    space_key: &str,
+    event_space_id: &str,
 ) {
     let archived = {
         let guard = keeper_archive.lock().await;
-        guard.get(space_id).map(|items| items.len()).unwrap_or(0)
+        guard.get(space_key).map(|items| items.len()).unwrap_or(0)
     };
 
     if archived == 0 {
@@ -1713,7 +1856,7 @@ async fn emit_keeper_archive_hint(
         EtherSyncEvent {
             kind: "space_keeper_archive_available".to_string(),
             ts_ms: now_ms(),
-            space_id: Some(space_id.to_string()),
+            space_id: Some(event_space_id.to_string()),
             slot_id: None,
             payload_b64: None,
             text: None,
@@ -1733,15 +1876,21 @@ fn emit_ethersync_event(events_tx: &broadcast::Sender<String>, event: EtherSyncE
 }
 
 fn derive_space_id(passphrase: &str, label: Option<&str>) -> String {
-    let canonical = canonicalize_passphrase(passphrase);
-    let hash = blake3_hash(&canonical);
-    let prefix = hex::encode(&hash[..8]);
+    let base = derive_space_key(passphrase);
+    let prefix = base.trim_start_matches("space-");
     if let Some(raw) = label {
         let clean = raw.trim();
         if !clean.is_empty() {
             return format!("{}:{}", clean, prefix);
         }
     }
+    base
+}
+
+fn derive_space_key(passphrase: &str) -> String {
+    let canonical = canonicalize_passphrase(passphrase);
+    let hash = blake3_hash(&canonical);
+    let prefix = hex::encode(&hash[..8]);
     format!("space-{}", prefix)
 }
 
@@ -1773,6 +1922,81 @@ async fn enqueue_keeper_envelope(
     let entry = guard.entry(space_id.to_string()).or_default();
     entry.push(KeeperEnvelopeRecord { slot_id, message });
     entry.len()
+}
+
+fn default_space_policy() -> EtherSpacePolicy {
+    let runtime_cfg = crate::config::Config::from_env();
+    EtherSpacePolicy {
+        retention_tier: runtime_cfg.retention_tier,
+        replication_factor: runtime_cfg.keeper_replication_factor,
+        route_bias: if runtime_cfg.operator_bridge_capable
+            && !runtime_cfg.bridge_bootstrap_hints.is_empty()
+        {
+            SpaceRouteBias::BridgePreferred
+        } else if runtime_cfg.keeper_replication_enabled
+            && runtime_cfg.keeper_replication_factor > 0
+        {
+            SpaceRouteBias::KeeperPreferred
+        } else {
+            SpaceRouteBias::Balanced
+        },
+    }
+}
+
+fn build_space_policy(
+    retention_tier: Option<&str>,
+    replication_factor: Option<usize>,
+    route_bias: Option<&str>,
+) -> EtherSpacePolicy {
+    let mut policy = default_space_policy();
+
+    if let Some(retention_tier) = retention_tier {
+        let clean = retention_tier.trim();
+        if !clean.is_empty() {
+            policy.retention_tier = clean.to_string();
+        }
+    }
+
+    if let Some(replication_factor) = replication_factor {
+        policy.replication_factor = replication_factor.min(16);
+    }
+
+    if route_bias.is_some() {
+        policy.route_bias = SpaceRouteBias::from_optional(route_bias);
+    }
+
+    if policy.retention_tier.eq_ignore_ascii_case("local-only") {
+        policy.replication_factor = 0;
+        if matches!(policy.route_bias, SpaceRouteBias::KeeperPreferred) {
+            policy.route_bias = SpaceRouteBias::Balanced;
+        }
+    } else if policy.replication_factor == 0
+        && !policy.retention_tier.eq_ignore_ascii_case("local-only")
+    {
+        policy.replication_factor = 1;
+    }
+
+    policy
+}
+
+async fn upsert_space_policy(
+    policies: &Arc<Mutex<HashMap<String, EtherSpacePolicy>>>,
+    space_id: &str,
+    requested: EtherSpacePolicy,
+    overwrite_existing: bool,
+) -> EtherSpacePolicy {
+    let mut guard = policies.lock().await;
+    if !overwrite_existing {
+        if let Some(existing) = guard.get(space_id) {
+            return existing.clone();
+        }
+    }
+    guard.insert(space_id.to_string(), requested.clone());
+    requested
+}
+
+fn policy_enables_keeper_replication(policy: &EtherSpacePolicy) -> bool {
+    policy.replication_factor > 0 && !policy.retention_tier.eq_ignore_ascii_case("local-only")
 }
 
 fn default_high_risk_gate_reasons(
@@ -1840,6 +2064,9 @@ fn default_ethersync_status() -> EtherSyncStatus {
         keeper_space_count: 0,
         archived_keeper_envelopes: 0,
         keeper_archive_space_count: 0,
+        managed_space_count: 0,
+        bridge_preferred_space_count: 0,
+        keeper_preferred_space_count: 0,
     }
 }
 

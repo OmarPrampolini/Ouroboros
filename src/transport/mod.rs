@@ -158,7 +158,7 @@ impl Connection {
 ///
 /// Convenience wrapper over [`establish_connection_with_orp`] with no ORP node.
 pub async fn establish_connection(p: &RendezvousParams, cfg: &Config) -> Result<Connection> {
-    establish_connection_with_orp(p, cfg, None, None, None).await
+    establish_connection_with_orp(p, cfg, None, None, None, None).await
 }
 
 /// Establish connection with optional ORP fallback inserted between Relay and Tor.
@@ -172,6 +172,7 @@ pub async fn establish_connection_with_orp(
     orp_node: Option<&EtherNode>,
     orp_passphrase: Option<&str>,
     orp_target_tag: Option<[u8; 8]>,
+    route_bias: Option<crate::state::SpaceRouteBias>,
 ) -> Result<Connection> {
     // NAT strategy selection (uses cached detection when available).
     // NOTE: Requires STUN servers configured via config.nat_detection_servers.
@@ -358,7 +359,15 @@ pub async fn establish_connection_with_orp(
                 // ORP: deterministic overlay route — tried before Tor.
                 if cfg.enable_orp {
                     if let Some(node) = orp_node {
-                        match orp::try_orp_route(node, p, cfg, orp_passphrase, orp_target_tag).await
+                        match orp::try_orp_route(
+                            node,
+                            p,
+                            cfg,
+                            orp_passphrase,
+                            orp_target_tag,
+                            route_bias.clone(),
+                        )
+                        .await
                         {
                             Ok(conn) => {
                                 tracing::info!("ORP: route established, skipping Tor");

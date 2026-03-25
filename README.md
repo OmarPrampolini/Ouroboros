@@ -187,6 +187,8 @@ Strong today:
 - bootstrap bundle and static discovery peers now seed EtherSync bootstrap state and space joins
 - federated discovery from ORP, bootstrap bundle, and static bootstrap peers
 - first keeper flow: publish enqueues encrypted keeper envelopes, a local replication task flushes them into a keeper replica archive, and backfill restores archived envelopes into local EtherSync storage
+- join-time space policy can now set retention tier, replication factor, and route bias per space
+- ORP candidate ranking now uses operator hints, region diversity, bootstrap bundle posture, and per-space route bias
 
 Explicitly not claimed yet:
 
@@ -223,6 +225,20 @@ The API now exposes:
 - operator hints, route class counts, and bootstrap bundle visibility
 - federated discovery candidates resolved from ORP, bundle, and config bootstrap
 - pending-versus-archived keeper state plus a concrete backfill control path for managed-retention experimentation
+- managed-space counts and route-bias posture across joined spaces
+
+`POST /v1/ethersync/spaces/join` now accepts optional per-space policy hints:
+
+- `retention_tier`
+- `replication_factor`
+- `route_bias`
+
+Supported `route_bias` values:
+
+- `balanced`
+- `bridge-preferred`
+- `keeper-preferred`
+- `direct-preferred`
 
 ## Wire and Interop Posture
 

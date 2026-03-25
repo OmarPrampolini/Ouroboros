@@ -121,7 +121,13 @@ pub(crate) async fn handle_join_space(
     }
     match state
         .app
-        .ethersync_join_space(req.passphrase, req.label)
+        .ethersync_join_space(
+            req.passphrase,
+            req.label,
+            req.retention_tier,
+            req.replication_factor,
+            req.route_bias,
+        )
         .await
     {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),

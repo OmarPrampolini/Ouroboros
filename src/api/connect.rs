@@ -720,6 +720,7 @@ pub(crate) async fn handle_connect(
         let orp_target_tag = parse_orp_target_tag(&target);
         let conn = if let Some(target_tag) = orp_target_tag {
             let orp_node = app.orp_node().await;
+            let orp_route_bias = app.orp_space_route_bias(passphrase.expose_secret()).await;
             let Some(orp_node) = orp_node else {
                 return Err(connect_err(
                     StatusCode::BAD_REQUEST,
@@ -743,6 +744,7 @@ pub(crate) async fn handle_connect(
                             Some(orp_ref.as_ref()),
                             Some(orp_passphrase.as_str()),
                             Some(target_tag),
+                            orp_route_bias.clone(),
                         )
                         .await
                     }
@@ -894,6 +896,7 @@ pub(crate) async fn handle_connect(
 
     // Get ORP node if enabled, for use in the transport fallback chain.
     let orp_node = app.orp_node().await;
+    let orp_route_bias = app.orp_space_route_bias(passphrase.expose_secret()).await;
 
     match run_with_retry_budget(
         "establish_connection",
@@ -911,6 +914,7 @@ pub(crate) async fn handle_connect(
                     orp_ref.as_deref(),
                     Some(orp_passphrase.as_str()),
                     None,
+                    orp_route_bias.clone(),
                 )
                 .await
             }

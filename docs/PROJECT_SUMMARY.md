@@ -100,6 +100,8 @@ Shared cryptographic building blocks:
 - federated route discovery can combine ORP, bundle, and static bootstrap peers
 - keeper replication can flush encrypted envelopes into a local replica archive
 - keeper backfill can restore archived envelopes into local EtherSync storage
+- space join can now attach per-space retention and route-bias policy
+- ORP ranking now factors operator hints, region hints, bundle posture, and per-space route bias
 
 ## Current truth
 
