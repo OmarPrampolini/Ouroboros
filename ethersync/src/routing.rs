@@ -727,20 +727,20 @@ pub fn score_announcement(announcement: &CachedAnnouncement, current_slot: u64) 
         .saturating_mul(750) as u16;
     let freshness_penalty = (announcement.last_seen.elapsed().as_secs().min(30) * 25) as u16;
 
-    let class_bonus = match announcement.frame.route_class {
+    let class_bonus: u16 = match announcement.frame.route_class {
         RouteClass::Direct => 5000,
         RouteClass::Assisted => 3800,
         RouteClass::Bridge => 3200,
         RouteClass::Keeper => 2200,
     };
 
-    let capability_bonus = (announcement.frame.capabilities.can_relay as u16) * 400
+    let capability_bonus: u16 = (announcement.frame.capabilities.can_relay as u16) * 400
         + (announcement.frame.capabilities.wan_assist as u16) * 250
         + (announcement.frame.capabilities.bridge_capable as u16) * 250
         + (announcement.frame.capabilities.keeper_capable as u16) * 150
         + (announcement.frame.capabilities.tor_capable as u16) * 50;
 
-    let rtt_bonus = announcement
+    let rtt_bonus: u16 = announcement
         .frame
         .measured_rtt_ms
         .map(|rtt| 1000u16.saturating_sub(rtt.min(1000)))
