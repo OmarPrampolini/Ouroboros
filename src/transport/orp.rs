@@ -261,48 +261,24 @@ fn score_with_bias(
     }
 }
 
-fn push_candidate(
-    out: &mut HashMap<SocketAddr, RouteCandidate>,
-    addr: SocketAddr,
-    score: u16,
-    source: String,
-    space_prefix: [u8; 8],
-    route_class: Option<String>,
-    operator_id_hint: String,
-    region_hint: String,
-    via_lookup: bool,
-    preference_bucket: String,
-    ranking_hints: Vec<String>,
-) {
-    match out.get_mut(&addr) {
-        Some(existing) if existing.score >= score => {}
+fn push_candidate(out: &mut HashMap<SocketAddr, RouteCandidate>, candidate: RouteCandidate) {
+    let candidate_addr = candidate.addr;
+    let candidate_score = candidate.score;
+    match out.get_mut(&candidate_addr) {
+        Some(existing) if existing.score >= candidate_score => {}
         Some(existing) => {
-            existing.score = score;
-            existing.source = source;
-            existing.space_prefix = space_prefix;
-            existing.route_class = route_class;
-            existing.operator_id_hint = operator_id_hint;
-            existing.region_hint = region_hint;
-            existing.via_lookup = via_lookup;
-            existing.preference_bucket = preference_bucket;
-            existing.ranking_hints = ranking_hints;
+            existing.score = candidate.score;
+            existing.source = candidate.source;
+            existing.space_prefix = candidate.space_prefix;
+            existing.route_class = candidate.route_class;
+            existing.operator_id_hint = candidate.operator_id_hint;
+            existing.region_hint = candidate.region_hint;
+            existing.via_lookup = candidate.via_lookup;
+            existing.preference_bucket = candidate.preference_bucket;
+            existing.ranking_hints = candidate.ranking_hints;
         }
         None => {
-            out.insert(
-                addr,
-                RouteCandidate {
-                    addr,
-                    score,
-                    source,
-                    space_prefix,
-                    route_class,
-                    operator_id_hint,
-                    region_hint,
-                    via_lookup,
-                    preference_bucket,
-                    ranking_hints,
-                },
-            );
+            out.insert(candidate_addr, candidate);
         }
     }
 }
@@ -414,23 +390,25 @@ async fn resolve_orp_candidates(
                     );
                     push_candidate(
                         &mut candidates,
-                        *addr,
-                        posture.score,
-                        format!(
-                            "space={} class={:?} operator={} region={} bucket={}",
-                            hex::encode(space_prefix),
-                            announcement.frame.route_class,
-                            announcement.frame.operator_id_hint,
-                            announcement.frame.region_hint,
-                            posture.preference_bucket
-                        ),
-                        *space_prefix,
-                        Some(route_class_label(announcement.frame.route_class)),
-                        announcement.frame.operator_id_hint.clone(),
-                        announcement.frame.region_hint.clone(),
-                        false,
-                        posture.preference_bucket,
-                        posture.ranking_hints,
+                        RouteCandidate {
+                            addr: *addr,
+                            score: posture.score,
+                            source: format!(
+                                "space={} class={:?} operator={} region={} bucket={}",
+                                hex::encode(space_prefix),
+                                announcement.frame.route_class,
+                                announcement.frame.operator_id_hint,
+                                announcement.frame.region_hint,
+                                posture.preference_bucket
+                            ),
+                            space_prefix: *space_prefix,
+                            route_class: Some(route_class_label(announcement.frame.route_class)),
+                            operator_id_hint: announcement.frame.operator_id_hint.clone(),
+                            region_hint: announcement.frame.region_hint.clone(),
+                            via_lookup: false,
+                            preference_bucket: posture.preference_bucket,
+                            ranking_hints: posture.ranking_hints,
+                        },
                     );
                 }
             }
@@ -521,16 +499,18 @@ async fn resolve_orp_candidates(
                         };
                         push_candidate(
                             &mut candidates,
-                            addr,
-                            score,
-                            source,
-                            space_prefix,
-                            route_class,
-                            operator_id_hint,
-                            region_hint,
-                            true,
-                            preference_bucket,
-                            ranking_hints,
+                            RouteCandidate {
+                                addr,
+                                score,
+                                source,
+                                space_prefix,
+                                route_class,
+                                operator_id_hint,
+                                region_hint,
+                                via_lookup: true,
+                                preference_bucket,
+                                ranking_hints,
+                            },
                         );
                     }
                 }

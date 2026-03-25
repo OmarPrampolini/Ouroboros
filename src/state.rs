@@ -2322,7 +2322,7 @@ async fn flush_keeper_pending_envelopes(
                 let spaces = guard.keys().cloned().collect::<Vec<_>>();
                 for space_id in spaces {
                     let drained_records = if let Some(entry) = guard.get_mut(&space_id) {
-                        entry.drain(..).collect::<Vec<_>>()
+                        std::mem::take(entry)
                     } else {
                         Vec::new()
                     };
