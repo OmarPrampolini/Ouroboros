@@ -503,11 +503,13 @@ impl AppState {
             rt.space_policies.clone()
         };
         let space_key = derive_space_key(passphrase);
-        policies
-            .lock()
-            .await
-            .get(&space_key)
-            .map(|policy| policy.route_bias.clone())
+        let route_bias = {
+            let guard = policies.lock().await;
+            guard
+                .get(&space_key)
+                .map(|policy| policy.route_bias.clone())
+        };
+        route_bias
     }
 
     pub async fn set_stop_tx(&self, tx: tokio::sync::watch::Sender<bool>) {
@@ -834,7 +836,7 @@ impl AppState {
             bridge_hint_count,
         );
         let (pending_keeper_envelopes, keeper_space_count) =
-            if let Some(keeper_envelopes) = keeper_envelopes {
+            if let Some(keeper_envelopes) = keeper_envelopes.as_ref() {
                 let guard = keeper_envelopes.lock().await;
                 let pending = guard.values().map(|items| items.len()).sum();
                 let spaces = guard.values().filter(|items| !items.is_empty()).count();
@@ -843,7 +845,7 @@ impl AppState {
                 (0, 0)
             };
         let (archived_keeper_envelopes, keeper_archive_space_count) =
-            if let Some(keeper_archive) = keeper_archive {
+            if let Some(keeper_archive) = keeper_archive.as_ref() {
                 let guard = keeper_archive.lock().await;
                 let archived = guard.values().map(|items| items.len()).sum();
                 let spaces = guard.values().filter(|items| !items.is_empty()).count();
@@ -860,20 +862,20 @@ impl AppState {
             managed_ready_space_count,
         ) = if let Some(space_policies) = space_policies {
             let guard = space_policies.lock().await;
-            let pending_guard = keeper_envelopes.as_ref().map(|items| items.clone());
-            let pending_guard = if let Some(items) = pending_guard {
+            let pending_items = keeper_envelopes.as_ref().cloned();
+            let pending_guard = if let Some(items) = pending_items.as_ref() {
                 Some(items.lock().await)
             } else {
                 None
             };
-            let archived_guard = keeper_archive.as_ref().map(|items| items.clone());
-            let archived_guard = if let Some(items) = archived_guard {
+            let archived_items = keeper_archive.as_ref().cloned();
+            let archived_guard = if let Some(items) = archived_items.as_ref() {
                 Some(items.lock().await)
             } else {
                 None
             };
-            let activity_guard = keeper_last_activity.as_ref().map(|items| items.clone());
-            let activity_guard = if let Some(items) = activity_guard {
+            let activity_items = keeper_last_activity.as_ref().cloned();
+            let activity_guard = if let Some(items) = activity_items.as_ref() {
                 Some(items.lock().await)
             } else {
                 None

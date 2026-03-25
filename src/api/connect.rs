@@ -831,6 +831,7 @@ pub(crate) async fn handle_connect(
                     let c = cfg.clone();
                     let orp_ref = orp_node.clone();
                     let orp_passphrase = passphrase.expose_secret().to_string();
+                    let route_bias = orp_route_bias.clone();
                     async move {
                         transport::establish_connection_with_orp(
                             &p,
@@ -838,7 +839,7 @@ pub(crate) async fn handle_connect(
                             Some(orp_ref.as_ref()),
                             Some(orp_passphrase.as_str()),
                             Some(target_tag),
-                            orp_route_bias.clone(),
+                            route_bias,
                         )
                         .await
                     }
@@ -1001,6 +1002,7 @@ pub(crate) async fn handle_connect(
             let c = cfg.clone();
             let orp_ref = orp_node.clone();
             let orp_passphrase = passphrase.expose_secret().to_string();
+            let route_bias = orp_route_bias.clone();
             async move {
                 transport::establish_connection_with_orp(
                     &p,
@@ -1008,7 +1010,7 @@ pub(crate) async fn handle_connect(
                     orp_ref.as_deref(),
                     Some(orp_passphrase.as_str()),
                     None,
-                    orp_route_bias.clone(),
+                    route_bias,
                 )
                 .await
             }
