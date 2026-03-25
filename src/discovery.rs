@@ -58,6 +58,23 @@ pub fn parse_bootstrap_peers(peers: &[String]) -> Vec<SocketAddr> {
     out
 }
 
+/// Parse a bootstrap endpoint hint from either `host:port` or `scheme://host:port`.
+pub fn parse_endpoint_hint(endpoint: &str) -> Option<SocketAddr> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    without_scheme.parse::<SocketAddr>().ok()
+}
+
 /// Abstraction layer for discovery backends (LAN cache, relay index, DHT/Kademlia).
 #[async_trait::async_trait]
 pub trait DiscoveryProvider: Send + Sync {
@@ -267,6 +284,44 @@ impl DiscoveryProvider for OrpDiscoveryProvider {
             .collect();
 
         Ok(addrs)
+    }
+}
+
+/// Discovery provider backed by a managed bootstrap bundle.
+pub struct BootstrapDiscoveryProvider {
+    endpoints: Vec<SocketAddr>,
+}
+
+impl BootstrapDiscoveryProvider {
+    pub fn from_bundle(bundle: &crate::bootstrap_bundle::BootstrapBundle) -> Self {
+        let mut endpoints = Vec::new();
+        for relay in &bundle.relays {
+            if let Some(addr) = parse_endpoint_hint(&relay.addr) {
+                if !endpoints.contains(&addr) {
+                    endpoints.push(addr);
+                }
+            }
+        }
+        for bridge in &bundle.bridges {
+            if let Some(addr) = parse_endpoint_hint(&bridge.endpoint) {
+                if !endpoints.contains(&addr) {
+                    endpoints.push(addr);
+                }
+            }
+        }
+
+        Self { endpoints }
+    }
+}
+
+#[async_trait::async_trait]
+impl DiscoveryProvider for BootstrapDiscoveryProvider {
+    async fn announce(&self, _space_hash: [u8; 32], _record: DiscoveryRecord) -> Result<()> {
+        Ok(())
+    }
+
+    async fn discover(&self, _space_hash: [u8; 32], limit: usize) -> Result<Vec<SocketAddr>> {
+        Ok(self.endpoints.iter().copied().take(limit).collect())
     }
 }
 

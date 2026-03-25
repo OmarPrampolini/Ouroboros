@@ -14,10 +14,10 @@ use tokio::time::interval;
 
 use super::types::{
     EtherSyncJoinRequest, EtherSyncPeerAddRequest, EtherSyncPublishFileRequest,
-    EtherSyncPublishRequest, EtherSyncStartRequest,
+    EtherSyncPublishRequest, EtherSyncStartRequest, KeeperBackfillRequest,
 };
 use super::{ApiError, ApiState};
-use crate::state::{EtherSyncStartConfig, EtherSyncStatus};
+use crate::state::{EtherSyncStartConfig, EtherSyncStatus, KeeperBackfillResult};
 
 type EtherSyncResult<T> = Result<Json<T>, ApiError>;
 
@@ -245,6 +245,23 @@ pub(crate) async fn handle_events_sse(
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::new())
         .into_response()
+}
+
+pub(crate) async fn handle_keeper_backfill(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(state): Extension<Arc<ApiState>>,
+    Json(req): Json<KeeperBackfillRequest>,
+) -> EtherSyncResult<KeeperBackfillResult> {
+    if !state.app.api_allow(addr.ip(), 1.0).await {
+        return Err(ApiError::bad_request("rate limit"));
+    }
+
+    let result = state
+        .app
+        .ethersync_keeper_backfill(req.passphrase, req.max_messages)
+        .await
+        .map_err(|e| ApiError::bad_request(&e.to_string()))?;
+    Ok(Json(result))
 }
 
 fn parse_peers(input: Vec<String>) -> Result<Vec<SocketAddr>, ApiError> {

@@ -212,7 +212,9 @@ Ouroboros distinguishes between:
 Current truth:
 
 - local replay exists
-- keeper-backed replay is scaffolded but not active
+- a local keeper replica archive exists as a managed-retention scaffold
+- backfill can restore archived encrypted envelopes into local replay storage
+- multi-node keeper-backed retention is not active yet
 
 This distinction must remain explicit in product language and in API surfaces.
 

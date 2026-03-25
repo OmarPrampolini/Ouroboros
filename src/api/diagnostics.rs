@@ -65,6 +65,12 @@ pub(crate) struct FallbackQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct RouteDiscoverQuery {
+    pub passphrase: String,
+    pub limit: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct FallbacksResponse {
     pub items: Vec<FallbackEvent>,
@@ -118,6 +124,10 @@ pub(crate) struct KeeperStatusResponse {
     pub replay_window_slots: usize,
     pub keeper_replication_enabled: bool,
     pub keeper_replication_factor: usize,
+    pub pending_keeper_envelopes: usize,
+    pub keeper_space_count: usize,
+    pub archived_keeper_envelopes: usize,
+    pub keeper_archive_space_count: usize,
     pub operator_model: String,
     pub operator_enrollment: String,
     pub monetization_model: String,
@@ -134,6 +144,15 @@ pub(crate) struct KeeperStatusResponse {
     pub operator_id_hint: String,
     pub operator_region_hint: String,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RouteDiscoverResponse {
+    pub space_prefix: String,
+    pub candidates: Vec<String>,
+    pub used_orp: bool,
+    pub used_bootstrap_bundle: bool,
+    pub used_static_bootstrap: bool,
 }
 
 /// Handle /v1/metrics - In-memory debugging metrics (zero persistence)
@@ -245,6 +264,64 @@ pub(crate) async fn handle_capabilities(
     };
 
     Ok(Json(snapshot))
+}
+
+/// Handle /v1/routes/discover - resolve candidates from ORP, bundle, and static bootstrap
+pub(crate) async fn handle_routes_discover(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<RouteDiscoverQuery>,
+    Extension(state): Extension<Arc<ApiState>>,
+) -> Result<Json<RouteDiscoverResponse>, StatusCode> {
+    if !state.app.api_allow(addr.ip(), 1.0).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if query.passphrase.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let cfg = Config::from_env();
+    let limit = query.limit.unwrap_or(8).clamp(1, 64);
+    let canonical = ouroboros_crypto::derive::canonicalize_passphrase(&query.passphrase);
+    let space_hash = ouroboros_crypto::hash::blake3_hash(&canonical);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&space_hash[..8]);
+
+    let mut backends: Vec<Arc<dyn crate::discovery::DiscoveryProvider>> = Vec::new();
+    let mut used_orp = false;
+    if let Some(node) = state.app.orp_node().await {
+        backends.push(Arc::new(crate::discovery::OrpDiscoveryProvider::new(
+            node.route_cache().clone(),
+        )));
+        used_orp = true;
+    }
+
+    let mut used_bootstrap_bundle = false;
+    if let Some(bundle) = crate::bootstrap_bundle::load_bootstrap_bundle(&cfg) {
+        backends.push(Arc::new(
+            crate::discovery::BootstrapDiscoveryProvider::from_bundle(&bundle),
+        ));
+        used_bootstrap_bundle = true;
+    }
+
+    let service = crate::discovery::DiscoveryService::with_bootstrap_peers(
+        crate::discovery::FederatedDiscovery::new(backends),
+        crate::discovery::parse_bootstrap_peers(&cfg.discovery_bootstrap_peers),
+    );
+    let candidates = service
+        .discover_endpoints(space_hash, limit)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    Ok(Json(RouteDiscoverResponse {
+        space_prefix: hex::encode(prefix),
+        candidates: candidates
+            .into_iter()
+            .map(|addr| addr.to_string())
+            .collect(),
+        used_orp,
+        used_bootstrap_bundle,
+        used_static_bootstrap: !cfg.discovery_bootstrap_peers.is_empty(),
+    }))
 }
 
 /// Handle /v1/routes/status - ORP control-plane diagnostics and high-risk gate status
@@ -370,6 +447,10 @@ pub(crate) async fn handle_keepers_status(
         replay_window_slots: status.replay_window_slots,
         keeper_replication_enabled: status.keeper_replication_enabled,
         keeper_replication_factor: status.keeper_replication_factor,
+        pending_keeper_envelopes: status.pending_keeper_envelopes,
+        keeper_space_count: status.keeper_space_count,
+        archived_keeper_envelopes: status.archived_keeper_envelopes,
+        keeper_archive_space_count: status.keeper_archive_space_count,
         operator_model: "managed-plus-open".to_string(),
         operator_enrollment: "first-party and partner-operated; third-party enrollment not open yet"
             .to_string(),
@@ -389,11 +470,11 @@ pub(crate) async fn handle_keepers_status(
         operator_id_hint: status.operator_id_hint,
         operator_region_hint: status.operator_region_hint,
         notes: vec![
-            "Current runtime can now describe keeper and bridge posture even when retention is still local-first"
+            "Current runtime can stage encrypted envelopes and flush them into a keeper replica archive"
                 .to_string(),
             "Bootstrap remains hybrid: static discovery peers, assist relays, and future bridge bundles"
                 .to_string(),
-            "Keeper nodes are planned to store encrypted envelopes and minimal availability metadata"
+            "Keeper backfill currently restores archived encrypted envelopes into local replay storage"
                 .to_string(),
         ],
     }))

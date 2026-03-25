@@ -94,9 +94,12 @@ Shared cryptographic building blocks:
 
 ### Bootstrap and keeper posture
 
-- bootstrap bundles can now be loaded for diagnostics and operator visibility
-- keeper replication posture is surfaced in runtime status
+- bootstrap bundles now seed EtherSync bootstrap peers and participate in space-scoped discovery
+- keeper replication posture is surfaced in runtime status with pending and archived counts
 - bridge hints and operator identity hints are part of the current code model
+- federated route discovery can combine ORP, bundle, and static bootstrap peers
+- keeper replication can flush encrypted envelopes into a local replica archive
+- keeper backfill can restore archived envelopes into local EtherSync storage
 
 ## Current truth
 
@@ -109,7 +112,7 @@ What is true today:
 What is not claimed yet:
 
 - global anonymity network
-- production keeper-backed retention
+- production multi-node keeper-backed retention
 - audited high-risk overlay
 
 ## Public API highlights
@@ -117,8 +120,10 @@ What is not claimed yet:
 - `POST /v1/connect`
 - `GET /v1/status`
 - `GET /v1/capabilities`
+- `GET /v1/routes/discover`
 - `GET /v1/routes/status`
 - `GET /v1/keepers/status`
+- `POST /v1/keepers/backfill`
 - `GET /v1/ethersync/status`
 - `POST /v1/ethersync/start`
 - `POST /v1/ethersync/spaces/join`

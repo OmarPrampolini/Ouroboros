@@ -25,8 +25,12 @@ At this stage the bundle is used for:
 - runtime diagnostics
 - API status surfaces
 - keeper and bridge posture visibility
+- EtherSync bootstrap peer seeding at runtime start
+- federated route discovery together with ORP and static bootstrap peers
+- space-join seeding before replay and ORP activity
+- operator-facing bootstrap inventory that can later be signed and mirrored
 
-It is not yet used as a full routing authority.
+It is not yet used as a full routing authority or as a mandatory global directory.
 
 ## JSON shape
 

@@ -150,6 +150,14 @@ pub struct EtherSyncStatus {
     pub bootstrap_bundle_bridges: usize,
     /// Number of keeper descriptors in the loaded bootstrap bundle.
     pub bootstrap_bundle_keepers: usize,
+    /// Count of locally queued keeper envelopes awaiting backfill/replication.
+    pub pending_keeper_envelopes: usize,
+    /// Number of spaces that currently have pending keeper envelopes.
+    pub keeper_space_count: usize,
+    /// Count of encrypted envelopes present in the keeper replica archive.
+    pub archived_keeper_envelopes: usize,
+    /// Number of spaces currently represented in the keeper replica archive.
+    pub keeper_archive_space_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,6 +180,13 @@ pub struct EtherSyncFilePublishResult {
     pub total_bytes: usize,
     pub total_chunks: usize,
     pub published_chunks: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KeeperBackfillResult {
+    pub space_id: String,
+    pub restored_messages: usize,
+    pub remaining_pending: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +217,7 @@ struct EtherSyncRuntime {
     bind_addr: String,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     run_task: JoinHandle<()>,
+    keeper_replication_task: Option<JoinHandle<()>>,
     subscriptions: HashMap<String, JoinHandle<()>>,
     events_tx: broadcast::Sender<String>,
     /// Whether ORP was enabled when this runtime was started.
@@ -214,6 +230,28 @@ struct EtherSyncRuntime {
     operator_id_hint: String,
     operator_region_hint: String,
     bootstrap_bundle: BootstrapBundleSummary,
+    keeper_envelopes: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    keeper_archive: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct KeeperEnvelopeRecord {
+    slot_id: u64,
+    message: ethersync::EtherMessage,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DiscoverySeedReport {
+    discovered: usize,
+    used_orp: bool,
+    used_bootstrap_bundle: bool,
+    used_static_bootstrap: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct KeeperReplicationFlush {
+    moved: usize,
+    touched_spaces: usize,
 }
 
 const ETHERSYNC_FILE_CHUNK_DEFAULT: usize = 1024;
@@ -453,10 +491,12 @@ impl AppState {
 
         let runtime_cfg = crate::config::Config::from_env();
         let bootstrap_bundle = crate::bootstrap_bundle::summarize_bootstrap_bundle(&runtime_cfg);
-        let bootstrap_peer_count = cfg.bootstrap_peers.len();
+        let resolved_bootstrap_peers =
+            resolve_initial_bootstrap_peers(&runtime_cfg, &cfg.bootstrap_peers);
+        let bootstrap_peer_count = resolved_bootstrap_peers.len();
         let node_cfg = NodeConfig {
             bind_addr: cfg.bind_addr.clone(),
-            bootstrap_peers: cfg.bootstrap_peers,
+            bootstrap_peers: resolved_bootstrap_peers,
             gossip_interval_secs: cfg.gossip_interval_secs.max(1),
             sweep_interval_secs: cfg.sweep_interval_secs.max(1),
             gossip_ttl: cfg.gossip_ttl.max(1),
@@ -487,6 +527,18 @@ impl AppState {
             }
         });
         let (events_tx, _) = broadcast::channel(512);
+        let keeper_envelopes = Arc::new(Mutex::new(HashMap::new()));
+        let keeper_archive = Arc::new(Mutex::new(HashMap::new()));
+        let keeper_replication_task = if runtime_cfg.keeper_replication_enabled {
+            Some(spawn_keeper_replication_task(
+                shutdown_tx.subscribe(),
+                events_tx.clone(),
+                keeper_envelopes.clone(),
+                keeper_archive.clone(),
+            ))
+        } else {
+            None
+        };
         emit_ethersync_event(
             &events_tx,
             EtherSyncEvent {
@@ -496,7 +548,10 @@ impl AppState {
                 slot_id: None,
                 payload_b64: None,
                 text: None,
-                info: Some("ethersync node started".to_string()),
+                info: Some(format!(
+                    "ethersync node started (bootstrap peers={})",
+                    bootstrap_peer_count
+                )),
                 error: None,
             },
         );
@@ -506,6 +561,7 @@ impl AppState {
             bind_addr: cfg.bind_addr,
             shutdown_tx,
             run_task,
+            keeper_replication_task,
             subscriptions: HashMap::new(),
             events_tx,
             enable_orp: cfg.enable_orp,
@@ -517,6 +573,8 @@ impl AppState {
             operator_id_hint: runtime_cfg.operator_id.clone(),
             operator_region_hint: runtime_cfg.operator_region.clone(),
             bootstrap_bundle,
+            keeper_envelopes,
+            keeper_archive,
         };
 
         let mut inner = self.inner.lock().await;
@@ -559,6 +617,12 @@ impl AppState {
             let _ = runtime.run_task.await;
         })
         .await;
+        if let Some(task) = runtime.keeper_replication_task.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                let _ = task.await;
+            })
+            .await;
+        }
 
         Ok(default_ethersync_status())
     }
@@ -577,6 +641,8 @@ impl AppState {
             operator_id_hint,
             operator_region_hint,
             bootstrap_bundle,
+            keeper_envelopes,
+            keeper_archive,
         ) = {
             let inner = self.inner.lock().await;
             match inner.ethersync.as_ref() {
@@ -593,6 +659,8 @@ impl AppState {
                     rt.operator_id_hint.clone(),
                     rt.operator_region_hint.clone(),
                     rt.bootstrap_bundle.clone(),
+                    Some(rt.keeper_envelopes.clone()),
+                    Some(rt.keeper_archive.clone()),
                 ),
                 None => (
                     None,
@@ -607,6 +675,8 @@ impl AppState {
                     "local-node".to_string(),
                     "unknown".to_string(),
                     BootstrapBundleSummary::default(),
+                    None,
+                    None,
                 ),
             }
         };
@@ -622,6 +692,24 @@ impl AppState {
             bootstrap_bundle.loaded,
             bridge_hint_count,
         );
+        let (pending_keeper_envelopes, keeper_space_count) =
+            if let Some(keeper_envelopes) = keeper_envelopes {
+                let guard = keeper_envelopes.lock().await;
+                let pending = guard.values().map(|items| items.len()).sum();
+                let spaces = guard.values().filter(|items| !items.is_empty()).count();
+                (pending, spaces)
+            } else {
+                (0, 0)
+            };
+        let (archived_keeper_envelopes, keeper_archive_space_count) =
+            if let Some(keeper_archive) = keeper_archive {
+                let guard = keeper_archive.lock().await;
+                let archived = guard.values().map(|items| items.len()).sum();
+                let spaces = guard.values().filter(|items| !items.is_empty()).count();
+                (archived, spaces)
+            } else {
+                (0, 0)
+            };
 
         // Collect ORP diagnostics from the route cache.
         let (route_cache_size, route_offers_count, last_orp_activity_ms) = {
@@ -669,6 +757,10 @@ impl AppState {
             bootstrap_bundle_relays: bootstrap_bundle.relays,
             bootstrap_bundle_bridges: bootstrap_bundle.bridges,
             bootstrap_bundle_keepers: bootstrap_bundle.keepers,
+            pending_keeper_envelopes,
+            keeper_space_count,
+            archived_keeper_envelopes,
+            keeper_archive_space_count,
         })
     }
 
@@ -707,7 +799,7 @@ impl AppState {
         }
         let space_id = derive_space_id(&passphrase, label.as_deref());
 
-        let (node, events_tx, already_subscribed, orp_enabled) = {
+        let (node, events_tx, already_subscribed, orp_enabled, keeper_envelopes, keeper_archive) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
                 return Err(anyhow::anyhow!("ethersync is not running"));
@@ -717,15 +809,23 @@ impl AppState {
                 rt.events_tx.clone(),
                 rt.subscriptions.contains_key(&space_id),
                 rt.enable_orp,
+                rt.keeper_envelopes.clone(),
+                rt.keeper_archive.clone(),
             )
         };
 
+        let discovery_report =
+            seed_space_from_discovery(&node, &events_tx, &passphrase, &space_id, orp_enabled).await;
+
         if already_subscribed {
             let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
+            emit_keeper_pending_hint(&events_tx, &keeper_envelopes, &space_id).await;
+            emit_keeper_archive_hint(&events_tx, &keeper_archive, &space_id).await;
             tracing::info!(
-                "ethersync join replayed {} message(s) for existing subscription {}",
+                "ethersync join replayed {} message(s) for existing subscription {} (discovered {} endpoint(s))",
                 replayed,
-                space_id
+                space_id,
+                discovery_report.discovered
             );
             return Ok(EtherSyncJoinResult { space_id });
         }
@@ -853,10 +953,13 @@ impl AppState {
 
         if inserted {
             let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
+            emit_keeper_pending_hint(&events_tx, &keeper_envelopes, &space_id).await;
+            emit_keeper_archive_hint(&events_tx, &keeper_archive, &space_id).await;
             tracing::info!(
-                "ethersync join replayed {} message(s) for new subscription {}",
+                "ethersync join replayed {} message(s) for new subscription {} (discovered {} endpoint(s))",
                 replayed,
-                space_id
+                space_id,
+                discovery_report.discovered
             );
         }
 
@@ -875,18 +978,46 @@ impl AppState {
             return Err(anyhow::anyhow!("payload is empty"));
         }
         let space_id = derive_space_id(&passphrase, None);
-        let (node, events_tx) = {
+        let (node, events_tx, keeper_enabled, keeper_envelopes) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
                 return Err(anyhow::anyhow!("ethersync is not running"));
             };
-            (rt.node.clone(), rt.events_tx.clone())
+            (
+                rt.node.clone(),
+                rt.events_tx.clone(),
+                rt.keeper_replication_enabled,
+                rt.keeper_envelopes.clone(),
+            )
         };
 
         let message = node
             .publish(&passphrase, &payload)
             .await
             .map_err(|e| anyhow::anyhow!("failed to publish ethersync payload: {}", e))?;
+
+        if keeper_enabled {
+            let pending = enqueue_keeper_envelope(
+                &keeper_envelopes,
+                &space_id,
+                message.clone(),
+                message.header.slot_id,
+            )
+            .await;
+            emit_ethersync_event(
+                &events_tx,
+                EtherSyncEvent {
+                    kind: "space_keeper_enqueued".to_string(),
+                    ts_ms: now_ms(),
+                    space_id: Some(space_id.clone()),
+                    slot_id: Some(message.header.slot_id),
+                    payload_b64: None,
+                    text: None,
+                    info: Some(format!("pending keeper envelopes={}", pending)),
+                    error: None,
+                },
+            );
+        }
 
         emit_ethersync_event(
             &events_tx,
@@ -934,12 +1065,17 @@ impl AppState {
         let transfer_id = derive_transfer_id(&clean_filename, file_bytes.len(), now_ms());
         let space_id = derive_space_id(&passphrase, None);
 
-        let (node, events_tx) = {
+        let (node, events_tx, keeper_enabled, keeper_envelopes) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
                 return Err(anyhow::anyhow!("ethersync is not running"));
             };
-            (rt.node.clone(), rt.events_tx.clone())
+            (
+                rt.node.clone(),
+                rt.events_tx.clone(),
+                rt.keeper_replication_enabled,
+                rt.keeper_envelopes.clone(),
+            )
         };
 
         emit_ethersync_event(
@@ -983,6 +1119,16 @@ impl AppState {
                 )
             })?;
             published_chunks += 1;
+
+            if keeper_enabled {
+                let _ = enqueue_keeper_envelope(
+                    &keeper_envelopes,
+                    &space_id,
+                    message.clone(),
+                    message.header.slot_id,
+                )
+                .await;
+            }
 
             emit_ethersync_event(
                 &events_tx,
@@ -1034,6 +1180,88 @@ impl AppState {
             return Err(anyhow::anyhow!("ethersync is not running"));
         };
         Ok(rt.events_tx.subscribe())
+    }
+
+    pub async fn ethersync_keeper_backfill(
+        &self,
+        passphrase: String,
+        max_messages: Option<usize>,
+    ) -> anyhow::Result<KeeperBackfillResult> {
+        if passphrase.trim().is_empty() {
+            return Err(anyhow::anyhow!("passphrase required"));
+        }
+        let space_id = derive_space_id(&passphrase, None);
+        let (node, events_tx, keeper_envelopes, keeper_archive) = {
+            let inner = self.inner.lock().await;
+            let Some(rt) = inner.ethersync.as_ref() else {
+                return Err(anyhow::anyhow!("ethersync is not running"));
+            };
+            (
+                rt.node.clone(),
+                rt.events_tx.clone(),
+                rt.keeper_envelopes.clone(),
+                rt.keeper_archive.clone(),
+            )
+        };
+
+        let limit = max_messages.unwrap_or(256).clamp(1, 4096);
+        let _ = flush_keeper_pending_envelopes(
+            &keeper_envelopes,
+            &keeper_archive,
+            Some(space_id.as_str()),
+        )
+        .await;
+        let archived = {
+            let guard = keeper_archive.lock().await;
+            guard
+                .get(&space_id)
+                .map(|items| items.iter().take(limit).cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+
+        let mut restored = 0usize;
+        {
+            let mut storage = node.storage().lock().await;
+            for envelope in &archived {
+                let hash = blake3_hash(&envelope.message.encrypted_payload);
+                if storage
+                    .store(envelope.slot_id, hash, envelope.message.clone())
+                    .is_ok()
+                {
+                    restored = restored.saturating_add(1);
+                }
+            }
+        }
+
+        let remaining_pending = {
+            let guard = keeper_envelopes.lock().await;
+            guard.get(&space_id).map(|items| items.len()).unwrap_or(0)
+        };
+
+        emit_ethersync_event(
+            &events_tx,
+            EtherSyncEvent {
+                kind: "space_keeper_backfill_completed".to_string(),
+                ts_ms: now_ms(),
+                space_id: Some(space_id.clone()),
+                slot_id: None,
+                payload_b64: None,
+                text: None,
+                info: Some(format!(
+                    "restored {} message(s), remaining pending={}, archived={}",
+                    restored,
+                    remaining_pending,
+                    archived.len()
+                )),
+                error: None,
+            },
+        );
+
+        Ok(KeeperBackfillResult {
+            space_id,
+            restored_messages: restored,
+            remaining_pending,
+        })
     }
 }
 
@@ -1158,6 +1386,346 @@ async fn replay_space_backlog(
 
     replayed
 }
+
+fn resolve_initial_bootstrap_peers(
+    runtime_cfg: &crate::config::Config,
+    requested: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut peers = requested.to_vec();
+
+    for peer in crate::discovery::parse_bootstrap_peers(&runtime_cfg.discovery_bootstrap_peers) {
+        push_unique_peer(&mut peers, peer);
+    }
+
+    for hint in &runtime_cfg.bridge_bootstrap_hints {
+        if let Some(addr) = crate::discovery::parse_endpoint_hint(hint) {
+            push_unique_peer(&mut peers, addr);
+        }
+    }
+
+    if let Some(bundle) = crate::bootstrap_bundle::load_bootstrap_bundle(runtime_cfg) {
+        for relay in &bundle.relays {
+            if let Some(addr) = crate::discovery::parse_endpoint_hint(&relay.addr) {
+                push_unique_peer(&mut peers, addr);
+            }
+        }
+        for bridge in &bundle.bridges {
+            if let Some(addr) = crate::discovery::parse_endpoint_hint(&bridge.endpoint) {
+                push_unique_peer(&mut peers, addr);
+            }
+        }
+    }
+
+    peers
+}
+
+fn push_unique_peer(peers: &mut Vec<SocketAddr>, addr: SocketAddr) {
+    if !peers.contains(&addr) {
+        peers.push(addr);
+    }
+}
+
+async fn seed_space_from_discovery(
+    node: &Arc<EtherNode>,
+    events_tx: &broadcast::Sender<String>,
+    passphrase: &str,
+    space_id: &str,
+    orp_enabled: bool,
+) -> DiscoverySeedReport {
+    let runtime_cfg = crate::config::Config::from_env();
+    let static_bootstrap =
+        crate::discovery::parse_bootstrap_peers(&runtime_cfg.discovery_bootstrap_peers);
+    let mut backends: Vec<Arc<dyn crate::discovery::DiscoveryProvider>> = Vec::new();
+    let mut report = DiscoverySeedReport::default();
+
+    if orp_enabled {
+        backends.push(Arc::new(crate::discovery::OrpDiscoveryProvider::new(
+            node.route_cache().clone(),
+        )));
+        report.used_orp = true;
+    }
+
+    if let Some(bundle) = crate::bootstrap_bundle::load_bootstrap_bundle(&runtime_cfg) {
+        backends.push(Arc::new(
+            crate::discovery::BootstrapDiscoveryProvider::from_bundle(&bundle),
+        ));
+        report.used_bootstrap_bundle = true;
+    }
+
+    report.used_static_bootstrap = !static_bootstrap.is_empty();
+    if backends.is_empty() && static_bootstrap.is_empty() {
+        return report;
+    }
+
+    let canonical = canonicalize_passphrase(passphrase);
+    let space_hash = blake3_hash(&canonical);
+    let service = crate::discovery::DiscoveryService::with_bootstrap_peers(
+        crate::discovery::FederatedDiscovery::new(backends),
+        static_bootstrap,
+    );
+
+    let endpoints = match service.discover_endpoints(space_hash, 12).await {
+        Ok(endpoints) => endpoints,
+        Err(err) => {
+            emit_ethersync_event(
+                events_tx,
+                EtherSyncEvent {
+                    kind: "space_discovery_error".to_string(),
+                    ts_ms: now_ms(),
+                    space_id: Some(space_id.to_string()),
+                    slot_id: None,
+                    payload_b64: None,
+                    text: None,
+                    info: Some("federated discovery failed".to_string()),
+                    error: Some(err.to_string()),
+                },
+            );
+            return report;
+        }
+    };
+
+    for endpoint in &endpoints {
+        node.add_peer(*endpoint).await;
+    }
+    report.discovered = endpoints.len();
+
+    if report.discovered > 0 {
+        emit_ethersync_event(
+            events_tx,
+            EtherSyncEvent {
+                kind: "space_discovery_seeded".to_string(),
+                ts_ms: now_ms(),
+                space_id: Some(space_id.to_string()),
+                slot_id: None,
+                payload_b64: None,
+                text: None,
+                info: Some(format!(
+                    "discovered {} endpoint(s) via orp={} bundle={} static={}",
+                    report.discovered,
+                    report.used_orp,
+                    report.used_bootstrap_bundle,
+                    report.used_static_bootstrap
+                )),
+                error: None,
+            },
+        );
+    }
+
+    report
+}
+
+fn spawn_keeper_replication_task(
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    events_tx: broadcast::Sender<String>,
+    keeper_envelopes: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    keeper_archive: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(1500));
+
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    let flush = flush_keeper_pending_envelopes(
+                        &keeper_envelopes,
+                        &keeper_archive,
+                        None,
+                    ).await;
+                    if flush.moved > 0 {
+                        emit_ethersync_event(
+                            &events_tx,
+                            EtherSyncEvent {
+                                kind: "keeper_replication_flushed".to_string(),
+                                ts_ms: now_ms(),
+                                space_id: None,
+                                slot_id: None,
+                                payload_b64: None,
+                                text: None,
+                                info: Some(format!(
+                                    "replicated {} envelope(s) across {} space(s)",
+                                    flush.moved,
+                                    flush.touched_spaces
+                                )),
+                                error: None,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        let flush = flush_keeper_pending_envelopes(&keeper_envelopes, &keeper_archive, None).await;
+        if flush.moved > 0 {
+            emit_ethersync_event(
+                &events_tx,
+                EtherSyncEvent {
+                    kind: "keeper_replication_flushed".to_string(),
+                    ts_ms: now_ms(),
+                    space_id: None,
+                    slot_id: None,
+                    payload_b64: None,
+                    text: None,
+                    info: Some(format!(
+                        "replicated {} envelope(s) across {} space(s) during shutdown",
+                        flush.moved, flush.touched_spaces
+                    )),
+                    error: None,
+                },
+            );
+        }
+    })
+}
+
+async fn flush_keeper_pending_envelopes(
+    keeper_envelopes: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    keeper_archive: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    only_space: Option<&str>,
+) -> KeeperReplicationFlush {
+    let drained = {
+        let mut guard = keeper_envelopes.lock().await;
+        let mut drained = Vec::new();
+
+        match only_space {
+            Some(space_id) => {
+                let drained_records = if let Some(entry) = guard.get_mut(space_id) {
+                    entry.drain(..).collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let should_remove = guard
+                    .get(space_id)
+                    .map(|items| items.is_empty())
+                    .unwrap_or(false);
+                if should_remove {
+                    guard.remove(space_id);
+                }
+                if !drained_records.is_empty() {
+                    drained.push((space_id.to_string(), drained_records));
+                }
+            }
+            None => {
+                let spaces = guard.keys().cloned().collect::<Vec<_>>();
+                for space_id in spaces {
+                    let drained_records = if let Some(entry) = guard.get_mut(&space_id) {
+                        entry.drain(..).collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    let should_remove = guard
+                        .get(&space_id)
+                        .map(|items| items.is_empty())
+                        .unwrap_or(false);
+                    if should_remove {
+                        guard.remove(&space_id);
+                    }
+                    if !drained_records.is_empty() {
+                        drained.push((space_id, drained_records));
+                    }
+                }
+            }
+        }
+
+        drained
+    };
+
+    if drained.is_empty() {
+        return KeeperReplicationFlush::default();
+    }
+
+    let mut moved = 0usize;
+    let touched_spaces = drained.len();
+    let mut archive = keeper_archive.lock().await;
+
+    for (space_id, records) in drained {
+        let entry = archive.entry(space_id).or_default();
+        for record in records {
+            let exists = entry.iter().any(|existing| {
+                existing.slot_id == record.slot_id
+                    && existing.message.encrypted_payload == record.message.encrypted_payload
+            });
+            if !exists {
+                entry.push(record);
+                moved = moved.saturating_add(1);
+            }
+        }
+        entry.sort_by_key(|record| record.slot_id);
+    }
+
+    KeeperReplicationFlush {
+        moved,
+        touched_spaces,
+    }
+}
+
+async fn emit_keeper_pending_hint(
+    events_tx: &broadcast::Sender<String>,
+    keeper_envelopes: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    space_id: &str,
+) {
+    let pending = {
+        let guard = keeper_envelopes.lock().await;
+        guard.get(space_id).map(|items| items.len()).unwrap_or(0)
+    };
+
+    if pending == 0 {
+        return;
+    }
+
+    emit_ethersync_event(
+        events_tx,
+        EtherSyncEvent {
+            kind: "space_keeper_backfill_available".to_string(),
+            ts_ms: now_ms(),
+            space_id: Some(space_id.to_string()),
+            slot_id: None,
+            payload_b64: None,
+            text: None,
+            info: Some(format!(
+                "{} pending keeper envelope(s) available for backfill",
+                pending
+            )),
+            error: None,
+        },
+    );
+}
+
+async fn emit_keeper_archive_hint(
+    events_tx: &broadcast::Sender<String>,
+    keeper_archive: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    space_id: &str,
+) {
+    let archived = {
+        let guard = keeper_archive.lock().await;
+        guard.get(space_id).map(|items| items.len()).unwrap_or(0)
+    };
+
+    if archived == 0 {
+        return;
+    }
+
+    emit_ethersync_event(
+        events_tx,
+        EtherSyncEvent {
+            kind: "space_keeper_archive_available".to_string(),
+            ts_ms: now_ms(),
+            space_id: Some(space_id.to_string()),
+            slot_id: None,
+            payload_b64: None,
+            text: None,
+            info: Some(format!(
+                "{} archived keeper envelope(s) available for backfill",
+                archived
+            )),
+            error: None,
+        },
+    );
+}
+
 fn emit_ethersync_event(events_tx: &broadcast::Sender<String>, event: EtherSyncEvent) {
     if let Ok(json) = serde_json::to_string(&event) {
         let _ = events_tx.send(json);
@@ -1193,6 +1761,18 @@ fn derive_transfer_id(filename: &str, total_bytes: usize, ts_ms: u64) -> String 
     seed.extend_from_slice(&ts_ms.to_le_bytes());
     let hash = blake3_hash(&seed);
     hex::encode(&hash[..10])
+}
+
+async fn enqueue_keeper_envelope(
+    keeper_envelopes: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    space_id: &str,
+    message: ethersync::EtherMessage,
+    slot_id: u64,
+) -> usize {
+    let mut guard = keeper_envelopes.lock().await;
+    let entry = guard.entry(space_id.to_string()).or_default();
+    entry.push(KeeperEnvelopeRecord { slot_id, message });
+    entry.len()
 }
 
 fn default_high_risk_gate_reasons(
@@ -1256,6 +1836,10 @@ fn default_ethersync_status() -> EtherSyncStatus {
         bootstrap_bundle_relays: bootstrap_bundle.relays,
         bootstrap_bundle_bridges: bootstrap_bundle.bridges,
         bootstrap_bundle_keepers: bootstrap_bundle.keepers,
+        pending_keeper_envelopes: 0,
+        keeper_space_count: 0,
+        archived_keeper_envelopes: 0,
+        keeper_archive_space_count: 0,
     }
 }
 

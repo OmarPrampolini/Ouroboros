@@ -195,3 +195,9 @@ pub(crate) struct EtherSyncPublishFileRequest {
     pub file_b64: String,
     pub chunk_size: Option<usize>,
 }
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct KeeperBackfillRequest {
+    pub passphrase: String,
+    pub max_messages: Option<usize>,
+}

@@ -184,6 +184,9 @@ Strong today:
 - transport cascade with real fallback logic
 - EtherSync message and file publication with replay window
 - ORP target-aware route discovery before Tor
+- bootstrap bundle and static discovery peers now seed EtherSync bootstrap state and space joins
+- federated discovery from ORP, bootstrap bundle, and static bootstrap peers
+- first keeper flow: publish enqueues encrypted keeper envelopes, a local replication task flushes them into a keeper replica archive, and backfill restores archived envelopes into local EtherSync storage
 
 Explicitly not claimed yet:
 
@@ -200,8 +203,10 @@ Representative endpoints:
 - `POST /v1/connect`
 - `GET /v1/status`
 - `GET /v1/capabilities`
+- `GET /v1/routes/discover`
 - `GET /v1/routes/status`
 - `GET /v1/keepers/status`
+- `POST /v1/keepers/backfill`
 - `GET /v1/ethersync/status`
 - `POST /v1/ethersync/start`
 - `POST /v1/ethersync/spaces/join`
@@ -216,6 +221,8 @@ The API now exposes:
 - keeper and retention scaffolding
 - capability reporting for `quic`, `webrtc`, `pq`, ORP tiers, and bridge bootstrap posture
 - operator hints, route class counts, and bootstrap bundle visibility
+- federated discovery candidates resolved from ORP, bundle, and config bootstrap
+- pending-versus-archived keeper state plus a concrete backfill control path for managed-retention experimentation
 
 ## Wire and Interop Posture
 

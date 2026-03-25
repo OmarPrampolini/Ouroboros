@@ -19,9 +19,17 @@ Key surfaces:
 - `/v1/connect`
 - `/v1/status`
 - `/v1/capabilities`
+- `/v1/routes/discover`
 - `/v1/routes/status`
 - `/v1/keepers/status`
+- `/v1/keepers/backfill`
 - `/v1/ethersync/*`
+
+Behavioral expectations:
+
+- EtherSync startup may enrich bootstrap peers from configured discovery peers, bridge hints, and bootstrap bundles
+- joining a space may seed peer knowledge from federated discovery before replay
+- keeper status must distinguish pending replication from archived replicated envelopes
 
 ## CipherPacket and Session Compatibility
 
