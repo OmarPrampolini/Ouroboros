@@ -48,6 +48,9 @@ pub(crate) async fn handle_start(
     if let Some(v) = req.enable_compression {
         cfg.enable_compression = v;
     }
+    if let Some(v) = req.enable_orp {
+        cfg.enable_orp = v;
+    }
 
     let status = state
         .app

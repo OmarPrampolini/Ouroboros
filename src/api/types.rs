@@ -162,6 +162,8 @@ pub(crate) struct EtherSyncStartRequest {
     pub sweep_interval_secs: Option<u64>,
     pub gossip_ttl: Option<u8>,
     pub enable_compression: Option<bool>,
+    /// Enable ORP route discovery as a transport fallback before Tor.
+    pub enable_orp: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

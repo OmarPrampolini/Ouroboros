@@ -75,6 +75,8 @@ pub struct EtherSyncStartConfig {
     pub sweep_interval_secs: u64,
     pub gossip_ttl: u8,
     pub enable_compression: bool,
+    /// Enable ORP route discovery as a transport fallback before Tor.
+    pub enable_orp: bool,
 }
 
 impl Default for EtherSyncStartConfig {
@@ -86,6 +88,7 @@ impl Default for EtherSyncStartConfig {
             sweep_interval_secs: 10,
             gossip_ttl: 3,
             enable_compression: true,
+            enable_orp: false,
         }
     }
 }
@@ -98,6 +101,13 @@ pub struct EtherSyncStatus {
     pub peer_count: usize,
     pub subscription_count: usize,
     pub spaces: Vec<String>,
+    /// Whether ORP is enabled for this runtime.
+    pub orp_enabled: bool,
+    /// Total number of route announcements currently in the route cache.
+    pub route_cache_size: usize,
+    /// UNIX timestamp (ms) of the most recently seen route announcement,
+    /// or `None` if the cache is empty or the node is not running.
+    pub last_orp_activity_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +162,8 @@ struct EtherSyncRuntime {
     run_task: JoinHandle<()>,
     subscriptions: HashMap<String, JoinHandle<()>>,
     events_tx: broadcast::Sender<String>,
+    /// Whether ORP was enabled when this runtime was started.
+    enable_orp: bool,
 }
 
 const ETHERSYNC_FILE_CHUNK_DEFAULT: usize = 1024;
@@ -421,6 +433,7 @@ impl AppState {
             run_task,
             subscriptions: HashMap::new(),
             events_tx,
+            enable_orp: cfg.enable_orp,
         };
 
         let mut inner = self.inner.lock().await;
@@ -445,6 +458,9 @@ impl AppState {
                 peer_count: 0,
                 subscription_count: 0,
                 spaces: Vec::new(),
+                orp_enabled: false,
+                route_cache_size: 0,
+                last_orp_activity_ms: None,
             });
         };
 
@@ -478,19 +494,23 @@ impl AppState {
             peer_count: 0,
             subscription_count: 0,
             spaces: Vec::new(),
+            orp_enabled: false,
+            route_cache_size: 0,
+            last_orp_activity_ms: None,
         })
     }
 
     pub async fn ethersync_status(&self) -> anyhow::Result<EtherSyncStatus> {
-        let (node, bind_addr, spaces) = {
+        let (node, bind_addr, spaces, enable_orp) = {
             let inner = self.inner.lock().await;
             match inner.ethersync.as_ref() {
                 Some(rt) => (
                     Some(rt.node.clone()),
                     Some(rt.bind_addr.clone()),
                     rt.subscriptions.keys().cloned().collect::<Vec<_>>(),
+                    rt.enable_orp,
                 ),
-                None => (None, None, Vec::new()),
+                None => (None, None, Vec::new(), false),
             }
         };
 
@@ -502,7 +522,25 @@ impl AppState {
                 peer_count: 0,
                 subscription_count: 0,
                 spaces: Vec::new(),
+                orp_enabled: false,
+                route_cache_size: 0,
+                last_orp_activity_ms: None,
             });
+        };
+
+        // Collect ORP diagnostics from the route cache.
+        let (route_cache_size, last_orp_activity_ms) = {
+            let cache = node.route_cache().lock().await;
+            let size = cache.announcements.len();
+            // Find the most recently observed announcement and convert its
+            // elapsed Instant back to a UNIX-ms timestamp (best-effort).
+            let last_ms = cache
+                .announcements
+                .values()
+                .map(|a| a.last_seen.elapsed().as_millis() as u64)
+                .min() // minimum elapsed = most recent
+                .map(|elapsed_ms| now_ms().saturating_sub(elapsed_ms));
+            (size, last_ms)
         };
 
         Ok(EtherSyncStatus {
@@ -512,6 +550,9 @@ impl AppState {
             peer_count: node.peer_count().await,
             subscription_count: node.subscription_count().await,
             spaces,
+            orp_enabled: enable_orp,
+            route_cache_size,
+            last_orp_activity_ms,
         })
     }
 
