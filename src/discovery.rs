@@ -5,7 +5,7 @@ use std::sync::Arc;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[cfg(feature = "dht")]
 mod kad;
@@ -210,6 +210,56 @@ impl DiscoveryProvider for InMemoryDiscovery {
             .collect();
         out.truncate(limit);
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ORP-backed discovery provider
+// ---------------------------------------------------------------------------
+
+/// Discovery provider backed by the EtherSync ORP route cache.
+///
+/// `announce` is a no-op — route announcements are published independently via
+/// [`ethersync::EtherNode::publish_route_announcement`].
+///
+/// `discover` returns all direct-UDP endpoints from fresh ORP announcements in
+/// the cache.  Space-hash filtering is intentionally omitted in Phase 2; it
+/// will be added once passphrase → `key_enc` mapping is threaded through the
+/// discovery API (Phase 3).
+pub struct OrpDiscoveryProvider {
+    route_cache: Arc<Mutex<ethersync::routing::RouteCache>>,
+}
+
+impl OrpDiscoveryProvider {
+    pub fn new(route_cache: Arc<Mutex<ethersync::routing::RouteCache>>) -> Self {
+        Self { route_cache }
+    }
+}
+
+#[async_trait::async_trait]
+impl DiscoveryProvider for OrpDiscoveryProvider {
+    async fn announce(&self, _space_hash: [u8; 32], _record: DiscoveryRecord) -> Result<()> {
+        // ORP announcements are handled by EtherNode — nothing to do here.
+        Ok(())
+    }
+
+    async fn discover(&self, _space_hash: [u8; 32], limit: usize) -> Result<Vec<SocketAddr>> {
+        use ethersync::routing::ANNOUNCE_SLOT_LOOKBACK;
+        use ethersync::EtherCoordinate;
+
+        let current_slot = EtherCoordinate::current_slot();
+        let min_slot = current_slot.saturating_sub(ANNOUNCE_SLOT_LOOKBACK);
+
+        let cache = self.route_cache.lock().await;
+        let addrs: Vec<SocketAddr> = cache
+            .announcements
+            .values()
+            .filter(|a| a.frame.slot >= min_slot && a.frame.capabilities.direct_udp)
+            .flat_map(|a| a.frame.reachable_udp.iter().cloned())
+            .take(limit)
+            .collect();
+
+        Ok(addrs)
     }
 }
 

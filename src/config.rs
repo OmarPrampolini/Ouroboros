@@ -146,6 +146,13 @@ pub struct Config {
 
     // Capabilities for advanced features
     pub require_capabilities: bool, // true = require CAP_NET_RAW for ICMP
+
+    // ORP (Ouroboros Routing Protocol) settings
+    /// Enable ORP as a transport fallback between Relay and Tor.
+    /// When true, the EtherSync route cache is queried for direct-UDP peers
+    /// before falling back to Tor.  Requires an active EtherNode.
+    #[serde(default)]
+    pub enable_orp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +209,7 @@ impl Config {
             tor_listen_addr: "127.0.0.1:9999".into(),
             nat_detection_servers: vec!["8.8.8.8:19302".into(), "1.1.1.1:3478".into()],
             require_capabilities: false,
+            enable_orp: false,
         }
     }
 }
