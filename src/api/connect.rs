@@ -814,11 +814,26 @@ pub(crate) async fn handle_connect(
         }));
     }
 
+    // Get ORP node if enabled, for use in the transport fallback chain.
+    let orp_node = app.orp_node().await;
+
     match run_with_retry_budget(
         "establish_connection",
         CONNECT_RETRY_BUDGET,
         CONNECT_RETRY_BACKOFF_MS,
-        || transport::establish_connection(&params, &cfg),
+        || {
+            let p = params.clone();
+            let c = cfg.clone();
+            let orp_ref = orp_node.clone();
+            async move {
+                transport::establish_connection_with_orp(
+                    &p,
+                    &c,
+                    orp_ref.as_deref(),
+                )
+                .await
+            }
+        },
     )
     .await
     {

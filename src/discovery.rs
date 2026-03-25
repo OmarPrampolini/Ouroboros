@@ -222,10 +222,9 @@ impl DiscoveryProvider for InMemoryDiscovery {
 /// `announce` is a no-op — route announcements are published independently via
 /// [`ethersync::EtherNode::publish_route_announcement`].
 ///
-/// `discover` returns all direct-UDP endpoints from fresh ORP announcements in
-/// the cache.  Space-hash filtering is intentionally omitted in Phase 2; it
-/// will be added once passphrase → `key_enc` mapping is threaded through the
-/// discovery API (Phase 3).
+/// `discover` returns direct-UDP endpoints from fresh ORP announcements whose
+/// `space_prefix` (first 8 bytes of `RouteKey`) matches the requested
+/// `space_hash` prefix — no cross-space leakage.
 pub struct OrpDiscoveryProvider {
     route_cache: Arc<Mutex<ethersync::routing::RouteCache>>,
 }
@@ -243,19 +242,27 @@ impl DiscoveryProvider for OrpDiscoveryProvider {
         Ok(())
     }
 
-    async fn discover(&self, _space_hash: [u8; 32], limit: usize) -> Result<Vec<SocketAddr>> {
+    async fn discover(&self, space_hash: [u8; 32], limit: usize) -> Result<Vec<SocketAddr>> {
         use ethersync::routing::ANNOUNCE_SLOT_LOOKBACK;
         use ethersync::EtherCoordinate;
 
         let current_slot = EtherCoordinate::current_slot();
         let min_slot = current_slot.saturating_sub(ANNOUNCE_SLOT_LOOKBACK);
 
+        // Filter by the first 8 bytes of space_hash (= space_prefix).
+        let mut target_prefix = [0u8; 8];
+        target_prefix.copy_from_slice(&space_hash[..8]);
+
         let cache = self.route_cache.lock().await;
         let addrs: Vec<SocketAddr> = cache
             .announcements
-            .values()
-            .filter(|a| a.frame.slot >= min_slot && a.frame.capabilities.direct_udp)
-            .flat_map(|a| a.frame.reachable_udp.iter().cloned())
+            .iter()
+            .filter(|(key, ann)| {
+                key.space_prefix == target_prefix
+                    && ann.frame.slot >= min_slot
+                    && ann.frame.capabilities.direct_udp
+            })
+            .flat_map(|(_, ann)| ann.frame.reachable_udp.iter().cloned())
             .take(limit)
             .collect();
 

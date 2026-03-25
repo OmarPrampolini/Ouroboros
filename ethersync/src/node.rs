@@ -9,7 +9,7 @@ use crate::{
     network::EtherUdpSocket,
     routing::{
         decode_orp_frame, encode_orp_frame, OrpFrame, RouteAnnouncement, RouteCache,
-        RouteCapabilities, RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE,
+        RouteCapabilities, RouteHop, RouteLookup, RouteOffer, SUBSPACE_ROUTE_ANNOUNCE,
         SUBSPACE_ROUTE_LOOKUP, SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
     },
     storage::EtherStorage,
@@ -18,7 +18,7 @@ use crate::{
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
 use ouroboros_crypto::random::fill_random;
-use std::collections::HashSet;
+use std::collections::{HashMap as StdHashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -109,6 +109,13 @@ pub struct EtherNode {
     route_cache: Arc<Mutex<RouteCache>>,
     /// Ephemeral node id for the current session (random 16 bytes)
     node_id: [u8; 16],
+    /// Active ORP spaces: maps space_prefix (first 8 bytes of space_hash)
+    /// to the passphrase that was used to join.  Only populated when
+    /// `start_orp_for_space` is called.
+    orp_spaces: Arc<RwLock<StdHashMap<[u8; 8], String>>>,
+    /// Handles for ORP announce tasks (one per space), so they can be
+    /// cleaned up on stop.
+    orp_announce_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl EtherNode {
@@ -162,6 +169,8 @@ impl EtherNode {
             max_seen_cache: 10000,
             route_cache: Arc::new(Mutex::new(RouteCache::new())),
             node_id,
+            orp_spaces: Arc::new(RwLock::new(StdHashMap::new())),
+            orp_announce_tasks: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -328,6 +337,15 @@ impl EtherNode {
         // Clone route_cache for the router task
         let route_cache_router = Arc::clone(&self.route_cache);
 
+        // Clones needed for Lookup → Offer response generation
+        let router_node_id = self.node_id;
+        let router_socket = Arc::clone(&self.socket);
+        let router_gossip = Arc::clone(&self.gossip_engine);
+        let router_storage = Arc::clone(&self.storage);
+        let router_seen = Arc::clone(&self.seen_messages);
+        let router_max_seen = self.max_seen_cache;
+        let router_enable_orp = self.config.enable_orp;
+
         // Spawn subscription router task
         let router_handle = tokio::spawn(async move {
             while let Some(msg) = new_msg_rx.recv().await {
@@ -362,34 +380,113 @@ impl EtherNode {
                     if subspace == SUBSPACE_USER {
                         // Regular user payload — deliver to subscriber channel.
                         let _ = sub.sender.send(msg.clone()).await;
-                    } else {
-                        // ORP control frame — feed into route cache.
-                        // We need a dummy source addr since routing is via gossip;
-                        // Phase 2 will thread the real peer addr through the pipeline.
-                        let dummy_src: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-                        let plaintext = match msg.decrypt(&sub._passphrase) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        let frame = match crate::routing::decode_orp_frame(&plaintext) {
-                            Ok(f) => f,
-                            Err(_) => continue,
-                        };
-                        let current_slot = EtherCoordinate::current_slot();
-                        let passphrase_bytes =
-                            ouroboros_crypto::derive::canonicalize_passphrase(&sub._passphrase);
-                        let space_hash = ouroboros_crypto::hash::blake3_hash(&passphrase_bytes);
-                        let mut cache = route_cache_router.lock().await;
-                        match frame {
-                            OrpFrame::Announce(ann) => {
-                                cache.insert_announcement(ann, dummy_src, current_slot, &space_hash);
-                            }
-                            OrpFrame::Offer(offer) => {
-                                cache.insert_offer(offer);
-                            }
-                            _ => {}
-                        }
+                        continue;
                     }
+
+                    // ORP control frame — decrypt and feed into route cache.
+                    let plaintext = match msg.decrypt(&sub._passphrase) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let frame = match crate::routing::decode_orp_frame(&plaintext) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let current_slot = EtherCoordinate::current_slot();
+                    let passphrase_bytes =
+                        ouroboros_crypto::derive::canonicalize_passphrase(&sub._passphrase);
+                    let space_hash = ouroboros_crypto::hash::blake3_hash(&passphrase_bytes);
+                    let dummy_src: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+                    let mut cache = route_cache_router.lock().await;
+                    match frame {
+                        OrpFrame::Announce(ann) => {
+                            cache.insert_announcement(ann, dummy_src, current_slot, &space_hash);
+                        }
+                        OrpFrame::Offer(offer) => {
+                            cache.insert_offer(offer);
+                        }
+                        OrpFrame::Lookup(lookup) if router_enable_orp => {
+                            // Check if OUR assist_tag matches the lookup target_tag.
+                            let mut our_tag = [0u8; 8];
+                            let tag_hash = ouroboros_crypto::hash::blake3_hash(&router_node_id);
+                            our_tag.copy_from_slice(&tag_hash[..8]);
+
+                            if our_tag != lookup.target_tag {
+                                // Not addressed to us — ignore.
+                                continue;
+                            }
+
+                            let local_addr = router_socket.local_addr();
+                            let hop = if !local_addr.ip().is_unspecified() {
+                                RouteHop::Direct { addr: local_addr }
+                            } else {
+                                // Can't offer a route if we have no reachable addr.
+                                continue;
+                            };
+
+                            let offer = RouteOffer {
+                                version: 1,
+                                lookup_id: lookup.lookup_id,
+                                responder_id: router_node_id,
+                                next_hop: hop,
+                                score: 5000, // direct = highest base score
+                            };
+                            let offer_frame = OrpFrame::Offer(offer);
+                            let offer_payload = match crate::routing::encode_orp_frame(&offer_frame) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+
+                            let slot = EtherCoordinate::current_slot();
+                            let offer_msg = match EtherMessage::new_control_message(
+                                &sub._passphrase,
+                                slot,
+                                &offer_payload,
+                                SUBSPACE_ROUTE_OFFER,
+                            ) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+
+                            let hash = ouroboros_crypto::hash::blake3_hash(&offer_msg.encrypted_payload);
+                            {
+                                let mut st = router_storage.lock().await;
+                                let _ = st.store(slot, hash, offer_msg.clone());
+                            }
+                            {
+                                let mut seen = router_seen.write().await;
+                                seen.insert(hash);
+                                if seen.len() > router_max_seen {
+                                    let to_remove: Vec<_> = seen.iter().take(seen.len() / 2).cloned().collect();
+                                    for h in to_remove { seen.remove(&h); }
+                                }
+                            }
+
+                            // Gossip the offer
+                            let ge = router_gossip.clone();
+                            let m = offer_msg;
+                            tokio::spawn(async move {
+                                for _ in 0..50 {
+                                    {
+                                        let g = ge.read().await;
+                                        if let Some(ref engine) = *g {
+                                            let _ = engine.publish(m).await;
+                                            return;
+                                        }
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                            });
+
+                            trace!(
+                                "ORP: responded to lookup {:?} with direct offer",
+                                &lookup.lookup_id[..4]
+                            );
+                        }
+                        _ => {} // Forward, Ack, Lookup when ORP disabled
+                    }
+                    drop(cache);
                 }
             }
         });
@@ -407,9 +504,6 @@ impl EtherNode {
 
         // Spawn peer cleanup task
         let cleanup_handle = self.spawn_cleanup_task();
-
-        // ORP announce task is driven per-passphrase in Phase 2.
-        // Nothing to spawn at node level yet.
 
         info!("EtherNode running with gossip engine");
 
@@ -734,48 +828,49 @@ impl EtherNode {
         Ok(cache.best_offer(&lookup_id).map(|co| co.frame.clone()))
     }
 
-    /// Feed a received ORP control message into the route cache.
+    /// Activate ORP for a passphrase space.
     ///
-    /// Called from the subscription router when a message arrives on a
-    /// control subspace (1–4).
-    async fn handle_orp_message(
-        &self,
-        msg: &EtherMessage,
-        passphrase: &str,
-        source_peer: SocketAddr,
-    ) {
-        let plaintext = match msg.decrypt(passphrase) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        let frame = match decode_orp_frame(&plaintext) {
-            Ok(f) => f,
-            Err(e) => {
-                trace!("ORP frame decode error: {:?}", e);
-                return;
-            }
-        };
-
-        let current_slot = EtherCoordinate::current_slot();
+    /// Registers the space prefix, starts periodic route announcements,
+    /// and publishes an immediate first announcement.  Returns the space
+    /// prefix so callers can track it.
+    pub async fn start_orp_for_space(&self, passphrase: &str) -> [u8; 8] {
         let passphrase_bytes = canonicalize_passphrase(passphrase);
         let space_hash = blake3_hash(&passphrase_bytes);
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&space_hash[..8]);
 
-        let mut cache = self.route_cache.lock().await;
-
-        match frame {
-            OrpFrame::Announce(ann) => {
-                if !cache.insert_announcement(ann, source_peer, current_slot, &space_hash) {
-                    trace!("ORP announcement rejected (stale or cache full)");
-                }
-            }
-            OrpFrame::Offer(offer) => {
-                cache.insert_offer(offer);
-            }
-            OrpFrame::Lookup(_) | OrpFrame::Forward(_) | OrpFrame::Ack(_) => {
-                // Lookup and Forward handling will be added in Phase 2.
-            }
+        // Register the space
+        {
+            let mut spaces = self.orp_spaces.write().await;
+            spaces.insert(prefix, passphrase.to_string());
         }
+
+        // Immediate first announcement
+        if let Err(e) = self.publish_route_announcement(passphrase).await {
+            warn!("ORP: initial announcement failed: {:?}", e);
+        }
+
+        // Start periodic announce task
+        let handle = self.spawn_orp_announce_task(
+            passphrase.to_string(),
+            self.config.orp_announce_interval_secs,
+        );
+        {
+            let mut tasks = self.orp_announce_tasks.lock().await;
+            tasks.push(handle);
+        }
+
+        info!(
+            "ORP: activated for space {} (announce interval {}s)",
+            hex::encode(prefix),
+            self.config.orp_announce_interval_secs
+        );
+        prefix
+    }
+
+    /// Return all space prefixes that have ORP active.
+    pub async fn orp_space_prefixes(&self) -> Vec<[u8; 8]> {
+        self.orp_spaces.read().await.keys().cloned().collect()
     }
 
     /// Spawn the ORP periodic announcement task.
@@ -950,5 +1045,101 @@ mod tests {
 
         // Hashes should be different due to random nonce
         assert_ne!(hash1, hash2);
+    }
+
+    #[tokio::test]
+    async fn test_orp_disabled_no_spaces() {
+        let config = NodeConfig {
+            enable_orp: false,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        // With ORP disabled, no spaces should be registered
+        let prefixes = node.orp_space_prefixes().await;
+        assert!(prefixes.is_empty());
+
+        // Route cache should be empty
+        let cache = node.route_cache().lock().await;
+        assert!(cache.announcements.is_empty());
+        assert!(cache.offers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_start_orp_for_space_registers_prefix() {
+        let config = NodeConfig {
+            enable_orp: true,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        let prefix = node.start_orp_for_space("test-passphrase").await;
+
+        // Prefix should be non-zero
+        assert_ne!(prefix, [0u8; 8]);
+
+        // Space should now appear in orp_space_prefixes
+        let prefixes = node.orp_space_prefixes().await;
+        assert_eq!(prefixes.len(), 1);
+        assert!(prefixes.contains(&prefix));
+    }
+
+    #[tokio::test]
+    async fn test_start_orp_produces_announcement_in_cache() {
+        let config = NodeConfig {
+            enable_orp: true,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        let _prefix = node.start_orp_for_space("announce-test").await;
+
+        // The initial announcement should be stored in local storage
+        // and the route cache gets populated when announcements are
+        // received from gossip. Let's verify the announcement was at
+        // least published by checking storage.
+        let slot = crate::EtherCoordinate::current_slot();
+        let storage = node.storage().lock().await;
+        let msgs = storage.get_slot_messages(slot).unwrap_or_default();
+        // Should have at least 1 message (the route announcement)
+        assert!(!msgs.is_empty(), "ORP announcement should be stored locally");
+    }
+
+    #[tokio::test]
+    async fn test_orp_deterministic_prefix() {
+        // Same passphrase must produce same prefix
+        let config = NodeConfig {
+            enable_orp: true,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        let prefix1 = node.start_orp_for_space("deterministic-test").await;
+        let prefix2 = node.start_orp_for_space("deterministic-test").await;
+        assert_eq!(prefix1, prefix2, "same passphrase must yield same space prefix");
+
+        // Different passphrase must produce different prefix
+        let prefix3 = node.start_orp_for_space("other-passphrase").await;
+        assert_ne!(prefix1, prefix3, "different passphrases must yield different prefixes");
+    }
+
+    #[tokio::test]
+    async fn test_orp_no_cross_space_in_space_prefixes() {
+        let config = NodeConfig {
+            enable_orp: true,
+            ..Default::default()
+        };
+        let node = EtherNode::new(config).await.unwrap();
+
+        let prefix_a = node.start_orp_for_space("space-alpha").await;
+        let prefix_b = node.start_orp_for_space("space-beta").await;
+
+        let prefixes = node.orp_space_prefixes().await;
+        assert_eq!(prefixes.len(), 2);
+        assert!(prefixes.contains(&prefix_a));
+        assert!(prefixes.contains(&prefix_b));
+
+        // Verify they're distinct
+        assert_ne!(prefix_a, prefix_b);
     }
 }

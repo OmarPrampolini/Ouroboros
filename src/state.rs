@@ -105,6 +105,8 @@ pub struct EtherSyncStatus {
     pub orp_enabled: bool,
     /// Total number of route announcements currently in the route cache.
     pub route_cache_size: usize,
+    /// Total number of route offers cached (across all lookup ids).
+    pub route_offers_count: usize,
     /// UNIX timestamp (ms) of the most recently seen route announcement,
     /// or `None` if the cache is empty or the node is not running.
     pub last_orp_activity_ms: Option<u64>,
@@ -288,6 +290,18 @@ impl AppState {
         limiter.check_cost(SocketAddr::new(ip, 0), cost).await
     }
 
+    /// Return the active EtherNode if ORP is enabled, for use with
+    /// `establish_connection_with_orp`.
+    pub async fn orp_node(&self) -> Option<Arc<EtherNode>> {
+        let inner = self.inner.lock().await;
+        let rt = inner.ethersync.as_ref()?;
+        if rt.enable_orp {
+            Some(rt.node.clone())
+        } else {
+            None
+        }
+    }
+
     pub async fn set_stop_tx(&self, tx: tokio::sync::watch::Sender<bool>) {
         let mut inner = self.inner.lock().await;
         inner.stop_tx = Some(tx);
@@ -396,6 +410,7 @@ impl AppState {
             sweep_interval_secs: cfg.sweep_interval_secs.max(1),
             gossip_ttl: cfg.gossip_ttl.max(1),
             enable_compression: cfg.enable_compression,
+            enable_orp: cfg.enable_orp,
             ..NodeConfig::default()
         };
 
@@ -460,6 +475,7 @@ impl AppState {
                 spaces: Vec::new(),
                 orp_enabled: false,
                 route_cache_size: 0,
+                route_offers_count: 0,
                 last_orp_activity_ms: None,
             });
         };
@@ -496,6 +512,7 @@ impl AppState {
             spaces: Vec::new(),
             orp_enabled: false,
             route_cache_size: 0,
+            route_offers_count: 0,
             last_orp_activity_ms: None,
         })
     }
@@ -524,14 +541,16 @@ impl AppState {
                 spaces: Vec::new(),
                 orp_enabled: false,
                 route_cache_size: 0,
+                route_offers_count: 0,
                 last_orp_activity_ms: None,
             });
         };
 
         // Collect ORP diagnostics from the route cache.
-        let (route_cache_size, last_orp_activity_ms) = {
+        let (route_cache_size, route_offers_count, last_orp_activity_ms) = {
             let cache = node.route_cache().lock().await;
-            let size = cache.announcements.len();
+            let ann_size = cache.announcements.len();
+            let offers_count: usize = cache.offers.values().map(|v| v.len()).sum();
             // Find the most recently observed announcement and convert its
             // elapsed Instant back to a UNIX-ms timestamp (best-effort).
             let last_ms = cache
@@ -540,7 +559,7 @@ impl AppState {
                 .map(|a| a.last_seen.elapsed().as_millis() as u64)
                 .min() // minimum elapsed = most recent
                 .map(|elapsed_ms| now_ms().saturating_sub(elapsed_ms));
-            (size, last_ms)
+            (ann_size, offers_count, last_ms)
         };
 
         Ok(EtherSyncStatus {
@@ -552,6 +571,7 @@ impl AppState {
             spaces,
             orp_enabled: enable_orp,
             route_cache_size,
+            route_offers_count,
             last_orp_activity_ms,
         })
     }
@@ -591,7 +611,7 @@ impl AppState {
         }
         let space_id = derive_space_id(&passphrase, label.as_deref());
 
-        let (node, events_tx, already_subscribed) = {
+        let (node, events_tx, already_subscribed, orp_enabled) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
                 return Err(anyhow::anyhow!("ethersync is not running"));
@@ -600,8 +620,14 @@ impl AppState {
                 rt.node.clone(),
                 rt.events_tx.clone(),
                 rt.subscriptions.contains_key(&space_id),
+                rt.enable_orp,
             )
         };
+
+        // Activate ORP route announcements for this space when enabled.
+        if orp_enabled {
+            node.start_orp_for_space(&passphrase).await;
+        }
 
         if already_subscribed {
             let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;

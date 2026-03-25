@@ -525,4 +525,90 @@ mod tests {
         let slot11 = cache.announcements_for_slot(&prefix, 11);
         assert_eq!(slot11.len(), 1);
     }
+
+    #[test]
+    fn subspace_constants_are_distinct() {
+        let subs = [
+            SUBSPACE_USER,
+            SUBSPACE_ROUTE_ANNOUNCE,
+            SUBSPACE_ROUTE_LOOKUP,
+            SUBSPACE_ROUTE_OFFER,
+            SUBSPACE_RELAY_BEACON,
+        ];
+        for i in 0..subs.len() {
+            for j in (i + 1)..subs.len() {
+                assert_ne!(subs[i], subs[j], "subspace collision at ({}, {})", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn no_cross_space_cache_leakage() {
+        let mut cache = RouteCache::new();
+        let space_a = [0xAAu8; 32];
+        let space_b = [0xBBu8; 32];
+        let tag = [5u8; 8];
+
+        let ann = make_announcement(50, [1u8; 16], tag);
+        cache.insert_announcement(ann, dummy_addr(), 50, &space_a);
+
+        // Lookup with space_b prefix should find nothing
+        let prefix_b = [0xBBu8; 8];
+        assert!(cache.find_by_tag(&prefix_b, &tag, 50).is_none());
+
+        // Lookup with space_a prefix should find it
+        let prefix_a = [0xAAu8; 8];
+        assert!(cache.find_by_tag(&prefix_a, &tag, 50).is_some());
+    }
+
+    #[test]
+    fn orp_frame_roundtrip_offer() {
+        let offer = RouteOffer {
+            version: 1,
+            lookup_id: [1u8; 16],
+            responder_id: [2u8; 16],
+            next_hop: RouteHop::Direct {
+                addr: dummy_addr(),
+            },
+            score: 5000,
+        };
+        let frame = OrpFrame::Offer(offer.clone());
+        let bytes = encode_orp_frame(&frame).unwrap();
+        let decoded = decode_orp_frame(&bytes).unwrap();
+        match decoded {
+            OrpFrame::Offer(o) => {
+                assert_eq!(o.lookup_id, offer.lookup_id);
+                assert_eq!(o.score, 5000);
+            }
+            _ => panic!("wrong frame type"),
+        }
+    }
+
+    #[test]
+    fn lookup_produces_offer_via_cache() {
+        let mut cache = RouteCache::new();
+        let lookup_id = [0xCC; 16];
+
+        // Simulate: a lookup targeting our tag produced an offer
+        let offer = RouteOffer {
+            version: 1,
+            lookup_id,
+            responder_id: [10u8; 16],
+            next_hop: RouteHop::Direct {
+                addr: dummy_addr(),
+            },
+            score: 5000,
+        };
+        cache.insert_offer(offer);
+
+        let best = cache.best_offer(&lookup_id);
+        assert!(best.is_some());
+        let best = best.unwrap();
+        assert_eq!(best.frame.score, 5000);
+        assert_eq!(best.frame.responder_id, [10u8; 16]);
+        match &best.frame.next_hop {
+            RouteHop::Direct { addr } => assert_eq!(*addr, dummy_addr()),
+            _ => panic!("expected Direct hop"),
+        }
+    }
 }

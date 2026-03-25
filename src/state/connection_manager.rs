@@ -11,6 +11,8 @@ use crate::{
     derive::RendezvousParams,
     transport::{self, Connection},
 };
+use ethersync::EtherNode;
+use std::sync::Arc;
 
 /// Circuit Breaker states per resilienza rete
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -185,8 +187,15 @@ impl ConnectionManager {
         }
     }
 
-    /// Attempt to establish connection with circuit breaker protection
-    pub async fn connect(&mut self, params: RendezvousParams) -> Result<Connection, anyhow::Error> {
+    /// Attempt to establish connection with circuit breaker protection.
+    ///
+    /// When `orp_node` is `Some`, ORP route discovery is tried between
+    /// Relay and Tor in the transport fallback chain.
+    pub async fn connect(
+        &mut self,
+        params: RendezvousParams,
+        orp_node: Option<Arc<EtherNode>>,
+    ) -> Result<Connection, anyhow::Error> {
         if !self.circuit_breaker.can_attempt() {
             let status = self.circuit_breaker.get_status();
             return Err(anyhow::anyhow!(
@@ -200,7 +209,13 @@ impl ConnectionManager {
         self.params = Some(params.clone());
 
         let cfg = Config::from_env();
-        match transport::establish_connection(&params, &cfg).await {
+        match transport::establish_connection_with_orp(
+            &params,
+            &cfg,
+            orp_node.as_deref(),
+        )
+        .await
+        {
             Ok(conn) => {
                 info!("Connection established successfully");
                 self.circuit_breaker.record_success();

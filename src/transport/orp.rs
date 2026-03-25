@@ -2,14 +2,8 @@
 //!
 //! Inserted into the transport fallback chain **between Relay and Tor**.
 //! Scans the route cache for fresh announcements that advertise direct-UDP
-//! reachability and dials each candidate in order, returning the first
-//! successful `Connection`.
-//!
-//! ## Space-prefix filtering (Phase 3 TODO)
-//! Currently all announcements in the cache are considered regardless of
-//! passphrase space.  Precise per-space filtering requires threading the ORP
-//! passphrase (or a derivation of it) into `RendezvousParams`; that mapping is
-//! deferred to Phase 3.
+//! reachability **within active ORP spaces only**, then dials each candidate
+//! in order, returning the first successful `Connection`.
 
 use std::net::SocketAddr;
 
@@ -26,12 +20,13 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync 
 
 /// Try to establish a connection via the ORP route cache.
 ///
-/// 1. Lock the route cache and collect all fresh announcements whose
-///    `direct_udp` capability flag is set.
-/// 2. For each candidate UDP address, dial with `connect_to` (UDP first,
-///    TCP hole-punch fallback) bounded by `cfg.wan_connect_timeout_ms`.
-/// 3. Return the first successful `Connection`, or an error if all
-///    candidates are unreachable.
+/// 1. Get the set of active ORP space prefixes from the node.
+/// 2. Lock the route cache and collect fresh announcements whose
+///    `direct_udp` capability is set **and** whose space prefix is in the
+///    active set — no cross-space leakage.
+/// 3. For each candidate, dial with `connect_to` bounded by
+///    `cfg.wan_connect_timeout_ms`.
+/// 4. Return the first successful `Connection`, or an error if all fail.
 pub async fn try_orp_route(
     node: &EtherNode,
     params: &RendezvousParams,
@@ -40,33 +35,54 @@ pub async fn try_orp_route(
     let current_slot = EtherCoordinate::current_slot();
     let min_slot = current_slot.saturating_sub(ANNOUNCE_SLOT_LOOKBACK);
 
+    // Only consider announcements from spaces we actively participate in.
+    let active_prefixes = node.orp_space_prefixes().await;
+    if active_prefixes.is_empty() {
+        tracing::debug!("ORP: no active ORP spaces registered");
+        network_telemetry::record_fallback_event("orp", "no_active_spaces", None);
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "ORP: no active ORP spaces",
+        )));
+    }
+
     // Snapshot candidates under the lock, then release before dialling.
     let candidates: Vec<SocketAddr> = {
         let cache = node.route_cache().lock().await;
         cache
             .announcements
-            .values()
-            .filter(|a| a.frame.slot >= min_slot && a.frame.capabilities.direct_udp)
-            .flat_map(|a| a.frame.reachable_udp.iter().cloned())
+            .iter()
+            .filter(|(key, ann)| {
+                ann.frame.slot >= min_slot
+                    && ann.frame.capabilities.direct_udp
+                    && active_prefixes.contains(&key.space_prefix)
+                    // Don't dial ourselves
+                    && ann.frame.node_id != node.node_id()
+            })
+            .flat_map(|(_, ann)| ann.frame.reachable_udp.iter().cloned())
             .collect()
     };
 
     if candidates.is_empty() {
-        tracing::debug!("ORP: no direct-UDP candidates in route cache (slot={})", current_slot);
+        tracing::debug!(
+            "ORP: no direct-UDP candidates in {} active space(s) (slot={})",
+            active_prefixes.len(),
+            current_slot
+        );
         network_telemetry::record_fallback_event("orp", "no_candidates", None);
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "ORP: route cache has no reachable candidates",
+            "ORP: no reachable candidates in active spaces",
         )));
     }
 
     tracing::debug!(
-        "ORP: {} direct-UDP candidate(s) for slot {}",
+        "ORP: {} direct-UDP candidate(s) across {} space(s) for slot {}",
         candidates.len(),
+        active_prefixes.len(),
         current_slot
     );
 
-    // Clamp dial timeout: at least 500 ms, at most 5 s per candidate.
     let dial_timeout = Duration::from_millis(cfg.wan_connect_timeout_ms.clamp(500, 5_000));
 
     for addr in &candidates {
@@ -101,9 +117,6 @@ pub async fn try_orp_route(
     network_telemetry::record_strategy_result("orp", false);
     Err(Box::new(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        format!(
-            "ORP: all {} candidate(s) exhausted",
-            candidates.len()
-        ),
+        format!("ORP: all {} candidate(s) exhausted", candidates.len()),
     )))
 }
