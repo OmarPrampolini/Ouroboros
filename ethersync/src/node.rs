@@ -103,6 +103,23 @@ impl Default for NodeConfig {
     }
 }
 
+/// Per-hop parameters for route binding installation.
+struct HopContext<'a> {
+    onion_secret_key: &'a [u8; 32],
+    node_id: [u8; 16],
+    circuit_id: [u8; 16],
+    space_prefix: [u8; 8],
+}
+
+/// Shared context for router helper functions to reduce argument count.
+struct RouterContext<'a> {
+    storage: &'a Arc<Mutex<EtherStorage>>,
+    seen_messages: &'a Arc<RwLock<HashSet<[u8; 32]>>>,
+    max_seen_cache: usize,
+    gossip_engine: &'a Arc<RwLock<Option<GossipEngine>>>,
+    passphrase: &'a str,
+}
+
 /// Subscription state for a passphrase
 #[derive(Debug)]
 struct Subscription {
@@ -630,15 +647,18 @@ impl EtherNode {
                         }
                         OrpFrame::Forward(forward) => {
                             drop(cache);
+                            let ctx = RouterContext {
+                                storage: &router_storage,
+                                seen_messages: &router_seen,
+                                max_seen_cache: router_max_seen,
+                                gossip_engine: &router_gossip,
+                                passphrase: &sub._passphrase,
+                            };
                             handle_high_risk_forward(
                                 &router_high_risk_routes,
                                 &router_pending_high_risk_acks,
                                 &router_high_risk_forward_seen,
-                                &router_storage,
-                                &router_seen,
-                                router_max_seen,
-                                &router_gossip,
-                                &sub._passphrase,
+                                &ctx,
                                 current_slot,
                                 forward,
                             )
@@ -647,13 +667,16 @@ impl EtherNode {
                         }
                         OrpFrame::DeliveryNotice(notice) => {
                             drop(cache);
+                            let ctx = RouterContext {
+                                storage: &router_storage,
+                                seen_messages: &router_seen,
+                                max_seen_cache: router_max_seen,
+                                gossip_engine: &router_gossip,
+                                passphrase: &sub._passphrase,
+                            };
                             handle_high_risk_delivery_notice(
                                 &router_high_risk_routes,
-                                &router_storage,
-                                &router_seen,
-                                router_max_seen,
-                                &router_gossip,
-                                &sub._passphrase,
+                                &ctx,
                                 current_slot,
                                 notice,
                             )
@@ -669,25 +692,31 @@ impl EtherNode {
                                 &open,
                             )
                             .await;
+                            let hop = HopContext {
+                                onion_secret_key: &*router_onion_secret_key,
+                                node_id: router_node_id,
+                                circuit_id: open.circuit_id,
+                                space_prefix,
+                            };
                             if let Some(ready) = install_high_risk_route_binding(
                                 &router_high_risk_routes,
                                 &router_pending_high_risk_accepts,
                                 &router_high_risk_accept_notify,
-                                &*router_onion_secret_key,
-                                router_node_id,
-                                open.circuit_id,
-                                space_prefix,
+                                &hop,
                                 &open.hop_payload,
                                 current_slot,
                             )
                             .await
                             {
+                                let ctx = RouterContext {
+                                    storage: &router_storage,
+                                    seen_messages: &router_seen,
+                                    max_seen_cache: router_max_seen,
+                                    gossip_engine: &router_gossip,
+                                    passphrase: &sub._passphrase,
+                                };
                                 let _ = publish_orp_frame_router(
-                                    &router_storage,
-                                    &router_seen,
-                                    router_max_seen,
-                                    &router_gossip,
-                                    &sub._passphrase,
+                                    &ctx,
                                     current_slot,
                                     OrpFrame::CircuitReady(ready),
                                     SUBSPACE_CIRCUIT_READY,
@@ -705,25 +734,31 @@ impl EtherNode {
                                 &extend,
                             )
                             .await;
+                            let hop = HopContext {
+                                onion_secret_key: &*router_onion_secret_key,
+                                node_id: router_node_id,
+                                circuit_id: extend.circuit_id,
+                                space_prefix,
+                            };
                             if let Some(ready) = install_high_risk_route_binding(
                                 &router_high_risk_routes,
                                 &router_pending_high_risk_accepts,
                                 &router_high_risk_accept_notify,
-                                &*router_onion_secret_key,
-                                router_node_id,
-                                extend.circuit_id,
-                                space_prefix,
+                                &hop,
                                 &extend.hop_payload,
                                 current_slot,
                             )
                             .await
                             {
+                                let ctx = RouterContext {
+                                    storage: &router_storage,
+                                    seen_messages: &router_seen,
+                                    max_seen_cache: router_max_seen,
+                                    gossip_engine: &router_gossip,
+                                    passphrase: &sub._passphrase,
+                                };
                                 let _ = publish_orp_frame_router(
-                                    &router_storage,
-                                    &router_seen,
-                                    router_max_seen,
-                                    &router_gossip,
-                                    &sub._passphrase,
+                                    &ctx,
                                     current_slot,
                                     OrpFrame::CircuitReady(ready),
                                     SUBSPACE_CIRCUIT_READY,
@@ -2468,19 +2503,16 @@ async fn install_high_risk_route_binding(
     routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
     pending_accepts: &Arc<Mutex<StdHashMap<[u8; 8], VecDeque<PendingHighRiskTransportSession>>>>,
     accept_notify: &Arc<Notify>,
-    onion_secret_key: &[u8; 32],
-    node_id: [u8; 16],
-    circuit_id: [u8; 16],
-    space_prefix: [u8; 8],
+    hop: &HopContext<'_>,
     payload: &[u8],
     current_slot: u64,
 ) -> Option<CircuitReady> {
-    let Some(handshake) = decode_high_risk_hop_handshake(payload) else {
-        return None;
-    };
+    let circuit_id = hop.circuit_id;
+    let space_prefix = hop.space_prefix;
+    let handshake = decode_high_risk_hop_handshake(payload)?;
     let local_onion_secret_key = Zeroizing::new(
         derive_rotating_onion_secret_key(
-            onion_secret_key,
+            hop.onion_secret_key,
             &space_prefix,
             handshake.onion_epoch_slot,
             &handshake.onion_salt,
@@ -2507,10 +2539,8 @@ async fn install_high_risk_route_binding(
     if descriptor.expires_at_slot < current_slot {
         return None;
     }
-    let Some(local_role) = high_risk_local_role_from_code(capsule.local_role_code) else {
-        return None;
-    };
-    if !high_risk_role_matches_descriptor(local_role, node_id, &descriptor) {
+    let local_role = high_risk_local_role_from_code(capsule.local_role_code)?;
+    if !high_risk_role_matches_descriptor(local_role, hop.node_id, &descriptor) {
         return None;
     }
     let hop_session_key = Some(*hop_session_key);
@@ -2626,11 +2656,7 @@ async fn handle_high_risk_forward(
     routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
     pending_acks: &Arc<Mutex<StdHashMap<HighRiskAckKey, oneshot::Sender<()>>>>,
     forward_seen: &Arc<Mutex<StdHashMap<HighRiskForwardKey, u64>>>,
-    storage: &Arc<Mutex<EtherStorage>>,
-    seen_messages: &Arc<RwLock<HashSet<[u8; 32]>>>,
-    max_seen_cache: usize,
-    gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
-    passphrase: &str,
+    ctx: &RouterContext<'_>,
     slot: u64,
     forward: RouteForward,
 ) {
@@ -2708,11 +2734,7 @@ async fn handle_high_risk_forward(
     match action {
         ForwardAction::Relay(next) => {
             let _ = publish_orp_frame_router(
-                storage,
-                seen_messages,
-                max_seen_cache,
-                gossip_engine,
-                passphrase,
+                ctx,
                 slot,
                 OrpFrame::Forward(next),
                 SUBSPACE_ROUTE_FORWARD,
@@ -2722,16 +2744,7 @@ async fn handle_high_risk_forward(
         ForwardAction::Deliver(deliver_tx, payload, receipt) => {
             if deliver_tx.try_send(payload).is_ok() {
                 if let Some(receipt) = receipt {
-                    let _ = publish_high_risk_delivery_receipt_router(
-                        routes,
-                        storage,
-                        seen_messages,
-                        max_seen_cache,
-                        gossip_engine,
-                        passphrase,
-                        receipt,
-                    )
-                    .await;
+                    let _ = publish_high_risk_delivery_receipt_router(routes, ctx, receipt).await;
                 }
             }
         }
@@ -2744,11 +2757,7 @@ async fn handle_high_risk_forward(
 
 async fn handle_high_risk_delivery_notice(
     routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
-    _storage: &Arc<Mutex<EtherStorage>>,
-    _seen_messages: &Arc<RwLock<HashSet<[u8; 32]>>>,
-    _max_seen_cache: usize,
-    _gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
-    _passphrase: &str,
+    _ctx: &RouterContext<'_>,
     _slot: u64,
     notice: ForwardDeliveryNotice,
 ) {
@@ -2760,11 +2769,7 @@ async fn handle_high_risk_delivery_notice(
 
 async fn publish_high_risk_delivery_receipt_router(
     routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
-    storage: &Arc<Mutex<EtherStorage>>,
-    seen_messages: &Arc<RwLock<HashSet<[u8; 32]>>>,
-    max_seen_cache: usize,
-    gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
-    passphrase: &str,
+    ctx: &RouterContext<'_>,
     receipt: DeliveryReceipt,
 ) -> Result<(), EtherSyncError> {
     let direction = opposite_route_direction(receipt.direction);
@@ -2788,11 +2793,7 @@ async fn publish_high_risk_delivery_receipt_router(
     };
 
     publish_orp_frame_router(
-        storage,
-        seen_messages,
-        max_seen_cache,
-        gossip_engine,
-        passphrase,
+        ctx,
         EtherCoordinate::current_slot(),
         OrpFrame::Forward(RouteForward {
             version: 1,
@@ -2902,26 +2903,22 @@ async fn mark_high_risk_forward_seen(
 }
 
 async fn publish_orp_frame_router(
-    storage: &Arc<Mutex<EtherStorage>>,
-    seen_messages: &Arc<RwLock<HashSet<[u8; 32]>>>,
-    max_seen_cache: usize,
-    gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
-    passphrase: &str,
+    ctx: &RouterContext<'_>,
     slot: u64,
     frame: OrpFrame,
     subspace: u64,
 ) -> Result<(), EtherSyncError> {
     let payload = encode_orp_frame(&frame)?;
-    let msg = EtherMessage::new_control_message(passphrase, slot, &payload, subspace)?;
+    let msg = EtherMessage::new_control_message(ctx.passphrase, slot, &payload, subspace)?;
     let hash = blake3_hash(&msg.encrypted_payload);
     {
-        let mut st = storage.lock().await;
+        let mut st = ctx.storage.lock().await;
         st.store(slot, hash, msg.clone())?;
     }
     {
-        let mut seen = seen_messages.write().await;
+        let mut seen = ctx.seen_messages.write().await;
         seen.insert(hash);
-        if seen.len() > max_seen_cache {
+        if seen.len() > ctx.max_seen_cache {
             let to_remove: Vec<_> = seen.iter().take(seen.len() / 2).cloned().collect();
             for h in to_remove {
                 seen.remove(&h);
@@ -2929,7 +2926,7 @@ async fn publish_orp_frame_router(
         }
     }
 
-    let ge = gossip_engine.clone();
+    let ge = ctx.gossip_engine.clone();
     tokio::spawn(async move {
         for _ in 0..50 {
             {
