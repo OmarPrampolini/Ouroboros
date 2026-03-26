@@ -14,7 +14,7 @@ use crate::{
     },
     routing::{
         encode_orp_frame, CircuitClose, CircuitExtend, CircuitOpen, CircuitReady, CoverPacket,
-        DeliveryReceipt, ForwardDeliveryNotice, HighRiskCircuitPlan, HighRiskGateSnapshot,
+        DeliveryReceipt, ForwardDeliveryNotice, HighRiskCircuitHop, HighRiskCircuitPlan, HighRiskGateSnapshot,
         HighRiskRouteDescriptor, OrpFrame, RouteAnnouncement, RouteCache, RouteCapabilities,
         RouteClass, RouteDirection, RouteForward, RouteHop, RouteLookup, RouteOffer,
         SUBSPACE_CIRCUIT_CLOSE, SUBSPACE_CIRCUIT_EXTEND, SUBSPACE_CIRCUIT_OPEN,
@@ -874,10 +874,10 @@ impl EtherNode {
         }
 
         // Spawn slot sweep task
-        let sweep_handle = self.spawn_sweep_task();
+        let mut sweep_handle = self.spawn_sweep_task();
 
         // Spawn peer cleanup task
-        let cleanup_handle = self.spawn_cleanup_task();
+        let mut cleanup_handle = self.spawn_cleanup_task();
 
         info!("EtherNode running with gossip engine");
 
@@ -890,8 +890,8 @@ impl EtherNode {
                         error!("Gossip engine error: {:?}", e);
                     }
                 }
-                _ = sweep_handle => {}
-                _ = cleanup_handle => {}
+                _ = &mut sweep_handle => {}
+                _ = &mut cleanup_handle => {}
                 _ = shutdown_rx.changed() => {
                     info!("Shutdown signal received, stopping node...");
                 }
@@ -937,6 +937,7 @@ impl EtherNode {
         let interval_secs = self.config.sweep_interval_secs;
         let high_risk_routes = Arc::clone(&self.high_risk_routes);
         let pending_high_risk_accepts = Arc::clone(&self.pending_high_risk_accepts);
+        let pending_high_risk_acks = Arc::clone(&self.pending_high_risk_acks);
         let high_risk_forward_seen = Arc::clone(&self.high_risk_forward_seen);
 
         tokio::spawn(async move {
@@ -2567,7 +2568,7 @@ async fn install_high_risk_route_binding(
             .or_default()
             .push_back(PendingHighRiskTransportSession {
                 circuit_id,
-                descriptor,
+                descriptor: descriptor.clone(),
                 local_role,
                 receiver,
                 ready_state,
@@ -2630,7 +2631,7 @@ async fn handle_high_risk_forward(
     max_seen_cache: usize,
     gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
     passphrase: &str,
-    _slot: u64,
+    slot: u64,
     forward: RouteForward,
 ) {
     if !mark_high_risk_forward_seen(forward_seen, &forward).await {
