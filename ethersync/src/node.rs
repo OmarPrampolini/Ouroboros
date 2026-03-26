@@ -7,12 +7,20 @@ use crate::{
     gossip::{GossipEngine, PeerManager},
     message::EtherMessage,
     network::EtherUdpSocket,
+    onion::{
+        decrypt_reply_layers, derive_onion_public_key, derive_onion_session_key,
+        derive_rotating_onion_secret_key, encrypt_reply_layers, open_hop_capsule, seal_hop_capsule,
+        HighRiskHopCapsule, HopHandshake, OnionCodec, OnionLayer,
+    },
     routing::{
-        encode_orp_frame, CircuitClose, CircuitExtend, CircuitOpen, CoverPacket,
-        HighRiskCircuitPlan, HighRiskGateSnapshot, OrpFrame, RouteAnnouncement, RouteCache,
-        RouteCapabilities, RouteClass, RouteHop, RouteLookup, RouteOffer, SUBSPACE_CIRCUIT_CLOSE,
-        SUBSPACE_CIRCUIT_EXTEND, SUBSPACE_CIRCUIT_OPEN, SUBSPACE_COVER_TRAFFIC,
-        SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_LOOKUP, SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
+        encode_orp_frame, CircuitClose, CircuitExtend, CircuitOpen, CircuitReady, CoverPacket,
+        DeliveryReceipt, ForwardDeliveryNotice, HighRiskCircuitPlan, HighRiskGateSnapshot,
+        HighRiskRouteDescriptor, OrpFrame, RouteAnnouncement, RouteCache, RouteCapabilities,
+        RouteClass, RouteDirection, RouteForward, RouteHop, RouteLookup, RouteOffer,
+        SUBSPACE_CIRCUIT_CLOSE, SUBSPACE_CIRCUIT_EXTEND, SUBSPACE_CIRCUIT_OPEN,
+        SUBSPACE_CIRCUIT_READY, SUBSPACE_COVER_TRAFFIC, SUBSPACE_DELIVERY_NOTICE,
+        SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_FORWARD, SUBSPACE_ROUTE_LOOKUP,
+        SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
     },
     storage::EtherStorage,
     EtherSyncError,
@@ -21,14 +29,16 @@ use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
 use ouroboros_crypto::random::fill_random;
 use serde::Serialize;
-use std::collections::{HashMap as StdHashMap, HashSet};
+use std::collections::{HashMap as StdHashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tokio::time::interval;
 use tracing::{error, info, trace, warn};
+use zeroize::{Zeroize, Zeroizing};
 
 /// EtherNode configuration
 #[derive(Debug, Clone)]
@@ -153,6 +163,106 @@ struct ObservedHighRiskCircuit {
     last_updated_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighRiskLocalRole {
+    Origin,
+    Entry,
+    Middle,
+    Exit,
+}
+
+#[derive(Debug)]
+struct HighRiskRouteBinding {
+    descriptor: HighRiskRouteDescriptor,
+    local_role: HighRiskLocalRole,
+    deliver_tx: Option<mpsc::Sender<Vec<u8>>>,
+    hop_session_key: Option<[u8; 32]>,
+    reply_session_key: Option<[u8; 32]>,
+    onion_codec: Option<OnionCodec>,
+    ready_state: Option<Arc<AtomicBool>>,
+    ready_notify: Option<Arc<Notify>>,
+    last_updated_ms: u64,
+}
+
+impl Drop for HighRiskRouteBinding {
+    fn drop(&mut self) {
+        if let Some(key) = self.hop_session_key.as_mut() {
+            key.zeroize();
+        }
+        if let Some(key) = self.reply_session_key.as_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingHighRiskTransportSession {
+    circuit_id: [u8; 16],
+    descriptor: HighRiskRouteDescriptor,
+    local_role: HighRiskLocalRole,
+    receiver: mpsc::Receiver<Vec<u8>>,
+    ready_state: Arc<AtomicBool>,
+    ready_notify: Arc<Notify>,
+}
+
+#[derive(Debug)]
+pub struct HighRiskTransportSession {
+    pub circuit_id: [u8; 16],
+    pub descriptor: HighRiskRouteDescriptor,
+    pub local_role: HighRiskLocalRole,
+    pub receiver: mpsc::Receiver<Vec<u8>>,
+    ready_state: Arc<AtomicBool>,
+    ready_notify: Arc<Notify>,
+}
+
+impl HighRiskTransportSession {
+    /// Wait until the exit confirms that the circuit has been installed locally.
+    pub async fn wait_ready(&self, timeout: Duration) -> Result<(), EtherSyncError> {
+        if self.ready_state.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.ready_notify.notified();
+                if self.ready_state.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| EtherSyncError::NetworkError("circuit establishment timed out".to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct HighRiskAckKey {
+    circuit_id: [u8; 16],
+    packet_id: [u8; 16],
+    direction: RouteDirection,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+enum HighRiskPayloadFrame {
+    Application(Vec<u8>),
+    DeliveryReceipt(DeliveryReceipt),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    Confirmed,
+    Unconfirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct HighRiskForwardKey {
+    circuit_id: [u8; 16],
+    packet_id: [u8; 16],
+    direction: RouteDirection,
+    hop_index: u8,
+}
+
 /// EtherNode - main entry point for EtherSync protocol
 #[derive(Debug)]
 pub struct EtherNode {
@@ -175,6 +285,8 @@ pub struct EtherNode {
     route_cache: Arc<Mutex<RouteCache>>,
     /// Ephemeral node id for the current session (random 16 bytes)
     node_id: [u8; 16],
+    /// Static onion secret for per-hop DH session derivation.
+    onion_secret_key: [u8; 32],
     /// Active ORP spaces: maps space_prefix (first 8 bytes of space_hash)
     /// to the passphrase that was used to join.  Only populated when
     /// `start_orp_for_space` is called.
@@ -184,6 +296,17 @@ pub struct EtherNode {
     orp_announce_tasks: Arc<Mutex<StdHashMap<[u8; 8], tokio::task::JoinHandle<()>>>>,
     /// Observed and locally prepared high-risk circuits.
     high_risk_circuits: Arc<Mutex<StdHashMap<[u8; 16], ObservedHighRiskCircuit>>>,
+    /// High-risk route bindings for the local node's role within observed circuits.
+    high_risk_routes: Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
+    /// Pending inbound high-risk sessions for local acceptors, bucketed per space.
+    pending_high_risk_accepts:
+        Arc<Mutex<StdHashMap<[u8; 8], VecDeque<PendingHighRiskTransportSession>>>>,
+    /// Pending end-to-end delivery acknowledgments for locally-originated packets.
+    pending_high_risk_acks: Arc<Mutex<StdHashMap<HighRiskAckKey, oneshot::Sender<()>>>>,
+    /// Notifier for inbound high-risk session availability.
+    high_risk_accept_notify: Arc<Notify>,
+    /// Deduplication cache for forwarded high-risk packets.
+    high_risk_forward_seen: Arc<Mutex<StdHashMap<HighRiskForwardKey, u64>>>,
 }
 
 impl EtherNode {
@@ -236,6 +359,10 @@ impl EtherNode {
         let mut node_id = [0u8; 16];
         fill_random(&mut node_id)
             .map_err(|_| EtherSyncError::NetworkError("failed to generate node id".to_string()))?;
+        let mut onion_secret_key = [0u8; 32];
+        fill_random(&mut onion_secret_key).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate onion secret key".to_string())
+        })?;
 
         Ok(Self {
             config,
@@ -248,9 +375,15 @@ impl EtherNode {
             max_seen_cache: 10000,
             route_cache: Arc::new(Mutex::new(RouteCache::new())),
             node_id,
+            onion_secret_key,
             orp_spaces: Arc::new(RwLock::new(StdHashMap::new())),
             orp_announce_tasks: Arc::new(Mutex::new(StdHashMap::new())),
             high_risk_circuits: Arc::new(Mutex::new(StdHashMap::new())),
+            high_risk_routes: Arc::new(Mutex::new(StdHashMap::new())),
+            pending_high_risk_accepts: Arc::new(Mutex::new(StdHashMap::new())),
+            pending_high_risk_acks: Arc::new(Mutex::new(StdHashMap::new())),
+            high_risk_accept_notify: Arc::new(Notify::new()),
+            high_risk_forward_seen: Arc::new(Mutex::new(StdHashMap::new())),
         })
     }
 
@@ -426,6 +559,12 @@ impl EtherNode {
         let router_max_seen = self.max_seen_cache;
         let router_enable_orp = self.config.enable_orp;
         let router_high_risk_circuits = Arc::clone(&self.high_risk_circuits);
+        let router_high_risk_routes = Arc::clone(&self.high_risk_routes);
+        let router_pending_high_risk_accepts = Arc::clone(&self.pending_high_risk_accepts);
+        let router_pending_high_risk_acks = Arc::clone(&self.pending_high_risk_acks);
+        let router_high_risk_accept_notify = Arc::clone(&self.high_risk_accept_notify);
+        let router_high_risk_forward_seen = Arc::clone(&self.high_risk_forward_seen);
+        let router_onion_secret_key = Zeroizing::new(self.onion_secret_key);
 
         // Spawn subscription router task
         let router_handle = tokio::spawn(async move {
@@ -489,7 +628,38 @@ impl EtherNode {
                         OrpFrame::Offer(offer) => {
                             cache.insert_offer(offer);
                         }
-                        OrpFrame::Forward(_) | OrpFrame::Ack(_) => {}
+                        OrpFrame::Forward(forward) => {
+                            drop(cache);
+                            handle_high_risk_forward(
+                                &router_high_risk_routes,
+                                &router_pending_high_risk_acks,
+                                &router_high_risk_forward_seen,
+                                &router_storage,
+                                &router_seen,
+                                router_max_seen,
+                                &router_gossip,
+                                &sub._passphrase,
+                                current_slot,
+                                forward,
+                            )
+                            .await;
+                            continue;
+                        }
+                        OrpFrame::DeliveryNotice(notice) => {
+                            drop(cache);
+                            handle_high_risk_delivery_notice(
+                                &router_high_risk_routes,
+                                &router_storage,
+                                &router_seen,
+                                router_max_seen,
+                                &router_gossip,
+                                &sub._passphrase,
+                                current_slot,
+                                notice,
+                            )
+                            .await;
+                            continue;
+                        }
                         OrpFrame::CircuitOpen(open) => {
                             drop(cache);
                             record_high_risk_open(
@@ -499,6 +669,31 @@ impl EtherNode {
                                 &open,
                             )
                             .await;
+                            if let Some(ready) = install_high_risk_route_binding(
+                                &router_high_risk_routes,
+                                &router_pending_high_risk_accepts,
+                                &router_high_risk_accept_notify,
+                                &*router_onion_secret_key,
+                                router_node_id,
+                                open.circuit_id,
+                                space_prefix,
+                                &open.hop_payload,
+                                current_slot,
+                            )
+                            .await
+                            {
+                                let _ = publish_orp_frame_router(
+                                    &router_storage,
+                                    &router_seen,
+                                    router_max_seen,
+                                    &router_gossip,
+                                    &sub._passphrase,
+                                    current_slot,
+                                    OrpFrame::CircuitReady(ready),
+                                    SUBSPACE_CIRCUIT_READY,
+                                )
+                                .await;
+                            }
                             continue;
                         }
                         OrpFrame::CircuitExtend(extend) => {
@@ -510,17 +705,58 @@ impl EtherNode {
                                 &extend,
                             )
                             .await;
+                            if let Some(ready) = install_high_risk_route_binding(
+                                &router_high_risk_routes,
+                                &router_pending_high_risk_accepts,
+                                &router_high_risk_accept_notify,
+                                &*router_onion_secret_key,
+                                router_node_id,
+                                extend.circuit_id,
+                                space_prefix,
+                                &extend.hop_payload,
+                                current_slot,
+                            )
+                            .await
+                            {
+                                let _ = publish_orp_frame_router(
+                                    &router_storage,
+                                    &router_seen,
+                                    router_max_seen,
+                                    &router_gossip,
+                                    &sub._passphrase,
+                                    current_slot,
+                                    OrpFrame::CircuitReady(ready),
+                                    SUBSPACE_CIRCUIT_READY,
+                                )
+                                .await;
+                            }
                             continue;
                         }
                         OrpFrame::CircuitClose(close) => {
                             drop(cache);
-                            record_high_risk_close(
-                                &router_high_risk_circuits,
-                                space_prefix,
-                                msg.header.slot_id,
-                                &close,
-                            )
-                            .await;
+                            let should_remove = {
+                                let routes_guard = router_high_risk_routes.lock().await;
+                                routes_guard
+                                    .get(&close.circuit_id)
+                                    .map(|binding| verify_high_risk_close(binding, &close))
+                                    .unwrap_or(false)
+                            };
+                            if should_remove {
+                                record_high_risk_close(
+                                    &router_high_risk_circuits,
+                                    space_prefix,
+                                    msg.header.slot_id,
+                                    &close,
+                                )
+                                .await;
+                                remove_high_risk_route_binding(
+                                    &router_high_risk_routes,
+                                    &router_pending_high_risk_accepts,
+                                    &router_pending_high_risk_acks,
+                                    close.circuit_id,
+                                )
+                                .await;
+                            }
                             continue;
                         }
                         OrpFrame::Cover(cover) => {
@@ -532,6 +768,11 @@ impl EtherNode {
                                 &cover,
                             )
                             .await;
+                            continue;
+                        }
+                        OrpFrame::CircuitReady(ready) => {
+                            drop(cache);
+                            handle_high_risk_circuit_ready(&router_high_risk_routes, ready).await;
                             continue;
                         }
                         OrpFrame::Lookup(lookup) if router_enable_orp => {
@@ -660,6 +901,8 @@ impl EtherNode {
         // Clean shutdown
         drop(engine);
         router_handle.abort();
+        sweep_handle.abort();
+        cleanup_handle.abort();
         self.abort_orp_announce_tasks().await;
 
         Ok(())
@@ -692,7 +935,9 @@ impl EtherNode {
     /// Spawn slot sweep background task
     fn spawn_sweep_task(&self) -> tokio::task::JoinHandle<()> {
         let interval_secs = self.config.sweep_interval_secs;
-        let _node_self = Arc::new(Mutex::new(())); // Placeholder for self reference
+        let high_risk_routes = Arc::clone(&self.high_risk_routes);
+        let pending_high_risk_accepts = Arc::clone(&self.pending_high_risk_accepts);
+        let high_risk_forward_seen = Arc::clone(&self.high_risk_forward_seen);
 
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(interval_secs));
@@ -708,6 +953,15 @@ impl EtherNode {
                     // Sweep slot - in full implementation would call self.sweep_slot
                     trace!("Sweeping slot {}", slot);
                 }
+
+                sweep_expired_high_risk_bindings(
+                    &high_risk_routes,
+                    &pending_high_risk_accepts,
+                    &pending_high_risk_acks,
+                    &high_risk_forward_seen,
+                    current_slot,
+                )
+                .await;
             }
         })
     }
@@ -866,6 +1120,8 @@ impl EtherNode {
     pub async fn publish_route_announcement(&self, passphrase: &str) -> Result<(), EtherSyncError> {
         let slot = EtherCoordinate::current_slot();
         let local_addr = self.socket.local_addr();
+        let (onion_pubkey, onion_salt) =
+            derive_rotating_announcement_onion_key(&self.onion_secret_key, passphrase, slot)?;
 
         // Build assist_tag: first 8 bytes of blake3(node_id)
         let mut assist_tag = [0u8; 8];
@@ -876,6 +1132,9 @@ impl EtherNode {
             version: 1,
             slot,
             node_id: self.node_id,
+            onion_pubkey,
+            onion_epoch_slot: slot,
+            onion_salt,
             capabilities: RouteCapabilities {
                 can_relay: self.config.orp_can_relay,
                 direct_udp: !local_addr.ip().is_unspecified(),
@@ -985,21 +1244,461 @@ impl EtherNode {
         fill_random(&mut circuit_id).map_err(|_| {
             EtherSyncError::NetworkError("failed to generate high-risk circuit id".to_string())
         })?;
+        let descriptor = self.build_high_risk_route_descriptor(plan, circuit_id, slot + 4);
+        let _ = self
+            .publish_high_risk_route_descriptor(passphrase, &descriptor, slot)
+            .await?;
+        Ok(circuit_id)
+    }
 
-        let open = CircuitOpen {
+    pub async fn open_high_risk_transport(
+        &self,
+        passphrase: &str,
+        target_tag: [u8; 8],
+    ) -> Result<
+        (
+            HighRiskGateSnapshot,
+            HighRiskCircuitPlan,
+            HighRiskTransportSession,
+        ),
+        EtherSyncError,
+    > {
+        let gate = self.high_risk_gate_snapshot(passphrase).await?;
+        let plan = self.plan_high_risk_circuit(passphrase, target_tag).await?;
+        let slot = EtherCoordinate::current_slot();
+        let mut circuit_id = [0u8; 16];
+        fill_random(&mut circuit_id).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate high-risk circuit id".to_string())
+        })?;
+        let descriptor = self.build_high_risk_route_descriptor(&plan, circuit_id, slot + 4);
+        let (deliver_tx, receiver) = mpsc::channel(256);
+        let ready_state = Arc::new(AtomicBool::new(false));
+        let ready_notify = Arc::new(Notify::new());
+        {
+            let mut routes = self.high_risk_routes.lock().await;
+            routes.insert(
+                circuit_id,
+                HighRiskRouteBinding {
+                    descriptor: descriptor.clone(),
+                    local_role: HighRiskLocalRole::Origin,
+                    deliver_tx: Some(deliver_tx),
+                    hop_session_key: None,
+                    reply_session_key: None,
+                    onion_codec: None,
+                    ready_state: Some(Arc::clone(&ready_state)),
+                    ready_notify: Some(Arc::clone(&ready_notify)),
+                    last_updated_ms: now_ms(),
+                },
+            );
+        }
+        let (onion_codec, reply_session_key) = match self
+            .publish_high_risk_route_descriptor(passphrase, &descriptor, slot)
+            .await
+        {
+            Ok(material) => material,
+            Err(err) => {
+                remove_high_risk_route_binding(
+                    &self.high_risk_routes,
+                    &self.pending_high_risk_accepts,
+                    &self.pending_high_risk_acks,
+                    circuit_id,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        {
+            let mut routes = self.high_risk_routes.lock().await;
+            if let Some(binding) = routes.get_mut(&circuit_id) {
+                binding.onion_codec = Some(onion_codec);
+                binding.reply_session_key = Some(reply_session_key);
+            }
+        }
+        Ok((
+            gate,
+            plan,
+            HighRiskTransportSession {
+                circuit_id,
+                descriptor,
+                local_role: HighRiskLocalRole::Origin,
+                receiver,
+                ready_state,
+                ready_notify,
+            },
+        ))
+    }
+
+    pub async fn accept_high_risk_transport(
+        &self,
+        passphrase: &str,
+        timeout: Duration,
+    ) -> Result<HighRiskTransportSession, EtherSyncError> {
+        let space_prefix = space_prefix_for_passphrase(passphrase);
+        let started = tokio::time::Instant::now();
+        loop {
+            let notified = self.high_risk_accept_notify.notified();
+            if let Some(session) = {
+                let mut pending = self.pending_high_risk_accepts.lock().await;
+                pending
+                    .get_mut(&space_prefix)
+                    .and_then(|queue| queue.pop_front())
+                    .map(|session| HighRiskTransportSession {
+                        circuit_id: session.circuit_id,
+                        descriptor: session.descriptor,
+                        local_role: session.local_role,
+                        receiver: session.receiver,
+                        ready_state: session.ready_state,
+                        ready_notify: session.ready_notify,
+                    })
+            } {
+                return Ok(session);
+            }
+
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(EtherSyncError::NetworkError(
+                    "timed out waiting for an inbound high-risk circuit".to_string(),
+                ));
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return Err(EtherSyncError::NetworkError(
+                    "timed out waiting for an inbound high-risk circuit".to_string(),
+                ));
+            }
+        }
+    }
+
+    pub async fn send_high_risk_payload(
+        &self,
+        passphrase: &str,
+        circuit_id: [u8; 16],
+        direction: RouteDirection,
+        payload: Vec<u8>,
+    ) -> Result<(), EtherSyncError> {
+        let mut packet_id = [0u8; 16];
+        fill_random(&mut packet_id).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate high-risk packet id".to_string())
+        })?;
+        self.publish_high_risk_payload_frame(
+            passphrase,
+            circuit_id,
+            packet_id,
+            direction,
+            HighRiskPayloadFrame::Application(payload),
+        )
+        .await
+    }
+
+    pub async fn send_high_risk_payload_reliable(
+        &self,
+        passphrase: &str,
+        circuit_id: [u8; 16],
+        direction: RouteDirection,
+        payload: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<DeliveryOutcome, EtherSyncError> {
+        let mut packet_id = [0u8; 16];
+        fill_random(&mut packet_id).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate high-risk packet id".to_string())
+        })?;
+        let (tx, rx) = oneshot::channel();
+        let ack_key = HighRiskAckKey {
+            circuit_id,
+            packet_id,
+            direction,
+        };
+        self.pending_high_risk_acks.lock().await.insert(ack_key, tx);
+
+        if let Err(err) = self
+            .publish_high_risk_payload_frame(
+                passphrase,
+                circuit_id,
+                packet_id,
+                direction,
+                HighRiskPayloadFrame::Application(payload),
+            )
+            .await
+        {
+            self.pending_high_risk_acks.lock().await.remove(&ack_key);
+            return Err(err);
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(())) => Ok(DeliveryOutcome::Confirmed),
+            _ => {
+                self.pending_high_risk_acks.lock().await.remove(&ack_key);
+                Ok(DeliveryOutcome::Unconfirmed)
+            }
+        }
+    }
+
+    async fn publish_high_risk_payload_frame(
+        &self,
+        passphrase: &str,
+        circuit_id: [u8; 16],
+        packet_id: [u8; 16],
+        direction: RouteDirection,
+        frame: HighRiskPayloadFrame,
+    ) -> Result<(), EtherSyncError> {
+        let payload_bytes = serialize_high_risk_payload_frame(&frame)?;
+        let (payload, hop_index, remaining_hops) = {
+            let routes = self.high_risk_routes.lock().await;
+            let Some(binding) = routes.get(&circuit_id) else {
+                return Err(EtherSyncError::NetworkError(
+                    "high-risk circuit binding not found for outbound payload".to_string(),
+                ));
+            };
+            let payload =
+                encode_outbound_high_risk_payload(binding, direction, &packet_id, &payload_bytes)?;
+            let (hop_index, remaining_hops) =
+                outbound_high_risk_route_state(binding.local_role, direction)?;
+            (payload, hop_index, remaining_hops)
+        };
+
+        let forward = RouteForward {
+            version: 1,
+            circuit_id,
+            packet_id,
+            direction,
+            hop_index,
+            remaining_hops,
+            payload,
+        };
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::Forward(forward),
+            SUBSPACE_ROUTE_FORWARD,
+            EtherCoordinate::current_slot(),
+        )
+        .await
+    }
+
+    pub async fn publish_high_risk_delivery_notice(
+        &self,
+        passphrase: &str,
+        circuit_id: [u8; 16],
+        packet_id: [u8; 16],
+        direction: RouteDirection,
+        delivered_hop: u8,
+    ) -> Result<(), EtherSyncError> {
+        let notice = ForwardDeliveryNotice {
+            version: 1,
+            packet_id,
+            circuit_id,
+            direction,
+            delivered_hop,
+        };
+        self.publish_orp_frame(
+            passphrase,
+            OrpFrame::DeliveryNotice(notice),
+            SUBSPACE_DELIVERY_NOTICE,
+            EtherCoordinate::current_slot(),
+        )
+        .await
+    }
+
+    fn build_high_risk_route_descriptor(
+        &self,
+        plan: &HighRiskCircuitPlan,
+        circuit_id: [u8; 16],
+        expires_at_slot: u64,
+    ) -> HighRiskRouteDescriptor {
+        HighRiskRouteDescriptor {
             version: 1,
             circuit_id,
             origin_id: self.node_id,
-            first_hop: RouteHop::Relay {
-                relay_addr: plan.entry.addr,
-                target_tag: plan.entry.assist_tag,
-            },
-            hop_payload: format!(
-                "orp-highrisk:entry:{}:{}",
-                plan.entry.operator_id_hint, plan.entry.region_hint
+            space_prefix: plan.space_prefix,
+            target_tag: plan.target_tag,
+            entry: plan.entry.clone(),
+            middle: plan.middle.clone(),
+            exit: plan.exit.clone(),
+            expires_at_slot,
+        }
+    }
+
+    async fn publish_high_risk_route_descriptor(
+        &self,
+        passphrase: &str,
+        descriptor: &HighRiskRouteDescriptor,
+        slot: u64,
+    ) -> Result<(OnionCodec, [u8; 32]), EtherSyncError> {
+        let mut entry_secret = Zeroizing::new([0u8; 32]);
+        fill_random(&mut *entry_secret).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate entry onion secret".to_string())
+        })?;
+        let mut middle_secret = Zeroizing::new([0u8; 32]);
+        fill_random(&mut *middle_secret).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate middle onion secret".to_string())
+        })?;
+        let mut exit_secret = Zeroizing::new([0u8; 32]);
+        fill_random(&mut *exit_secret).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate exit onion secret".to_string())
+        })?;
+        let mut reply_entry_secret = Zeroizing::new([0u8; 32]);
+        fill_random(&mut *reply_entry_secret).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate reply entry onion secret".to_string())
+        })?;
+        let mut reply_middle_secret = Zeroizing::new([0u8; 32]);
+        fill_random(&mut *reply_middle_secret).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate reply middle onion secret".to_string())
+        })?;
+        let mut reply_exit_secret = Zeroizing::new([0u8; 32]);
+        fill_random(&mut *reply_exit_secret).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate reply exit onion secret".to_string())
+        })?;
+
+        let entry_session_key = Zeroizing::new(
+            derive_onion_session_key(
+                &*entry_secret,
+                &descriptor.entry.onion_pubkey,
+                &descriptor.circuit_id,
             )
-            .into_bytes(),
-            expires_at_slot: slot + 4,
+            .map_err(map_onion_error)?,
+        );
+        let middle_session_key = Zeroizing::new(
+            derive_onion_session_key(
+                &*middle_secret,
+                &descriptor.middle.onion_pubkey,
+                &descriptor.circuit_id,
+            )
+            .map_err(map_onion_error)?,
+        );
+        let exit_session_key = Zeroizing::new(
+            derive_onion_session_key(
+                &*exit_secret,
+                &descriptor.exit.onion_pubkey,
+                &descriptor.circuit_id,
+            )
+            .map_err(map_onion_error)?,
+        );
+        let reply_entry_session_key = Zeroizing::new(
+            derive_onion_session_key(
+                &*reply_entry_secret,
+                &descriptor.entry.onion_pubkey,
+                &descriptor.circuit_id,
+            )
+            .map_err(map_onion_error)?,
+        );
+        let reply_middle_session_key = Zeroizing::new(
+            derive_onion_session_key(
+                &*reply_middle_secret,
+                &descriptor.middle.onion_pubkey,
+                &descriptor.circuit_id,
+            )
+            .map_err(map_onion_error)?,
+        );
+        let reply_exit_session_key = Zeroizing::new(
+            derive_onion_session_key(
+                &*reply_exit_secret,
+                &descriptor.exit.onion_pubkey,
+                &descriptor.circuit_id,
+            )
+            .map_err(map_onion_error)?,
+        );
+
+        let entry_payload = serialize_hop_handshake(HopHandshake {
+            origin_ephemeral_pubkey: derive_onion_public_key(&*entry_secret),
+            onion_epoch_slot: descriptor.entry.onion_epoch_slot,
+            onion_salt: descriptor.entry.onion_salt,
+            sealed_capsule: seal_hop_capsule(
+                &*entry_session_key,
+                &descriptor.circuit_id,
+                &HighRiskHopCapsule {
+                    descriptor: build_minimal_high_risk_descriptor(
+                        descriptor,
+                        HighRiskLocalRole::Entry,
+                    ),
+                    local_role_code: high_risk_local_role_code(HighRiskLocalRole::Entry),
+                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&*reply_entry_secret),
+                },
+            )
+            .map_err(map_onion_error)?,
+            reply_layers_ciphertext: Vec::new(),
+        })?;
+        let middle_payload = serialize_hop_handshake(HopHandshake {
+            origin_ephemeral_pubkey: derive_onion_public_key(&*middle_secret),
+            onion_epoch_slot: descriptor.middle.onion_epoch_slot,
+            onion_salt: descriptor.middle.onion_salt,
+            sealed_capsule: seal_hop_capsule(
+                &*middle_session_key,
+                &descriptor.circuit_id,
+                &HighRiskHopCapsule {
+                    descriptor: build_minimal_high_risk_descriptor(
+                        descriptor,
+                        HighRiskLocalRole::Middle,
+                    ),
+                    local_role_code: high_risk_local_role_code(HighRiskLocalRole::Middle),
+                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&*reply_middle_secret),
+                },
+            )
+            .map_err(map_onion_error)?,
+            reply_layers_ciphertext: Vec::new(),
+        })?;
+        let mut reply_layers = [
+            OnionLayer {
+                session_key: *reply_middle_session_key,
+                hop_index: 1,
+            },
+            OnionLayer {
+                session_key: *reply_entry_session_key,
+                hop_index: 0,
+            },
+            OnionLayer {
+                session_key: *reply_exit_session_key,
+                hop_index: 2,
+            },
+        ];
+        let exit_payload = serialize_hop_handshake(HopHandshake {
+            origin_ephemeral_pubkey: derive_onion_public_key(&*exit_secret),
+            onion_epoch_slot: descriptor.exit.onion_epoch_slot,
+            onion_salt: descriptor.exit.onion_salt,
+            sealed_capsule: seal_hop_capsule(
+                &*exit_session_key,
+                &descriptor.circuit_id,
+                &HighRiskHopCapsule {
+                    descriptor: build_minimal_high_risk_descriptor(
+                        descriptor,
+                        HighRiskLocalRole::Exit,
+                    ),
+                    local_role_code: high_risk_local_role_code(HighRiskLocalRole::Exit),
+                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&*reply_exit_secret),
+                },
+            )
+            .map_err(map_onion_error)?,
+            reply_layers_ciphertext: encrypt_reply_layers(
+                &*reply_exit_session_key,
+                &descriptor.circuit_id,
+                &reply_layers,
+            )
+            .map_err(map_onion_error)?,
+        })?;
+        for layer in &mut reply_layers {
+            layer.session_key.zeroize();
+        }
+
+        let onion_codec = OnionCodec {
+            layers: vec![
+                OnionLayer {
+                    session_key: *entry_session_key,
+                    hop_index: 0,
+                },
+                OnionLayer {
+                    session_key: *middle_session_key,
+                    hop_index: 1,
+                },
+                OnionLayer {
+                    session_key: *exit_session_key,
+                    hop_index: 2,
+                },
+            ],
+        };
+
+        let open = CircuitOpen {
+            version: 1,
+            circuit_id: descriptor.circuit_id,
+            hop_payload: entry_payload,
+            expires_at_slot: descriptor.expires_at_slot,
         };
         self.publish_orp_frame(
             passphrase,
@@ -1013,18 +1712,10 @@ impl EtherNode {
 
         let middle = CircuitExtend {
             version: 1,
-            circuit_id,
+            circuit_id: descriptor.circuit_id,
             current_hop: 1,
-            next_hop: RouteHop::Relay {
-                relay_addr: plan.middle.addr,
-                target_tag: plan.middle.assist_tag,
-            },
-            hop_payload: format!(
-                "orp-highrisk:middle:{}:{}",
-                plan.middle.operator_id_hint, plan.middle.region_hint
-            )
-            .into_bytes(),
-            expires_at_slot: slot + 4,
+            hop_payload: middle_payload,
+            expires_at_slot: descriptor.expires_at_slot,
         };
         self.publish_orp_frame(
             passphrase,
@@ -1038,17 +1729,10 @@ impl EtherNode {
 
         let exit = CircuitExtend {
             version: 1,
-            circuit_id,
+            circuit_id: descriptor.circuit_id,
             current_hop: 2,
-            next_hop: RouteHop::Direct {
-                addr: plan.exit.addr,
-            },
-            hop_payload: format!(
-                "orp-highrisk:exit:{}:{}",
-                plan.exit.operator_id_hint, plan.exit.region_hint
-            )
-            .into_bytes(),
-            expires_at_slot: slot + 4,
+            hop_payload: exit_payload,
+            expires_at_slot: descriptor.expires_at_slot,
         };
         self.publish_orp_frame(
             passphrase,
@@ -1062,7 +1746,7 @@ impl EtherNode {
 
         let cover = CoverPacket {
             version: 1,
-            stream_id: circuit_id,
+            stream_id: descriptor.circuit_id,
             cover_class: 1,
             payload: vec![0u8; 256],
         };
@@ -1075,8 +1759,7 @@ impl EtherNode {
         .await?;
         record_high_risk_cover_for_passphrase(&self.high_risk_circuits, passphrase, slot, &cover)
             .await;
-
-        Ok(circuit_id)
+        Ok((onion_codec, *reply_exit_session_key))
     }
 
     pub async fn close_high_risk_circuit(
@@ -1086,20 +1769,36 @@ impl EtherNode {
         reason_code: u16,
     ) -> Result<(), EtherSyncError> {
         let slot = EtherCoordinate::current_slot();
-        let close = CircuitClose {
-            version: 1,
-            circuit_id,
-            reason_code,
+        let close_frames = {
+            let routes = self.high_risk_routes.lock().await;
+            routes
+                .get(&circuit_id)
+                .map(|binding| build_high_risk_close_frames(binding, circuit_id, reason_code))
+                .unwrap_or_default()
         };
-        self.publish_orp_frame(
-            passphrase,
-            OrpFrame::CircuitClose(close.clone()),
-            SUBSPACE_CIRCUIT_CLOSE,
-            slot,
-        )
-        .await?;
-        record_high_risk_close_for_passphrase(&self.high_risk_circuits, passphrase, slot, &close)
+        for close in &close_frames {
+            self.publish_orp_frame(
+                passphrase,
+                OrpFrame::CircuitClose(close.clone()),
+                SUBSPACE_CIRCUIT_CLOSE,
+                slot,
+            )
+            .await?;
+            record_high_risk_close_for_passphrase(
+                &self.high_risk_circuits,
+                passphrase,
+                slot,
+                close,
+            )
             .await;
+        }
+        remove_high_risk_route_binding(
+            &self.high_risk_routes,
+            &self.pending_high_risk_accepts,
+            &self.pending_high_risk_acks,
+            circuit_id,
+        )
+        .await;
         Ok(())
     }
 
@@ -1229,6 +1928,10 @@ impl EtherNode {
 
         self.orp_spaces.write().await.clear();
         self.high_risk_circuits.lock().await.clear();
+        self.high_risk_routes.lock().await.clear();
+        self.pending_high_risk_accepts.lock().await.clear();
+        self.pending_high_risk_acks.lock().await.clear();
+        self.high_risk_forward_seen.lock().await.clear();
     }
 
     /// Spawn the ORP periodic announcement task.
@@ -1243,6 +1946,7 @@ impl EtherNode {
         let route_cache = Arc::clone(&self.route_cache);
         let socket = Arc::clone(&self.socket);
         let node_id = self.node_id;
+        let onion_secret_key = Zeroizing::new(self.onion_secret_key);
         let max_seen_cache = self.max_seen_cache;
         let orp_can_relay = self.config.orp_can_relay;
         let orp_wan_assist = self.config.orp_wan_assist;
@@ -1260,6 +1964,20 @@ impl EtherNode {
 
                 let slot = EtherCoordinate::current_slot();
                 let local_addr = socket.local_addr();
+                let (onion_pubkey, onion_salt) = match derive_rotating_announcement_onion_key(
+                    &onion_secret_key,
+                    &passphrase,
+                    slot,
+                ) {
+                    Ok(material) => material,
+                    Err(err) => {
+                        warn!(
+                            "ORP onion announcement derive error in announce task: {:?}",
+                            err
+                        );
+                        continue;
+                    }
+                };
 
                 let mut assist_tag = [0u8; 8];
                 let tag_hash = blake3_hash(&node_id);
@@ -1269,6 +1987,9 @@ impl EtherNode {
                     version: 1,
                     slot,
                     node_id,
+                    onion_pubkey,
+                    onion_epoch_slot: slot,
+                    onion_salt,
                     capabilities: RouteCapabilities {
                         can_relay: orp_can_relay,
                         direct_udp: !local_addr.ip().is_unspecified(),
@@ -1380,14 +2101,106 @@ fn space_prefix_for_passphrase(passphrase: &str) -> [u8; 8] {
     prefix
 }
 
-fn route_hop_label(hop: &RouteHop) -> String {
-    match hop {
-        RouteHop::Direct { addr } => format!("direct:{addr}"),
-        RouteHop::Relay {
-            relay_addr,
-            target_tag,
-        } => format!("relay:{}#{}", relay_addr, hex::encode(target_tag)),
-        RouteHop::Tor { onion_address } => format!("tor:{onion_address}"),
+fn derive_rotating_announcement_onion_key(
+    onion_root_secret_key: &[u8; 32],
+    passphrase: &str,
+    slot: u64,
+) -> Result<([u8; 32], [u8; 16]), EtherSyncError> {
+    let space_prefix = space_prefix_for_passphrase(passphrase);
+    let mut onion_salt = [0u8; 16];
+    fill_random(&mut onion_salt).map_err(|_| {
+        EtherSyncError::NetworkError("failed to generate announcement onion salt".to_string())
+    })?;
+    let onion_secret_key =
+        derive_rotating_onion_secret_key(onion_root_secret_key, &space_prefix, slot, &onion_salt)
+            .map_err(map_onion_error)?;
+    let onion_secret_key = Zeroizing::new(onion_secret_key);
+    Ok((derive_onion_public_key(&onion_secret_key), onion_salt))
+}
+
+fn masked_high_risk_hop() -> HighRiskCircuitHop {
+    HighRiskCircuitHop {
+        node_id: [0u8; 16],
+        onion_pubkey: [0u8; 32],
+        onion_epoch_slot: 0,
+        onion_salt: [0u8; 16],
+        assist_tag: [0u8; 8],
+        addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+        route_class: RouteClass::Direct,
+        operator_id_hint: String::new(),
+        region_hint: String::new(),
+        can_relay: false,
+        bridge_capable: false,
+    }
+}
+
+fn build_minimal_high_risk_descriptor(
+    descriptor: &HighRiskRouteDescriptor,
+    local_role: HighRiskLocalRole,
+) -> HighRiskRouteDescriptor {
+    let mut minimal = HighRiskRouteDescriptor {
+        version: descriptor.version,
+        circuit_id: descriptor.circuit_id,
+        origin_id: [0u8; 16],
+        space_prefix: descriptor.space_prefix,
+        target_tag: [0u8; 8],
+        entry: masked_high_risk_hop(),
+        middle: masked_high_risk_hop(),
+        exit: masked_high_risk_hop(),
+        expires_at_slot: descriptor.expires_at_slot,
+    };
+
+    match local_role {
+        HighRiskLocalRole::Origin => {
+            minimal.origin_id = descriptor.origin_id;
+            minimal.target_tag = descriptor.target_tag;
+            minimal.entry = descriptor.entry.clone();
+            minimal.middle = descriptor.middle.clone();
+            minimal.exit = descriptor.exit.clone();
+        }
+        HighRiskLocalRole::Entry => {
+            minimal.entry = descriptor.entry.clone();
+        }
+        HighRiskLocalRole::Middle => {
+            minimal.middle = descriptor.middle.clone();
+        }
+        HighRiskLocalRole::Exit => {
+            minimal.target_tag = descriptor.target_tag;
+            minimal.exit = descriptor.exit.clone();
+        }
+    }
+
+    minimal
+}
+
+fn high_risk_local_role_code(local_role: HighRiskLocalRole) -> u8 {
+    match local_role {
+        HighRiskLocalRole::Origin => 0,
+        HighRiskLocalRole::Entry => 1,
+        HighRiskLocalRole::Middle => 2,
+        HighRiskLocalRole::Exit => 3,
+    }
+}
+
+fn high_risk_local_role_from_code(code: u8) -> Option<HighRiskLocalRole> {
+    match code {
+        1 => Some(HighRiskLocalRole::Entry),
+        2 => Some(HighRiskLocalRole::Middle),
+        3 => Some(HighRiskLocalRole::Exit),
+        _ => None,
+    }
+}
+
+fn high_risk_role_matches_descriptor(
+    local_role: HighRiskLocalRole,
+    node_id: [u8; 16],
+    descriptor: &HighRiskRouteDescriptor,
+) -> bool {
+    match local_role {
+        HighRiskLocalRole::Origin => descriptor.origin_id == node_id,
+        HighRiskLocalRole::Entry => descriptor.entry.node_id == node_id,
+        HighRiskLocalRole::Middle => descriptor.middle.node_id == node_id,
+        HighRiskLocalRole::Exit => descriptor.exit.node_id == node_id,
     }
 }
 
@@ -1501,12 +2314,12 @@ async fn record_high_risk_open(
         .or_insert_with(|| ObservedHighRiskCircuit {
             circuit_id: frame.circuit_id,
             space_prefix,
-            origin_id: Some(frame.origin_id),
+            origin_id: None,
             active: true,
             opened_at_slot: Some(slot),
             expires_at_slot: Some(frame.expires_at_slot),
-            first_hop: Some(route_hop_label(&frame.first_hop)),
-            last_hop: Some(route_hop_label(&frame.first_hop)),
+            first_hop: Some("sealed-capsule".to_string()),
+            last_hop: Some("sealed-capsule".to_string()),
             extend_count: 0,
             highest_hop_index: 0,
             cover_packets: 0,
@@ -1515,7 +2328,6 @@ async fn record_high_risk_open(
             last_updated_ms: now_ms(),
         });
     record.space_prefix = space_prefix;
-    record.origin_id = Some(frame.origin_id);
     record.active = true;
     record.opened_at_slot.get_or_insert(slot);
     record.expires_at_slot = Some(
@@ -1524,10 +2336,10 @@ async fn record_high_risk_open(
             .unwrap_or(frame.expires_at_slot)
             .max(frame.expires_at_slot),
     );
-    record.first_hop = Some(route_hop_label(&frame.first_hop));
+    record.first_hop = Some("sealed-capsule".to_string());
     record
         .last_hop
-        .get_or_insert_with(|| route_hop_label(&frame.first_hop));
+        .get_or_insert_with(|| "sealed-capsule".to_string());
     record.close_reason = None;
     record.last_updated_ms = now_ms();
     push_control_frame_label(record, "CircuitOpen");
@@ -1572,7 +2384,7 @@ async fn record_high_risk_extend(
     record.highest_hop_index = record
         .highest_hop_index
         .max(frame.current_hop.saturating_add(1));
-    record.last_hop = Some(route_hop_label(&frame.next_hop));
+    record.last_hop = Some(format!("sealed-hop-{}", frame.current_hop));
     record.close_reason = None;
     record.last_updated_ms = now_ms();
     push_control_frame_label(record, "CircuitExtend");
@@ -1649,6 +2461,829 @@ async fn record_high_risk_cover(
     record.cover_packets = record.cover_packets.saturating_add(1);
     record.last_updated_ms = now_ms();
     push_control_frame_label(record, "Cover");
+}
+
+async fn install_high_risk_route_binding(
+    routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
+    pending_accepts: &Arc<Mutex<StdHashMap<[u8; 8], VecDeque<PendingHighRiskTransportSession>>>>,
+    accept_notify: &Arc<Notify>,
+    onion_secret_key: &[u8; 32],
+    node_id: [u8; 16],
+    circuit_id: [u8; 16],
+    space_prefix: [u8; 8],
+    payload: &[u8],
+    current_slot: u64,
+) -> Option<CircuitReady> {
+    let Some(handshake) = decode_high_risk_hop_handshake(payload) else {
+        return None;
+    };
+    let local_onion_secret_key = Zeroizing::new(
+        derive_rotating_onion_secret_key(
+            onion_secret_key,
+            &space_prefix,
+            handshake.onion_epoch_slot,
+            &handshake.onion_salt,
+        )
+        .ok()?,
+    );
+    let hop_session_key = Zeroizing::new(
+        derive_onion_session_key(
+            &local_onion_secret_key,
+            &handshake.origin_ephemeral_pubkey,
+            &circuit_id,
+        )
+        .ok()?,
+    );
+    let capsule =
+        open_hop_capsule(&hop_session_key, &circuit_id, &handshake.sealed_capsule).ok()?;
+    let descriptor = capsule.descriptor;
+    if descriptor.circuit_id != circuit_id {
+        return None;
+    }
+    if descriptor.space_prefix != space_prefix {
+        return None;
+    }
+    if descriptor.expires_at_slot < current_slot {
+        return None;
+    }
+    let Some(local_role) = high_risk_local_role_from_code(capsule.local_role_code) else {
+        return None;
+    };
+    if !high_risk_role_matches_descriptor(local_role, node_id, &descriptor) {
+        return None;
+    }
+    let hop_session_key = Some(*hop_session_key);
+    let reply_session_key = Zeroizing::new(
+        derive_onion_session_key(
+            &local_onion_secret_key,
+            &capsule.reply_origin_ephemeral_pubkey,
+            &descriptor.circuit_id,
+        )
+        .ok()?,
+    );
+
+    let mut routes_guard = routes.lock().await;
+    if let Some(existing) = routes_guard.get_mut(&descriptor.circuit_id) {
+        existing.last_updated_ms = now_ms();
+        return None;
+    }
+
+    if local_role == HighRiskLocalRole::Exit {
+        let circuit_id = descriptor.circuit_id;
+        let (deliver_tx, receiver) = mpsc::channel(256);
+        let ready_state = Arc::new(AtomicBool::new(true));
+        let ready_notify = Arc::new(Notify::new());
+        let exit_onion_codec = if handshake.reply_layers_ciphertext.is_empty() {
+            None
+        } else {
+            Some(OnionCodec {
+                layers: decrypt_reply_layers(
+                    &reply_session_key,
+                    &descriptor.circuit_id,
+                    &handshake.reply_layers_ciphertext,
+                )
+                .ok()?,
+            })
+        };
+        routes_guard.insert(
+            circuit_id,
+            HighRiskRouteBinding {
+                descriptor: descriptor.clone(),
+                local_role,
+                deliver_tx: Some(deliver_tx),
+                hop_session_key,
+                reply_session_key: Some(*reply_session_key),
+                onion_codec: exit_onion_codec,
+                ready_state: Some(Arc::clone(&ready_state)),
+                ready_notify: Some(Arc::clone(&ready_notify)),
+                last_updated_ms: now_ms(),
+            },
+        );
+        drop(routes_guard);
+
+        let mut pending = pending_accepts.lock().await;
+        pending
+            .entry(space_prefix)
+            .or_default()
+            .push_back(PendingHighRiskTransportSession {
+                circuit_id,
+                descriptor,
+                local_role,
+                receiver,
+                ready_state,
+                ready_notify,
+            });
+        accept_notify.notify_waiters();
+        return Some(CircuitReady {
+            version: 1,
+            circuit_id,
+            established_at_slot: current_slot,
+            ready_mac: compute_high_risk_ready_mac(
+                &reply_session_key,
+                &descriptor.circuit_id,
+                current_slot,
+            ),
+        });
+    }
+
+    routes_guard.insert(
+        descriptor.circuit_id,
+        HighRiskRouteBinding {
+            descriptor,
+            local_role,
+            deliver_tx: None,
+            hop_session_key,
+            reply_session_key: Some(*reply_session_key),
+            onion_codec: None,
+            ready_state: None,
+            ready_notify: None,
+            last_updated_ms: now_ms(),
+        },
+    );
+    None
+}
+
+async fn remove_high_risk_route_binding(
+    routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
+    pending_accepts: &Arc<Mutex<StdHashMap<[u8; 8], VecDeque<PendingHighRiskTransportSession>>>>,
+    pending_acks: &Arc<Mutex<StdHashMap<HighRiskAckKey, oneshot::Sender<()>>>>,
+    circuit_id: [u8; 16],
+) {
+    routes.lock().await.remove(&circuit_id);
+    let mut pending_guard = pending_accepts.lock().await;
+    for queue in pending_guard.values_mut() {
+        queue.retain(|session| session.circuit_id != circuit_id);
+    }
+    pending_guard.retain(|_, queue| !queue.is_empty());
+    pending_acks
+        .lock()
+        .await
+        .retain(|key, _| key.circuit_id != circuit_id);
+}
+
+async fn handle_high_risk_forward(
+    routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
+    pending_acks: &Arc<Mutex<StdHashMap<HighRiskAckKey, oneshot::Sender<()>>>>,
+    forward_seen: &Arc<Mutex<StdHashMap<HighRiskForwardKey, u64>>>,
+    storage: &Arc<Mutex<EtherStorage>>,
+    seen_messages: &Arc<RwLock<HashSet<[u8; 32]>>>,
+    max_seen_cache: usize,
+    gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
+    passphrase: &str,
+    _slot: u64,
+    forward: RouteForward,
+) {
+    if !mark_high_risk_forward_seen(forward_seen, &forward).await {
+        return;
+    }
+
+    enum ForwardAction {
+        Relay(RouteForward),
+        Deliver(mpsc::Sender<Vec<u8>>, Vec<u8>, Option<DeliveryReceipt>),
+        ResolveReceipt(DeliveryReceipt),
+        Ignore,
+    }
+
+    let action = {
+        let mut routes_guard = routes.lock().await;
+        let Some(binding) = routes_guard.get_mut(&forward.circuit_id) else {
+            return;
+        };
+        binding.last_updated_ms = now_ms();
+        let Some(expected_hop) = expected_high_risk_hop(binding.local_role, forward.direction)
+        else {
+            return;
+        };
+        if forward.hop_index != expected_hop {
+            return;
+        }
+
+        let payload = match decode_inbound_high_risk_payload(binding, &forward) {
+            Some(payload) => payload,
+            None => return,
+        };
+
+        if is_terminal_high_risk_hop(binding.local_role, forward.direction) {
+            match decode_high_risk_payload_frame(&payload) {
+                Some(HighRiskPayloadFrame::DeliveryReceipt(receipt)) => {
+                    if !verify_delivery_receipt(binding, &receipt) {
+                        ForwardAction::Ignore
+                    } else {
+                        ForwardAction::ResolveReceipt(receipt)
+                    }
+                }
+                Some(HighRiskPayloadFrame::Application(app_payload)) => {
+                    match binding.deliver_tx.clone() {
+                        Some(deliver_tx) => ForwardAction::Deliver(
+                            deliver_tx,
+                            app_payload,
+                            build_delivery_receipt(binding, &forward),
+                        ),
+                        None => ForwardAction::Ignore,
+                    }
+                }
+                None => match binding.deliver_tx.clone() {
+                    Some(deliver_tx) => ForwardAction::Deliver(
+                        deliver_tx,
+                        payload,
+                        build_delivery_receipt(binding, &forward),
+                    ),
+                    None => ForwardAction::Ignore,
+                },
+            }
+        } else {
+            ForwardAction::Relay(RouteForward {
+                version: forward.version,
+                packet_id: forward.packet_id,
+                circuit_id: forward.circuit_id,
+                direction: forward.direction,
+                hop_index: forward.hop_index.saturating_add(1),
+                remaining_hops: forward.remaining_hops.saturating_sub(1),
+                payload,
+            })
+        }
+    };
+
+    match action {
+        ForwardAction::Relay(next) => {
+            let _ = publish_orp_frame_router(
+                storage,
+                seen_messages,
+                max_seen_cache,
+                gossip_engine,
+                passphrase,
+                slot,
+                OrpFrame::Forward(next),
+                SUBSPACE_ROUTE_FORWARD,
+            )
+            .await;
+        }
+        ForwardAction::Deliver(deliver_tx, payload, receipt) => {
+            if deliver_tx.try_send(payload).is_ok() {
+                if let Some(receipt) = receipt {
+                    let _ = publish_high_risk_delivery_receipt_router(
+                        routes,
+                        storage,
+                        seen_messages,
+                        max_seen_cache,
+                        gossip_engine,
+                        passphrase,
+                        receipt,
+                    )
+                    .await;
+                }
+            }
+        }
+        ForwardAction::ResolveReceipt(receipt) => {
+            resolve_pending_high_risk_ack(pending_acks, receipt).await;
+        }
+        ForwardAction::Ignore => {}
+    }
+}
+
+async fn handle_high_risk_delivery_notice(
+    routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
+    _storage: &Arc<Mutex<EtherStorage>>,
+    _seen_messages: &Arc<RwLock<HashSet<[u8; 32]>>>,
+    _max_seen_cache: usize,
+    _gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
+    _passphrase: &str,
+    _slot: u64,
+    notice: ForwardDeliveryNotice,
+) {
+    let mut routes_guard = routes.lock().await;
+    if let Some(binding) = routes_guard.get_mut(&notice.circuit_id) {
+        binding.last_updated_ms = now_ms();
+    }
+}
+
+async fn publish_high_risk_delivery_receipt_router(
+    routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
+    storage: &Arc<Mutex<EtherStorage>>,
+    seen_messages: &Arc<RwLock<HashSet<[u8; 32]>>>,
+    max_seen_cache: usize,
+    gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
+    passphrase: &str,
+    receipt: DeliveryReceipt,
+) -> Result<(), EtherSyncError> {
+    let direction = opposite_route_direction(receipt.direction);
+    let mut packet_id = [0u8; 16];
+    fill_random(&mut packet_id).map_err(|_| {
+        EtherSyncError::NetworkError("failed to generate delivery receipt packet id".to_string())
+    })?;
+    let payload_bytes =
+        serialize_high_risk_payload_frame(&HighRiskPayloadFrame::DeliveryReceipt(receipt.clone()))?;
+
+    let (payload, hop_index, remaining_hops) = {
+        let routes_guard = routes.lock().await;
+        let Some(binding) = routes_guard.get(&receipt.circuit_id) else {
+            return Ok(());
+        };
+        let payload =
+            encode_outbound_high_risk_payload(binding, direction, &packet_id, &payload_bytes)?;
+        let (hop_index, remaining_hops) =
+            outbound_high_risk_route_state(binding.local_role, direction)?;
+        (payload, hop_index, remaining_hops)
+    };
+
+    publish_orp_frame_router(
+        storage,
+        seen_messages,
+        max_seen_cache,
+        gossip_engine,
+        passphrase,
+        EtherCoordinate::current_slot(),
+        OrpFrame::Forward(RouteForward {
+            version: 1,
+            circuit_id: receipt.circuit_id,
+            packet_id,
+            direction,
+            hop_index,
+            remaining_hops,
+            payload,
+        }),
+        SUBSPACE_ROUTE_FORWARD,
+    )
+    .await
+}
+
+async fn resolve_pending_high_risk_ack(
+    pending_acks: &Arc<Mutex<StdHashMap<HighRiskAckKey, oneshot::Sender<()>>>>,
+    receipt: DeliveryReceipt,
+) {
+    let key = HighRiskAckKey {
+        circuit_id: receipt.circuit_id,
+        packet_id: receipt.packet_id,
+        direction: receipt.direction,
+    };
+    if let Some(tx) = pending_acks.lock().await.remove(&key) {
+        let _ = tx.send(());
+    }
+}
+
+async fn handle_high_risk_circuit_ready(
+    routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
+    ready: CircuitReady,
+) {
+    let mut routes_guard = routes.lock().await;
+    if let Some(binding) = routes_guard.get_mut(&ready.circuit_id) {
+        if !verify_high_risk_ready(binding, &ready) {
+            return;
+        }
+        binding.last_updated_ms = now_ms();
+        if let Some(ready_state) = binding.ready_state.as_ref() {
+            ready_state.store(true, Ordering::SeqCst);
+        }
+        if let Some(ready_notify) = binding.ready_notify.as_ref() {
+            ready_notify.notify_waiters();
+        }
+    }
+}
+
+fn serialize_hop_handshake(handshake: HopHandshake) -> Result<Vec<u8>, EtherSyncError> {
+    bincode::serialize(&handshake).map_err(|err| {
+        EtherSyncError::NetworkError(format!(
+            "failed to serialize high-risk hop handshake: {err}"
+        ))
+    })
+}
+
+fn decode_high_risk_hop_handshake(payload: &[u8]) -> Option<HopHandshake> {
+    bincode::deserialize(payload).ok()
+}
+
+fn map_onion_error(err: crate::onion::OnionError) -> EtherSyncError {
+    EtherSyncError::NetworkError(format!("high-risk onion error: {err}"))
+}
+
+fn expected_high_risk_hop(local_role: HighRiskLocalRole, direction: RouteDirection) -> Option<u8> {
+    match (local_role, direction) {
+        (HighRiskLocalRole::Entry, RouteDirection::OriginToTarget) => Some(0),
+        (HighRiskLocalRole::Middle, RouteDirection::OriginToTarget) => Some(1),
+        (HighRiskLocalRole::Exit, RouteDirection::OriginToTarget) => Some(2),
+        (HighRiskLocalRole::Middle, RouteDirection::TargetToOrigin) => Some(0),
+        (HighRiskLocalRole::Entry, RouteDirection::TargetToOrigin) => Some(1),
+        (HighRiskLocalRole::Origin, RouteDirection::TargetToOrigin) => Some(2),
+        _ => None,
+    }
+}
+
+fn is_terminal_high_risk_hop(local_role: HighRiskLocalRole, direction: RouteDirection) -> bool {
+    matches!(
+        (local_role, direction),
+        (HighRiskLocalRole::Exit, RouteDirection::OriginToTarget)
+            | (HighRiskLocalRole::Origin, RouteDirection::TargetToOrigin)
+    )
+}
+
+async fn mark_high_risk_forward_seen(
+    forward_seen: &Arc<Mutex<StdHashMap<HighRiskForwardKey, u64>>>,
+    forward: &RouteForward,
+) -> bool {
+    let now = now_ms();
+    let mut seen = forward_seen.lock().await;
+    seen.retain(|_, seen_at| now.saturating_sub(*seen_at) <= 15 * 60 * 1000);
+    let key = HighRiskForwardKey {
+        circuit_id: forward.circuit_id,
+        packet_id: forward.packet_id,
+        direction: forward.direction,
+        hop_index: forward.hop_index,
+    };
+    if seen.contains_key(&key) {
+        return false;
+    }
+    seen.insert(key, now);
+    if seen.len() > 8192 {
+        let cutoff = now.saturating_sub(5 * 60 * 1000);
+        seen.retain(|_, seen_at| *seen_at >= cutoff);
+    }
+    true
+}
+
+async fn publish_orp_frame_router(
+    storage: &Arc<Mutex<EtherStorage>>,
+    seen_messages: &Arc<RwLock<HashSet<[u8; 32]>>>,
+    max_seen_cache: usize,
+    gossip_engine: &Arc<RwLock<Option<GossipEngine>>>,
+    passphrase: &str,
+    slot: u64,
+    frame: OrpFrame,
+    subspace: u64,
+) -> Result<(), EtherSyncError> {
+    let payload = encode_orp_frame(&frame)?;
+    let msg = EtherMessage::new_control_message(passphrase, slot, &payload, subspace)?;
+    let hash = blake3_hash(&msg.encrypted_payload);
+    {
+        let mut st = storage.lock().await;
+        st.store(slot, hash, msg.clone())?;
+    }
+    {
+        let mut seen = seen_messages.write().await;
+        seen.insert(hash);
+        if seen.len() > max_seen_cache {
+            let to_remove: Vec<_> = seen.iter().take(seen.len() / 2).cloned().collect();
+            for h in to_remove {
+                seen.remove(&h);
+            }
+        }
+    }
+
+    let ge = gossip_engine.clone();
+    tokio::spawn(async move {
+        for _ in 0..50 {
+            {
+                let g = ge.read().await;
+                if let Some(ref engine) = *g {
+                    let _ = engine.publish(msg).await;
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    Ok(())
+}
+
+const HIGH_RISK_PAYLOAD_MAGIC: &[u8] = b"orbp1";
+
+fn serialize_high_risk_payload_frame(
+    frame: &HighRiskPayloadFrame,
+) -> Result<Vec<u8>, EtherSyncError> {
+    let mut encoded = HIGH_RISK_PAYLOAD_MAGIC.to_vec();
+    let body = bincode::serialize(frame).map_err(|err| {
+        EtherSyncError::NetworkError(format!(
+            "failed to serialize high-risk payload frame: {err}"
+        ))
+    })?;
+    encoded.extend_from_slice(&body);
+    Ok(encoded)
+}
+
+fn decode_high_risk_payload_frame(payload: &[u8]) -> Option<HighRiskPayloadFrame> {
+    payload
+        .strip_prefix(HIGH_RISK_PAYLOAD_MAGIC)
+        .and_then(|body| bincode::deserialize(body).ok())
+}
+
+fn build_delivery_receipt(
+    binding: &HighRiskRouteBinding,
+    forward: &RouteForward,
+) -> Option<DeliveryReceipt> {
+    let session_key = receipt_session_key(binding)?;
+    Some(DeliveryReceipt {
+        version: 1,
+        circuit_id: forward.circuit_id,
+        packet_id: forward.packet_id,
+        direction: forward.direction,
+        receipt_mac: compute_delivery_receipt_mac(
+            &session_key,
+            &forward.circuit_id,
+            &forward.packet_id,
+            forward.direction,
+        ),
+    })
+}
+
+fn compute_high_risk_ready_mac(
+    session_key: &[u8; 32],
+    circuit_id: &[u8; 16],
+    established_at_slot: u64,
+) -> [u8; 16] {
+    let mut input = Vec::with_capacity(16 + 8 + 18);
+    input.extend_from_slice(b"orp/high-risk/ready");
+    input.extend_from_slice(circuit_id);
+    input.extend_from_slice(&established_at_slot.to_le_bytes());
+    let digest = blake3::keyed_hash(session_key, &input);
+    let mut mac = [0u8; 16];
+    mac.copy_from_slice(&digest.as_bytes()[..16]);
+    mac
+}
+
+fn compute_high_risk_close_mac(
+    session_key: &[u8; 32],
+    circuit_id: &[u8; 16],
+    reason_code: u16,
+    target_role_code: u8,
+) -> [u8; 16] {
+    let mut input = Vec::with_capacity(16 + 2 + 1 + 18);
+    input.extend_from_slice(b"orp/high-risk/close");
+    input.extend_from_slice(circuit_id);
+    input.extend_from_slice(&reason_code.to_le_bytes());
+    input.push(target_role_code);
+    let digest = blake3::keyed_hash(session_key, &input);
+    let mut mac = [0u8; 16];
+    mac.copy_from_slice(&digest.as_bytes()[..16]);
+    mac
+}
+
+fn verify_high_risk_ready(binding: &HighRiskRouteBinding, ready: &CircuitReady) -> bool {
+    if binding.local_role != HighRiskLocalRole::Origin {
+        return false;
+    }
+    let Some(session_key) = binding.reply_session_key else {
+        return false;
+    };
+    compute_high_risk_ready_mac(&session_key, &ready.circuit_id, ready.established_at_slot)
+        == ready.ready_mac
+}
+
+fn close_auth_key_for_binding(binding: &HighRiskRouteBinding) -> Option<[u8; 32]> {
+    match binding.local_role {
+        HighRiskLocalRole::Origin => binding.reply_session_key,
+        HighRiskLocalRole::Entry | HighRiskLocalRole::Middle | HighRiskLocalRole::Exit => {
+            binding.hop_session_key
+        }
+    }
+}
+
+fn verify_high_risk_close(binding: &HighRiskRouteBinding, close: &CircuitClose) -> bool {
+    if high_risk_local_role_code(binding.local_role) != close.target_role_code {
+        return false;
+    }
+    let Some(session_key) = close_auth_key_for_binding(binding) else {
+        return false;
+    };
+    compute_high_risk_close_mac(
+        &session_key,
+        &close.circuit_id,
+        close.reason_code,
+        close.target_role_code,
+    ) == close.control_mac
+}
+
+fn build_high_risk_close_frames(
+    binding: &HighRiskRouteBinding,
+    circuit_id: [u8; 16],
+    reason_code: u16,
+) -> Vec<CircuitClose> {
+    match binding.local_role {
+        HighRiskLocalRole::Origin => binding
+            .onion_codec
+            .as_ref()
+            .map(|codec| {
+                codec
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(hop_index, layer)| {
+                        let target_role_code = match hop_index {
+                            0 => high_risk_local_role_code(HighRiskLocalRole::Entry),
+                            1 => high_risk_local_role_code(HighRiskLocalRole::Middle),
+                            _ => high_risk_local_role_code(HighRiskLocalRole::Exit),
+                        };
+                        CircuitClose {
+                            version: 1,
+                            circuit_id,
+                            reason_code,
+                            target_role_code,
+                            control_mac: compute_high_risk_close_mac(
+                                &layer.session_key,
+                                &circuit_id,
+                                reason_code,
+                                target_role_code,
+                            ),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        HighRiskLocalRole::Exit => binding
+            .reply_session_key
+            .map(|session_key| {
+                vec![CircuitClose {
+                    version: 1,
+                    circuit_id,
+                    reason_code,
+                    target_role_code: high_risk_local_role_code(HighRiskLocalRole::Origin),
+                    control_mac: compute_high_risk_close_mac(
+                        &session_key,
+                        &circuit_id,
+                        reason_code,
+                        high_risk_local_role_code(HighRiskLocalRole::Origin),
+                    ),
+                }]
+            })
+            .unwrap_or_default(),
+        HighRiskLocalRole::Entry | HighRiskLocalRole::Middle => Vec::new(),
+    }
+}
+
+fn verify_delivery_receipt(binding: &HighRiskRouteBinding, receipt: &DeliveryReceipt) -> bool {
+    let Some(session_key) = receipt_session_key(binding) else {
+        return false;
+    };
+    compute_delivery_receipt_mac(
+        &session_key,
+        &receipt.circuit_id,
+        &receipt.packet_id,
+        receipt.direction,
+    ) == receipt.receipt_mac
+}
+
+fn receipt_session_key(binding: &HighRiskRouteBinding) -> Option<[u8; 32]> {
+    match binding.local_role {
+        HighRiskLocalRole::Exit | HighRiskLocalRole::Origin => binding.reply_session_key,
+        HighRiskLocalRole::Entry | HighRiskLocalRole::Middle => None,
+    }
+}
+
+fn compute_delivery_receipt_mac(
+    session_key: &[u8; 32],
+    circuit_id: &[u8; 16],
+    packet_id: &[u8; 16],
+    direction: RouteDirection,
+) -> [u8; 16] {
+    let mut input = Vec::with_capacity(33);
+    input.extend_from_slice(circuit_id);
+    input.extend_from_slice(packet_id);
+    input.push(route_direction_code(direction));
+    let digest = blake3::keyed_hash(session_key, &input);
+    let mut mac = [0u8; 16];
+    mac.copy_from_slice(&digest.as_bytes()[..16]);
+    mac
+}
+
+fn route_direction_code(direction: RouteDirection) -> u8 {
+    match direction {
+        RouteDirection::OriginToTarget => 1,
+        RouteDirection::TargetToOrigin => 2,
+    }
+}
+
+fn opposite_route_direction(direction: RouteDirection) -> RouteDirection {
+    match direction {
+        RouteDirection::OriginToTarget => RouteDirection::TargetToOrigin,
+        RouteDirection::TargetToOrigin => RouteDirection::OriginToTarget,
+    }
+}
+
+async fn sweep_expired_high_risk_bindings(
+    routes: &Arc<Mutex<StdHashMap<[u8; 16], HighRiskRouteBinding>>>,
+    pending_accepts: &Arc<Mutex<StdHashMap<[u8; 8], VecDeque<PendingHighRiskTransportSession>>>>,
+    pending_acks: &Arc<Mutex<StdHashMap<HighRiskAckKey, oneshot::Sender<()>>>>,
+    forward_seen: &Arc<Mutex<StdHashMap<HighRiskForwardKey, u64>>>,
+    current_slot: u64,
+) {
+    let mut removed_circuit_ids = Vec::new();
+    {
+        let mut routes_guard = routes.lock().await;
+        routes_guard.retain(|circuit_id, binding| {
+            let keep = binding.descriptor.expires_at_slot >= current_slot;
+            if !keep {
+                removed_circuit_ids.push(*circuit_id);
+            }
+            keep
+        });
+    }
+
+    {
+        let mut pending_guard = pending_accepts.lock().await;
+        for queue in pending_guard.values_mut() {
+            queue.retain(|session| {
+                let keep = session.descriptor.expires_at_slot >= current_slot;
+                if !keep {
+                    removed_circuit_ids.push(session.circuit_id);
+                }
+                keep
+            });
+        }
+        pending_guard.retain(|_, queue| !queue.is_empty());
+    }
+
+    if !removed_circuit_ids.is_empty() {
+        let removed = removed_circuit_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        pending_acks
+            .lock()
+            .await
+            .retain(|key, _| !removed.contains(&key.circuit_id));
+    }
+
+    {
+        let cutoff = now_ms().saturating_sub(5 * 60_000);
+        let mut forward_seen_guard = forward_seen.lock().await;
+        forward_seen_guard.retain(|_, seen_at_ms| *seen_at_ms >= cutoff);
+    }
+}
+
+fn outbound_high_risk_route_state(
+    local_role: HighRiskLocalRole,
+    direction: RouteDirection,
+) -> Result<(u8, u8), EtherSyncError> {
+    match (local_role, direction) {
+        (HighRiskLocalRole::Origin, RouteDirection::OriginToTarget)
+        | (HighRiskLocalRole::Exit, RouteDirection::TargetToOrigin) => Ok((0, 2)),
+        _ => Err(EtherSyncError::NetworkError(
+            "high-risk route direction is not valid for the local endpoint role".to_string(),
+        )),
+    }
+}
+
+fn encode_outbound_high_risk_payload(
+    binding: &HighRiskRouteBinding,
+    direction: RouteDirection,
+    packet_id: &[u8; 16],
+    payload_bytes: &[u8],
+) -> Result<Vec<u8>, EtherSyncError> {
+    match (binding.local_role, direction) {
+        (HighRiskLocalRole::Origin, RouteDirection::OriginToTarget)
+        | (HighRiskLocalRole::Exit, RouteDirection::TargetToOrigin) => {
+            let Some(onion_codec) = binding.onion_codec.as_ref() else {
+                return Err(EtherSyncError::NetworkError(
+                    "high-risk onion codec is not installed for the outbound circuit direction"
+                        .to_string(),
+                ));
+            };
+            onion_codec
+                .wrap(packet_id, payload_bytes)
+                .map_err(map_onion_error)
+        }
+        _ => Ok(payload_bytes.to_vec()),
+    }
+}
+
+fn decode_inbound_high_risk_payload(
+    binding: &HighRiskRouteBinding,
+    forward: &RouteForward,
+) -> Option<Vec<u8>> {
+    match (binding.local_role, forward.direction) {
+        (
+            HighRiskLocalRole::Entry | HighRiskLocalRole::Middle | HighRiskLocalRole::Exit,
+            RouteDirection::OriginToTarget,
+        ) => {
+            let hop_session_key = binding.hop_session_key.as_ref()?;
+            OnionCodec::peel(
+                hop_session_key,
+                forward.hop_index,
+                &forward.packet_id,
+                &forward.payload,
+            )
+            .ok()
+        }
+        (HighRiskLocalRole::Middle, RouteDirection::TargetToOrigin) => {
+            let reply_session_key = binding.reply_session_key.as_ref()?;
+            OnionCodec::peel(reply_session_key, 1, &forward.packet_id, &forward.payload).ok()
+        }
+        (HighRiskLocalRole::Entry, RouteDirection::TargetToOrigin) => {
+            let reply_session_key = binding.reply_session_key.as_ref()?;
+            OnionCodec::peel(reply_session_key, 0, &forward.packet_id, &forward.payload).ok()
+        }
+        (HighRiskLocalRole::Origin, RouteDirection::TargetToOrigin) => OnionCodec::peel(
+            binding.reply_session_key.as_ref()?,
+            2,
+            &forward.packet_id,
+            &forward.payload,
+        )
+        .ok(),
+        _ => Some(forward.payload.clone()),
+    }
+}
+
+impl Drop for EtherNode {
+    fn drop(&mut self) {
+        self.onion_secret_key.zeroize();
+    }
 }
 
 #[cfg(feature = "handshake-fallback")]

@@ -101,8 +101,9 @@ The current truthful claim is:
 
 - ORP is a serious deterministic private overlay routing direction
 - ORP is integrated as a target-aware, space-scoped transport fallback
-- ORP now has a high-risk control-plane scaffold with circuit planning, gate telemetry, and observed control-frame tracking
-- ORP is not yet a finished global anonymity network because the routed high-risk session data plane is still intentionally inactive
+- ORP now has a routed high-risk data plane built on three-hop onion forwarding, per-hop sealed setup capsules, and rotating announcement keys derived locally from a root plus per-announcement salt
+- untrusted bootstrap bundles can still participate as opaque ingress assist, but they do not earn trust-sensitive ranking or high-risk posture
+- ORP is still not presented as a finished global anonymity network because remote keeper replication, hard trust attestation, and adversarial hardening still matter more than naming
 
 That boundary is deliberate. We do not unlock that claim until the system actually earns it.
 
@@ -134,7 +135,7 @@ It is designed to require:
 - bridge ingress
 - hard anonymity gating
 
-High-Risk is intentionally blocked today. The runtime surfaces that boundary instead of silently pretending.
+High-Risk is a real runtime path now, but it remains aggressively gated and described conservatively. The software should tell the truth about posture instead of silently pretending every network is good enough.
 
 ## Network Model
 
@@ -187,14 +188,14 @@ That is why the project is more than a pile of features. The pieces explain each
 Strong today:
 
 - deterministic derivation across the core stack
-- authenticated local API
+- authenticated local management API plus a separate network-facing keeper ingest surface
 - multiple live connect flows
 - transport cascade with real fallback logic
 - EtherSync message and file publication with replay window
 - ORP target-aware route discovery before Tor
 - bootstrap bundle and static discovery peers now seed EtherSync bootstrap state and space joins
 - federated discovery from ORP, bootstrap bundle, and static bootstrap peers
-- first keeper flow: publish enqueues encrypted keeper envelopes, a local replication task flushes them into a keeper replica archive, and backfill restores archived envelopes into local EtherSync storage
+- keeper replication now performs real round-trip store requests against keeper endpoints and tracks confirmed, pending, and failed remote sends
 - keeper posture is now tracked per space as a local manifest with desired targets, candidate shortfall, replication stage, and last local keeper activity
 - join-time space policy can now set retention tier, replication factor, and route bias per space
 - ORP candidate ranking now uses operator hints, region diversity, bootstrap bundle posture, and per-space route bias
@@ -203,18 +204,22 @@ Strong today:
 - ORP inspection now exposes preference buckets and ranking hints so bridge-heavy and operator-aware choices are legible
 - bootstrap bundle validation now exposes local usability, structural weakness, and advisory staleness
 - keeper endpoints from the bootstrap bundle now participate in runtime/bootstrap seeding when managed retention posture is active
-- ORP-HighRisk now has truthful circuit planning, hard-gate diagnostics, prepared-circuit telemetry, and observed control-frame tracking in the runtime
+- ORP-HighRisk now has truthful circuit planning, a live routed data plane, hard-gate diagnostics, prepared-circuit telemetry, observed control-frame tracking, per-hop sealed circuit setup capsules, and rotating onion announcement keys in the runtime
+- untrusted bootstrap bundles now degrade to opaque ingress assist instead of being treated as trusted routing truth
 
 Explicitly not claimed yet:
 
 - global anonymity network
 - production keeper-backed replicated retention across independent remote keepers
-- active high-risk routed session data plane
 - audited high-risk multi-hop overlay
 
 ## Public API
 
-The local control plane lives under `/v1`.
+Most of `/v1` is the authenticated local control plane.
+
+Explicit exception:
+
+- `POST /v1/keeper/store` is a bearer-protected network-facing operator ingress endpoint for keeper replication, not a localhost-only management route
 
 Representative endpoints:
 
@@ -229,6 +234,7 @@ Representative endpoints:
 - `GET /v1/keepers/policies`
 - `POST /v1/keepers/policies`
 - `POST /v1/keepers/backfill`
+- `POST /v1/keeper/store`
 - `GET /v1/ethersync/status`
 - `POST /v1/ethersync/start`
 - `POST /v1/ethersync/spaces/join`
@@ -239,6 +245,7 @@ Representative endpoints:
 The API now exposes:
 
 - privacy profile intent
+- strict versus effective High-Risk posture when the hard anonymity gate is bypassed for development
 - route and ORP diagnostics
 - target-specific ORP candidate inspection with scores, route classes, operator hints, region hints, and lookup provenance
 - bridge/operator-aware discovery ordering and ORP preference buckets for explaining routing posture
@@ -276,7 +283,7 @@ Current anchors:
 
 - CipherPacket V2 for session framing
 - stable EtherSync subspace meanings for user data and ORP metadata
-- additive ORP wire-family formalization for future high-risk circuits
+- additive ORP wire-family formalization for live high-risk routed circuits
 
 The ORP family now has canonical frame names:
 
@@ -284,13 +291,14 @@ The ORP family now has canonical frame names:
 - `Lookup`
 - `Offer`
 - `Forward`
-- `Ack`
+- `DeliveryNotice`
 - `CircuitOpen`
 - `CircuitExtend`
 - `CircuitClose`
 - `Cover`
+- `CircuitReady`
 
-The last four are formalized as contract and roadmap, not presented as live high-risk anonymity guarantees.
+The routed high-risk frame family is now live inside the repo, but it is still not marketed as an audited anonymity guarantee.
 
 ## Canonical Documentation
 

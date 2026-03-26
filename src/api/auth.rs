@@ -6,6 +6,19 @@ use axum::response::IntoResponse;
 use subtle::ConstantTimeEq;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+#[derive(Clone)]
+pub(crate) struct AuthConfig {
+    pub local_api_token: Option<std::sync::Arc<String>>,
+    pub keeper_ingest_token: Option<std::sync::Arc<String>>,
+}
+
+fn matches_bearer(auth_str: &str, token: &str) -> bool {
+    let expected = format!("Bearer {}", token);
+    let auth_bytes = auth_str.as_bytes();
+    let expected_bytes = expected.as_bytes();
+    auth_bytes.len() == expected_bytes.len() && bool::from(auth_bytes.ct_eq(expected_bytes))
+}
+
 pub(crate) fn build_cors_layer() -> CorsLayer {
     // CORS is primarily relevant for the GUI (dev server origin) and protects against drive-by
     // browser access to localhost APIs. We keep an allowlist by default.
@@ -36,20 +49,45 @@ pub(crate) fn build_cors_layer() -> CorsLayer {
 }
 
 pub(crate) async fn require_bearer(
-    State(token): State<std::sync::Arc<String>>,
+    State(auth): State<AuthConfig>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> axum::response::Response {
+    if req.method() == Method::POST && req.uri().path() == "/v1/keeper/store" {
+        // Keeper ingest is a network-facing operator surface, not a localhost control-plane API.
+        // Accept either a dedicated keeper-ingest bearer or the local management bearer so the
+        // route is never unauthenticated on the network.
+        let Some(auth_header) = req.headers().get(AUTHORIZATION) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        let Ok(auth_str) = auth_header.to_str() else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        let keeper_ok = auth
+            .keeper_ingest_token
+            .as_deref()
+            .map(|ingest_token| matches_bearer(auth_str, ingest_token))
+            .unwrap_or(false);
+        let local_ok = auth
+            .local_api_token
+            .as_deref()
+            .map(|token| matches_bearer(auth_str, token.as_str()))
+            .unwrap_or(false);
+        if keeper_ok || local_ok {
+            return next.run(req).await;
+        }
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(token) = auth.local_api_token.as_ref() else {
+        return next.run(req).await;
+    };
     let Some(auth_header) = req.headers().get(AUTHORIZATION) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let Ok(auth_str) = auth_header.to_str() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let expected = format!("Bearer {}", token.as_str());
-    let auth_bytes = auth_str.as_bytes();
-    let expected_bytes = expected.as_bytes();
-    if auth_bytes.len() != expected_bytes.len() || !bool::from(auth_bytes.ct_eq(expected_bytes)) {
+    if !matches_bearer(auth_str, token.as_str()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     next.run(req).await

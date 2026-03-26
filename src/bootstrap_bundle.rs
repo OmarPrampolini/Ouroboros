@@ -1,9 +1,12 @@
+use base64::{engine::general_purpose, Engine as _};
+use ring::signature::{self, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::Config;
+use crate::config::{BootstrapTrustedKey, Config};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BootstrapBundle {
@@ -19,6 +22,16 @@ pub struct BootstrapBundle {
     pub keepers: Vec<BootstrapKeeper>,
     #[serde(default)]
     pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<BootstrapBundleSignature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapBundleSignature {
+    pub algorithm: String,
+    pub signature: String,
+    #[serde(default)]
+    pub key_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +90,26 @@ pub enum BootstrapBundleValidationKind {
     DuplicateId,
     DuplicateEndpoint,
     StaleBundle,
+    UnsignedBundle,
+    UntrustedSignature,
+    InvalidSignature,
+    UnsupportedSignatureAlgorithm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BootstrapBundleTrustPosture {
+    Unsigned,
+    SignedUntrusted,
+    VerifiedTrusted,
+    InvalidSignature,
+    UnsupportedAlgorithm,
+}
+
+impl BootstrapBundleTrustPosture {
+    pub fn is_verified_trusted(&self) -> bool {
+        matches!(self, Self::VerifiedTrusted)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,8 +153,21 @@ pub struct BootstrapBundleValidationReport {
     pub is_empty: bool,
     pub is_usable: bool,
     pub is_structurally_weak: bool,
+    pub trust_posture: BootstrapBundleTrustPosture,
+    pub trusted_for_high_risk: bool,
+    pub trusted_keys_configured: usize,
+    pub signature_present: bool,
+    pub signature_algorithm: Option<String>,
+    pub signature_key_id: Option<String>,
+    pub trusted_key_id: Option<String>,
     pub issue_counts: BootstrapBundleValidationIssueCounts,
     pub issues: Vec<BootstrapBundleValidationIssue>,
+}
+
+impl BootstrapBundleValidationReport {
+    pub fn trusted_for_runtime_high_risk(&self) -> bool {
+        self.trusted_for_high_risk && !self.staleness.is_stale()
+    }
 }
 
 impl BootstrapBundle {
@@ -137,6 +183,10 @@ impl BootstrapBundle {
 
     pub fn validation_report(&self) -> BootstrapBundleValidationReport {
         validate_bootstrap_bundle(self)
+    }
+
+    pub fn validation_report_with_config(&self, cfg: &Config) -> BootstrapBundleValidationReport {
+        validate_bootstrap_bundle_with_config(self, cfg)
     }
 
     pub fn validation_report_at(
@@ -191,8 +241,21 @@ pub fn load_bootstrap_bundle(cfg: &Config) -> Option<BootstrapBundle> {
 }
 
 pub fn validate_bootstrap_bundle(bundle: &BootstrapBundle) -> BootstrapBundleValidationReport {
-    validate_bootstrap_bundle_at(
+    validate_bootstrap_bundle_with_trusted_keys_at(
         bundle,
+        &[],
+        current_time_ms(),
+        DEFAULT_BOOTSTRAP_BUNDLE_STALE_AFTER_MS,
+    )
+}
+
+pub fn validate_bootstrap_bundle_with_config(
+    bundle: &BootstrapBundle,
+    cfg: &Config,
+) -> BootstrapBundleValidationReport {
+    validate_bootstrap_bundle_with_trusted_keys_at(
+        bundle,
+        &cfg.bootstrap_bundle_trusted_keys,
         current_time_ms(),
         DEFAULT_BOOTSTRAP_BUNDLE_STALE_AFTER_MS,
     )
@@ -200,6 +263,29 @@ pub fn validate_bootstrap_bundle(bundle: &BootstrapBundle) -> BootstrapBundleVal
 
 pub fn validate_bootstrap_bundle_at(
     bundle: &BootstrapBundle,
+    checked_at_ms: u64,
+    stale_after_ms: u64,
+) -> BootstrapBundleValidationReport {
+    validate_bootstrap_bundle_with_trusted_keys_at(bundle, &[], checked_at_ms, stale_after_ms)
+}
+
+pub fn validate_bootstrap_bundle_with_config_at(
+    bundle: &BootstrapBundle,
+    cfg: &Config,
+    checked_at_ms: u64,
+    stale_after_ms: u64,
+) -> BootstrapBundleValidationReport {
+    validate_bootstrap_bundle_with_trusted_keys_at(
+        bundle,
+        &cfg.bootstrap_bundle_trusted_keys,
+        checked_at_ms,
+        stale_after_ms,
+    )
+}
+
+fn validate_bootstrap_bundle_with_trusted_keys_at(
+    bundle: &BootstrapBundle,
+    trusted_keys: &[BootstrapTrustedKey],
     checked_at_ms: u64,
     stale_after_ms: u64,
 ) -> BootstrapBundleValidationReport {
@@ -264,6 +350,69 @@ pub fn validate_bootstrap_bundle_at(
 
     let is_empty =
         summary.relays == 0 && summary.bridges == 0 && summary.keepers == 0 && summary.mirrors == 0;
+    let trust = evaluate_bundle_trust(bundle, trusted_keys);
+    match trust.posture {
+        BootstrapBundleTrustPosture::Unsigned => push_issue(
+            &mut issues,
+            &mut counts,
+            BootstrapBundleValidationIssue {
+                kind: BootstrapBundleValidationKind::UnsignedBundle,
+                severity: BootstrapBundleValidationSeverity::Warning,
+                entry_kind: None,
+                entry_index: None,
+                field: Some("signature".to_owned()),
+                value: None,
+                message: "bootstrap bundle is unsigned; runtime may only use it as opaque ingress assist and must not treat it as trusted for high-risk routing".to_owned(),
+            },
+        ),
+        BootstrapBundleTrustPosture::SignedUntrusted => push_issue(
+            &mut issues,
+            &mut counts,
+            BootstrapBundleValidationIssue {
+                kind: BootstrapBundleValidationKind::UntrustedSignature,
+                severity: BootstrapBundleValidationSeverity::Warning,
+                entry_kind: None,
+                entry_index: None,
+                field: Some("signature".to_owned()),
+                value: trust.signature_key_id.clone(),
+                message: trust.failure_reason.clone().unwrap_or_else(|| {
+                    "bootstrap bundle signature did not match any configured trusted key"
+                        .to_owned()
+                }),
+            },
+        ),
+        BootstrapBundleTrustPosture::InvalidSignature => push_issue(
+            &mut issues,
+            &mut counts,
+            BootstrapBundleValidationIssue {
+                kind: BootstrapBundleValidationKind::InvalidSignature,
+                severity: BootstrapBundleValidationSeverity::Warning,
+                entry_kind: None,
+                entry_index: None,
+                field: Some("signature".to_owned()),
+                value: trust.signature_key_id.clone(),
+                message: trust.failure_reason.clone().unwrap_or_else(|| {
+                    "bootstrap bundle signature is present but invalid".to_owned()
+                }),
+            },
+        ),
+        BootstrapBundleTrustPosture::UnsupportedAlgorithm => push_issue(
+            &mut issues,
+            &mut counts,
+            BootstrapBundleValidationIssue {
+                kind: BootstrapBundleValidationKind::UnsupportedSignatureAlgorithm,
+                severity: BootstrapBundleValidationSeverity::Warning,
+                entry_kind: None,
+                entry_index: None,
+                field: Some("signature.algorithm".to_owned()),
+                value: trust.signature_algorithm.clone(),
+                message: trust.failure_reason.clone().unwrap_or_else(|| {
+                    "bootstrap bundle signature algorithm is unsupported".to_owned()
+                }),
+            },
+        ),
+        BootstrapBundleTrustPosture::VerifiedTrusted => {}
+    }
     let is_usable = counts.error == 0;
     let is_structurally_weak = counts.warning > 0;
 
@@ -276,6 +425,13 @@ pub fn validate_bootstrap_bundle_at(
         is_empty,
         is_usable,
         is_structurally_weak,
+        trust_posture: trust.posture,
+        trusted_for_high_risk: trust.posture.is_verified_trusted(),
+        trusted_keys_configured: trusted_keys.len(),
+        signature_present: trust.signature_present,
+        signature_algorithm: trust.signature_algorithm,
+        signature_key_id: trust.signature_key_id,
+        trusted_key_id: trust.trusted_key_id,
         issue_counts: counts,
         issues,
     }
@@ -288,11 +444,15 @@ pub fn summarize_bootstrap_bundle(cfg: &Config) -> BootstrapBundleSummary {
 }
 
 pub fn validate_loaded_bootstrap_bundle(cfg: &Config) -> Option<BootstrapBundleValidationReport> {
-    load_bootstrap_bundle(cfg).map(|bundle| validate_bootstrap_bundle(&bundle))
+    load_bootstrap_bundle(cfg).map(|bundle| validate_bootstrap_bundle_with_config(&bundle, cfg))
 }
 
 pub fn bootstrap_bundle_is_usable(bundle: &BootstrapBundle) -> bool {
     bundle.validation_report().is_usable
+}
+
+pub fn bootstrap_bundle_is_trusted_for_high_risk(bundle: &BootstrapBundle, cfg: &Config) -> bool {
+    validate_bootstrap_bundle_with_config(bundle, cfg).trusted_for_runtime_high_risk()
 }
 
 pub fn bootstrap_bundle_is_stale(bundle: &BootstrapBundle) -> bool {
@@ -544,4 +704,192 @@ fn current_time_ms() -> u64 {
             u64::try_from(millis).unwrap_or(u64::MAX)
         })
         .unwrap_or(0)
+}
+
+#[derive(Debug, Clone)]
+struct BundleTrustEvaluation {
+    posture: BootstrapBundleTrustPosture,
+    signature_present: bool,
+    signature_algorithm: Option<String>,
+    signature_key_id: Option<String>,
+    trusted_key_id: Option<String>,
+    failure_reason: Option<String>,
+}
+
+fn evaluate_bundle_trust(
+    bundle: &BootstrapBundle,
+    trusted_keys: &[BootstrapTrustedKey],
+) -> BundleTrustEvaluation {
+    let Some(signature) = bundle.signature.as_ref() else {
+        return BundleTrustEvaluation {
+            posture: BootstrapBundleTrustPosture::Unsigned,
+            signature_present: false,
+            signature_algorithm: None,
+            signature_key_id: None,
+            trusted_key_id: None,
+            failure_reason: None,
+        };
+    };
+
+    let algorithm = signature.algorithm.trim().to_ascii_lowercase();
+    if algorithm != "ed25519" {
+        return BundleTrustEvaluation {
+            posture: BootstrapBundleTrustPosture::UnsupportedAlgorithm,
+            signature_present: true,
+            signature_algorithm: Some(signature.algorithm.clone()),
+            signature_key_id: signature.key_id.clone(),
+            trusted_key_id: None,
+            failure_reason: Some(format!(
+                "unsupported bootstrap bundle signature algorithm '{}'; only ed25519 is currently accepted",
+                signature.algorithm
+            )),
+        };
+    }
+
+    let canonical_payload = match canonical_bundle_payload(bundle) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return BundleTrustEvaluation {
+                posture: BootstrapBundleTrustPosture::InvalidSignature,
+                signature_present: true,
+                signature_algorithm: Some(signature.algorithm.clone()),
+                signature_key_id: signature.key_id.clone(),
+                trusted_key_id: None,
+                failure_reason: Some(format!(
+                    "failed to canonicalize bootstrap bundle payload before signature verification: {}",
+                    err
+                )),
+            };
+        }
+    };
+
+    let signature_bytes = match decode_material(&signature.signature) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return BundleTrustEvaluation {
+                posture: BootstrapBundleTrustPosture::InvalidSignature,
+                signature_present: true,
+                signature_algorithm: Some(signature.algorithm.clone()),
+                signature_key_id: signature.key_id.clone(),
+                trusted_key_id: None,
+                failure_reason: Some(format!(
+                    "bootstrap bundle signature could not be decoded: {}",
+                    err
+                )),
+            };
+        }
+    };
+
+    if trusted_keys.is_empty() {
+        return BundleTrustEvaluation {
+            posture: BootstrapBundleTrustPosture::SignedUntrusted,
+            signature_present: true,
+            signature_algorithm: Some(signature.algorithm.clone()),
+            signature_key_id: signature.key_id.clone(),
+            trusted_key_id: None,
+            failure_reason: Some(
+                "bootstrap bundle is signed but no trusted bundle keys are configured locally"
+                    .to_owned(),
+            ),
+        };
+    }
+
+    let mut saw_candidate_key = false;
+    for trusted_key in trusted_keys.iter().filter(|trusted_key| {
+        signature
+            .key_id
+            .as_deref()
+            .map(|key_id| trusted_key.key_id.as_deref() == Some(key_id.trim()))
+            .unwrap_or(true)
+    }) {
+        saw_candidate_key = true;
+        let public_key = match decode_material(&trusted_key.public_key) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let verifier = UnparsedPublicKey::new(&signature::ED25519, public_key);
+        if verifier
+            .verify(&canonical_payload, &signature_bytes)
+            .is_ok()
+        {
+            return BundleTrustEvaluation {
+                posture: BootstrapBundleTrustPosture::VerifiedTrusted,
+                signature_present: true,
+                signature_algorithm: Some(signature.algorithm.clone()),
+                signature_key_id: signature.key_id.clone(),
+                trusted_key_id: trusted_key.key_id.clone(),
+                failure_reason: None,
+            };
+        }
+    }
+
+    let posture = if saw_candidate_key && signature.key_id.is_some() {
+        BootstrapBundleTrustPosture::InvalidSignature
+    } else {
+        BootstrapBundleTrustPosture::SignedUntrusted
+    };
+
+    BundleTrustEvaluation {
+        posture,
+        signature_present: true,
+        signature_algorithm: Some(signature.algorithm.clone()),
+        signature_key_id: signature.key_id.clone(),
+        trusted_key_id: None,
+        failure_reason: Some(if saw_candidate_key {
+            "bootstrap bundle signature did not verify against any configured trusted key"
+                .to_owned()
+        } else if let Some(key_id) = signature.key_id.as_deref() {
+            format!(
+                "bootstrap bundle references key id '{}' but no matching trusted key is configured locally",
+                key_id
+            )
+        } else {
+            "bootstrap bundle signature did not match any configured trusted key".to_owned()
+        }),
+    }
+}
+
+fn canonical_bundle_payload(bundle: &BootstrapBundle) -> Result<Vec<u8>, serde_json::Error> {
+    let mut unsigned = bundle.clone();
+    unsigned.signature = None;
+    let value = serde_json::to_value(unsigned)?;
+    let canonical = canonicalize_json_value(value);
+    serde_json::to_vec(&canonical)
+}
+
+fn canonicalize_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries = map.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut ordered = Map::new();
+            for (key, value) in entries {
+                ordered.insert(key, canonicalize_json_value(value));
+            }
+            Value::Object(ordered)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(canonicalize_json_value)
+                .collect::<Vec<_>>(),
+        ),
+        other => other,
+    }
+}
+
+fn decode_material(raw: &str) -> Result<Vec<u8>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty material".to_owned());
+    }
+
+    if trimmed.len() % 2 == 0 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return hex::decode(trimmed).map_err(|err| err.to_string());
+    }
+
+    general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+        .map_err(|err| err.to_string())
 }

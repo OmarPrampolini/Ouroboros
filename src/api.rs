@@ -76,6 +76,7 @@ pub async fn create_api_server(
 }
 
 fn build_router(state: Arc<ApiState>, api_token: Option<String>) -> Router {
+    let cfg = crate::config::Config::from_env();
     let mut app = Router::new()
         .route("/v1/connect", post(connect::handle_connect))
         .route("/v1/status", get(stream::handle_status))
@@ -152,13 +153,19 @@ fn build_router(state: Arc<ApiState>, api_token: Option<String>) -> Router {
             "/v1/keepers/backfill",
             post(ethersync::handle_keeper_backfill),
         )
+        // Network-facing operator ingress for keeper replication; not part of the
+        // localhost-only management subset of /v1.
+        .route("/v1/keeper/store", post(ethersync::handle_keeper_store))
         .route("/v1/ethersync/events", get(ethersync::handle_events_sse))
         .layer(Extension(state))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
 
-    if let Some(token) = api_token {
-        let token = std::sync::Arc::new(token);
-        app = app.layer(from_fn_with_state(token, auth::require_bearer));
+    let auth_config = auth::AuthConfig {
+        local_api_token: api_token.map(std::sync::Arc::new),
+        keeper_ingest_token: cfg.keeper_ingest_token.map(std::sync::Arc::new),
+    };
+    if auth_config.local_api_token.is_some() || auth_config.keeper_ingest_token.is_some() {
+        app = app.layer(from_fn_with_state(auth_config, auth::require_bearer));
     }
 
     // IMPORTANT: CORS must be OUTERMOST so preflight OPTIONS does not get blocked by auth.

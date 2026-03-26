@@ -90,6 +90,8 @@ Shared cryptographic building blocks:
 - route cache for ORP-Standard
 - target connect through `orp:<16-hex>`
 - route classes, operator hints, and region hints in announcements
+- rotating onion announcement keys derived locally from a root plus per-announcement salt
+- per-hop sealed high-risk setup capsules instead of public full-route descriptors
 - high-risk circuit wire contract formalized and tracked in runtime telemetry
 
 ### Bootstrap and keeper posture
@@ -108,7 +110,8 @@ Shared cryptographic building blocks:
 - ORP candidate inspection now exposes preference buckets and ranking hints for bridge-heavy and operator-aware decisions
 - bootstrap bundle validation now reports usability, structural weakness, and advisory staleness
 - keeper endpoints from the bootstrap bundle now participate in bootstrap seeding when managed retention is enabled
-- high-risk circuit planning and observed control-frame telemetry now exist, while the routed session data plane remains intentionally inactive
+- high-risk circuit planning, routed session transport, and observed control-frame telemetry now exist in the runtime
+- untrusted bootstrap bundles can still act as opaque ingress assist without being upgraded to trusted routing posture
 
 ## Current truth
 
@@ -122,11 +125,12 @@ What is not claimed yet:
 
 - global anonymity network
 - production multi-node keeper-backed retention
-- active high-risk routed session data plane
 - audited high-risk overlay
 
 ## Public API highlights
 
+- most `/v1` endpoints are authenticated local control-plane routes
+- `POST /v1/keeper/store` is a network-facing operator ingress route for keeper replication
 - `POST /v1/connect`
 - `GET /v1/status`
 - `GET /v1/capabilities`
@@ -145,7 +149,7 @@ What is not claimed yet:
 - `POST /v1/ethersync/files/publish`
 - `GET /v1/ethersync/events`
 
-`POST /v1/connect` now returns structured rejection details when `privacy_profile=high-risk` is requested before the gate is available.
+`POST /v1/connect` now returns strict versus effective High-Risk posture honestly: if the hard anonymity gate is bypassed for development, the runtime exposes that degraded posture instead of silently reporting a normal High-Risk success.
 
 ## Feature flags
 

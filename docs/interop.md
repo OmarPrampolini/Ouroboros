@@ -6,13 +6,18 @@ This document defines the compatibility posture for Ouroboros local APIs and wir
 
 ## Local API
 
-The public local control plane is `/v1`.
+The public API namespace is `/v1`.
 
 Core expectations:
 
 - additive fields are allowed within `/v1`
 - additive endpoints are allowed within `/v1`
 - removing fields or changing meaning requires a documented migration
+
+Boundary note:
+
+- most `/v1` endpoints are authenticated local control-plane routes
+- `POST /v1/keeper/store` is a bearer-protected network-facing operator ingress route and must not be documented as localhost-only
 
 Key surfaces:
 
@@ -26,17 +31,19 @@ Key surfaces:
 - `/v1/keepers/status`
 - `/v1/keepers/policies`
 - `/v1/keepers/backfill`
+- `/v1/keeper/store`
 - `/v1/ethersync/*`
 
 Behavioral expectations:
 
 - EtherSync startup may enrich bootstrap peers from configured discovery peers, bridge hints, and bootstrap bundles
 - joining a space may seed peer knowledge from federated discovery before replay
-- keeper status must distinguish pending replication from archived replicated envelopes
+- untrusted bootstrap bundles may still contribute opaque ingress candidates, but they must not affect trust-sensitive routing posture
+- keeper status must distinguish local archive, pending remote send, failed remote send, and round-trip confirmed remote receipts
 - keeper APIs may expose per-space manifests, candidate shortfall, and managed-ready posture without claiming remote keeper guarantees that do not yet exist
 - joining a space may carry per-space retention and route-bias policy without changing the underlying passphrase scope
 - route inspection must expose target-scoped ORP ranking inputs without inventing route semantics that the runtime does not actually use
-- route status may expose high-risk circuit planning and control-frame telemetry without advertising a live high-risk routed data plane
+- route status may expose high-risk circuit planning, sealed setup capsules, and live routed data-plane telemetry without advertising more anonymity than the runtime actually enforces
 
 ## CipherPacket and Session Compatibility
 
@@ -58,20 +65,22 @@ Current ORP wire family:
 - `Lookup`
 - `Offer`
 - `Forward`
-- `Ack`
+- `DeliveryNotice`
 
-Reserved and formalized for ORP-HighRisk:
+Current ORP-HighRisk frame family:
 
 - `CircuitOpen`
 - `CircuitExtend`
 - `CircuitClose`
 - `Cover`
+- `CircuitReady`
 
 Current implementation truth:
 
 - these frames are formalized and surfaced in interop/capability documentation
-- the runtime can plan and publish high-risk control frames and observe them locally
-- the routed high-risk session data plane is still intentionally inactive
+- the runtime can plan, publish, and route high-risk session traffic through the current ORP data plane
+- circuit setup now ships per-hop sealed capsules instead of exposing the full route descriptor to the entire passphrase space
+- the current implementation still stops short of audited anonymity guarantees and fully hardened adversarial behavior
 
 Compatibility rule:
 
@@ -92,6 +101,9 @@ Formal subspace meanings:
 - `6`: circuit extend
 - `7`: circuit close
 - `8`: cover traffic
+- `9`: routed high-risk forward
+- `10`: delivery notice
+- `11`: circuit ready
 
 Reserved subspaces must remain stable once published.
 
@@ -110,6 +122,8 @@ The runtime should expose at least:
 - `bridge_bootstrap`
 
 Capabilities are not marketing. They are machine-readable truth.
+
+When the hard anonymity gate is bypassed for development, machine-readable status must distinguish strict availability from effective runtime posture instead of silently reporting `high-risk` as uniformly available.
 
 ## Deprecation Policy
 

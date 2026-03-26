@@ -14,6 +14,9 @@
 //! - `6`: circuit extend       (`SUBSPACE_CIRCUIT_EXTEND`)
 //! - `7`: circuit close        (`SUBSPACE_CIRCUIT_CLOSE`)
 //! - `8`: cover traffic        (`SUBSPACE_COVER_TRAFFIC`)
+//! - `9`: route forward        (`SUBSPACE_ROUTE_FORWARD`)
+//! - `10`: delivery notice     (`SUBSPACE_DELIVERY_NOTICE`)
+//! - `11`: circuit ready       (`SUBSPACE_CIRCUIT_READY`)
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -21,6 +24,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use crate::onion::is_valid_onion_public_key;
 use crate::EtherSyncError;
 
 // ---------------------------------------------------------------------------
@@ -37,14 +41,20 @@ pub const SUBSPACE_ROUTE_LOOKUP: u64 = 2;
 pub const SUBSPACE_ROUTE_OFFER: u64 = 3;
 /// Relay health beacon channel.
 pub const SUBSPACE_RELAY_BEACON: u64 = 4;
-/// Circuit establishment channel for future ORP-HighRisk overlays.
+/// Circuit establishment channel for ORP-HighRisk overlays.
 pub const SUBSPACE_CIRCUIT_OPEN: u64 = 5;
-/// Circuit extension channel for future ORP-HighRisk overlays.
+/// Circuit extension channel for ORP-HighRisk overlays.
 pub const SUBSPACE_CIRCUIT_EXTEND: u64 = 6;
-/// Circuit teardown channel for future ORP-HighRisk overlays.
+/// Circuit teardown channel for ORP-HighRisk overlays.
 pub const SUBSPACE_CIRCUIT_CLOSE: u64 = 7;
-/// Cover traffic channel for future ORP-HighRisk overlays.
+/// Cover traffic channel for ORP-HighRisk overlays.
 pub const SUBSPACE_COVER_TRAFFIC: u64 = 8;
+/// Routed multi-hop data channel for ORP-HighRisk overlays.
+pub const SUBSPACE_ROUTE_FORWARD: u64 = 9;
+/// Delivery notices for ORP-HighRisk routed packets.
+pub const SUBSPACE_DELIVERY_NOTICE: u64 = 10;
+/// Circuit-ready notification from exit to origin once a target binding exists locally.
+pub const SUBSPACE_CIRCUIT_READY: u64 = 11;
 
 /// Maximum number of announcements to keep per (space_hash, slot).
 pub const MAX_ANNOUNCEMENTS_PER_SLOT: usize = 64;
@@ -116,6 +126,14 @@ pub enum RouteHop {
     Tor { onion_address: String },
 }
 
+/// Direction of travel for a high-risk routed packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteDirection {
+    OriginToTarget,
+    TargetToOrigin,
+}
+
 // ---------------------------------------------------------------------------
 // ORP frame types
 // ---------------------------------------------------------------------------
@@ -127,11 +145,12 @@ pub enum OrpFrame {
     Lookup(RouteLookup),
     Offer(RouteOffer),
     Forward(RouteForward),
-    Ack(RouteAck),
+    DeliveryNotice(ForwardDeliveryNotice),
     CircuitOpen(CircuitOpen),
     CircuitExtend(CircuitExtend),
     CircuitClose(CircuitClose),
     Cover(CoverPacket),
+    CircuitReady(CircuitReady),
 }
 
 /// Periodic advertisement that a peer is online and reachable within a slot.
@@ -142,6 +161,15 @@ pub struct RouteAnnouncement {
     pub slot: u64,
     /// Ephemeral node id for this slot (derived from slot + node identity).
     pub node_id: [u8; 16],
+    /// Published X25519 onion public key for this node/session.
+    #[serde(default)]
+    pub onion_pubkey: [u8; 32],
+    /// Slot/epoch used to derive the rotating onion announcement key.
+    #[serde(default)]
+    pub onion_epoch_slot: u64,
+    /// Random salt mixed into the locally-derived onion announcement key.
+    #[serde(default)]
+    pub onion_salt: [u8; 16],
     pub capabilities: RouteCapabilities,
     /// Known direct UDP endpoints for this peer.
     pub reachable_udp: Vec<SocketAddr>,
@@ -190,18 +218,32 @@ pub struct RouteOffer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteForward {
     pub version: u8,
+    pub packet_id: [u8; 16],
     pub circuit_id: [u8; 16],
+    pub direction: RouteDirection,
     pub hop_index: u8,
     pub remaining_hops: u8,
     pub payload: Vec<u8>,
 }
 
-/// Delivery acknowledgment for a forwarded packet.
+/// Best-effort delivery notice for a forwarded packet observed at the exit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteAck {
+pub struct ForwardDeliveryNotice {
+    pub version: u8,
+    pub packet_id: [u8; 16],
+    pub circuit_id: [u8; 16],
+    pub direction: RouteDirection,
+    pub delivered_hop: u8,
+}
+
+/// End-to-end delivery receipt for a routed packet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryReceipt {
     pub version: u8,
     pub circuit_id: [u8; 16],
-    pub delivered_hop: u8,
+    pub packet_id: [u8; 16],
+    pub direction: RouteDirection,
+    pub receipt_mac: [u8; 16],
 }
 
 /// Opens a high-risk overlay circuit with a first hop.
@@ -209,9 +251,7 @@ pub struct RouteAck {
 pub struct CircuitOpen {
     pub version: u8,
     pub circuit_id: [u8; 16],
-    pub origin_id: [u8; 16],
-    pub first_hop: RouteHop,
-    /// Encrypted handshake material for the first hop only.
+    /// Serialized `HopHandshake` for the first hop only.
     pub hop_payload: Vec<u8>,
     pub expires_at_slot: u64,
 }
@@ -222,8 +262,7 @@ pub struct CircuitExtend {
     pub version: u8,
     pub circuit_id: [u8; 16],
     pub current_hop: u8,
-    pub next_hop: RouteHop,
-    /// Onion-layer payload only the next hop can open.
+    /// Serialized `HopHandshake` for the next hop only.
     pub hop_payload: Vec<u8>,
     pub expires_at_slot: u64,
 }
@@ -234,6 +273,10 @@ pub struct CircuitClose {
     pub version: u8,
     pub circuit_id: [u8; 16],
     pub reason_code: u16,
+    #[serde(default)]
+    pub target_role_code: u8,
+    #[serde(default)]
+    pub control_mac: [u8; 16],
 }
 
 /// Fixed-shape padding or cover packet for anti-correlation work.
@@ -243,6 +286,16 @@ pub struct CoverPacket {
     pub stream_id: [u8; 16],
     pub cover_class: u8,
     pub payload: Vec<u8>,
+}
+
+/// Notification that the exit node has installed a local target binding for a circuit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitReady {
+    pub version: u8,
+    pub circuit_id: [u8; 16],
+    pub established_at_slot: u64,
+    #[serde(default)]
+    pub ready_mac: [u8; 16],
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +339,12 @@ pub struct RouteCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HighRiskCircuitHop {
     pub node_id: [u8; 16],
+    #[serde(default)]
+    pub onion_pubkey: [u8; 32],
+    #[serde(default)]
+    pub onion_epoch_slot: u64,
+    #[serde(default)]
+    pub onion_salt: [u8; 16],
     pub assist_tag: [u8; 8],
     pub addr: SocketAddr,
     pub route_class: RouteClass,
@@ -304,6 +363,19 @@ pub struct HighRiskCircuitPlan {
     pub exit: HighRiskCircuitHop,
     pub operator_diversity: usize,
     pub region_diversity: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighRiskRouteDescriptor {
+    pub version: u8,
+    pub circuit_id: [u8; 16],
+    pub origin_id: [u8; 16],
+    pub space_prefix: [u8; 8],
+    pub target_tag: [u8; 8],
+    pub entry: HighRiskCircuitHop,
+    pub middle: HighRiskCircuitHop,
+    pub exit: HighRiskCircuitHop,
+    pub expires_at_slot: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,6 +540,7 @@ impl RouteCache {
                 k.space_prefix == *space_prefix
                     && k.slot >= min_slot
                     && ann.frame.capabilities.can_relay
+                    && has_onion_pubkey(&ann.frame.onion_pubkey)
                     && !ann.frame.reachable_udp.is_empty()
             })
             .map(|(_, ann)| ann);
@@ -534,6 +607,9 @@ impl RouteCache {
 
         for (key, announcement) in &self.announcements {
             if key.space_prefix != *space_prefix || key.slot < min_slot {
+                continue;
+            }
+            if !has_onion_pubkey(&announcement.frame.onion_pubkey) {
                 continue;
             }
             let Some(addr) = announcement.frame.reachable_udp.first().copied() else {
@@ -665,6 +741,9 @@ impl RouteCache {
 fn build_high_risk_hop(announcement: &CachedAnnouncement, addr: SocketAddr) -> HighRiskCircuitHop {
     HighRiskCircuitHop {
         node_id: announcement.frame.node_id,
+        onion_pubkey: announcement.frame.onion_pubkey,
+        onion_epoch_slot: announcement.frame.onion_epoch_slot,
+        onion_salt: announcement.frame.onion_salt,
         assist_tag: announcement.frame.assist_tag,
         addr,
         route_class: announcement.frame.route_class,
@@ -673,6 +752,10 @@ fn build_high_risk_hop(announcement: &CachedAnnouncement, addr: SocketAddr) -> H
         can_relay: announcement.frame.capabilities.can_relay,
         bridge_capable: announcement.frame.capabilities.bridge_capable,
     }
+}
+
+fn has_onion_pubkey(pubkey: &[u8; 32]) -> bool {
+    is_valid_onion_public_key(pubkey)
 }
 
 fn distinct_non_empty<'a>(values: impl IntoIterator<Item = &'a str>) -> usize {
@@ -771,6 +854,9 @@ mod tests {
             version: 1,
             slot,
             node_id,
+            onion_pubkey: [7u8; 32],
+            onion_epoch_slot: slot,
+            onion_salt: [9u8; 16],
             capabilities: RouteCapabilities::default(),
             reachable_udp: vec![dummy_addr()],
             assist_tag: tag,
@@ -800,6 +886,7 @@ mod tests {
             OrpFrame::Announce(decoded_ann) => {
                 assert_eq!(decoded_ann.slot, ann.slot);
                 assert_eq!(decoded_ann.node_id, ann.node_id);
+                assert_eq!(decoded_ann.onion_pubkey, ann.onion_pubkey);
                 assert_eq!(decoded_ann.assist_tag, ann.assist_tag);
             }
             _ => panic!("wrong frame type"),
@@ -990,11 +1077,6 @@ mod tests {
         let open = CircuitOpen {
             version: 1,
             circuit_id: [3u8; 16],
-            origin_id: [4u8; 16],
-            first_hop: RouteHop::Relay {
-                relay_addr: dummy_addr(),
-                target_tag: [9u8; 8],
-            },
             hop_payload: vec![1, 2, 3, 4],
             expires_at_slot: 88,
         };
@@ -1004,7 +1086,6 @@ mod tests {
         match decoded {
             OrpFrame::CircuitOpen(decoded_open) => {
                 assert_eq!(decoded_open.circuit_id, open.circuit_id);
-                assert_eq!(decoded_open.origin_id, open.origin_id);
                 assert_eq!(decoded_open.expires_at_slot, open.expires_at_slot);
             }
             _ => panic!("wrong frame type"),

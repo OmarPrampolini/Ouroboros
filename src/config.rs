@@ -174,6 +174,8 @@ pub struct Config {
     pub operator_keeper_capable: bool,
     /// Whether keeper-backed replication is enabled for the local runtime.
     pub keeper_replication_enabled: bool,
+    /// Optional bearer token accepted by the network-facing keeper ingest endpoint.
+    pub keeper_ingest_token: Option<String>,
     /// Replication factor for managed keeper-backed retention.
     pub keeper_replication_factor: usize,
     /// Human-readable retention tier for status surfaces.
@@ -184,6 +186,15 @@ pub struct Config {
     pub bootstrap_bundle_path: Option<String>,
     /// Optional inline JSON bootstrap bundle for local development.
     pub bootstrap_bundle_json: Option<String>,
+    /// Require a verified-trusted bootstrap bundle before enabling high-risk profile.
+    pub high_risk_require_trusted_bundle: bool,
+    /// Enable quantitative hard anonymity gate for the high-risk profile.
+    /// When false, quantitative thresholds (relay count, operator diversity, etc.)
+    /// are logged but do not block circuit setup. Defaults to true.
+    pub high_risk_hard_anonymity_gate: bool,
+    /// Trusted public keys for bootstrap bundle signature verification.
+    #[serde(default)]
+    pub bootstrap_bundle_trusted_keys: Vec<BootstrapTrustedKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +202,12 @@ pub struct TlsMimicryConfig {
     pub target_domain: String,
     pub issuer_spki_hashes: Vec<[u8; 32]>,
     pub enforce: bool, // true = reject if mismatch, false = warn only
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapTrustedKey {
+    pub key_id: Option<String>,
+    pub public_key: String,
 }
 
 impl Config {
@@ -247,11 +264,15 @@ impl Config {
             operator_bridge_capable: false,
             operator_keeper_capable: false,
             keeper_replication_enabled: false,
+            keeper_ingest_token: None,
             keeper_replication_factor: 0,
             retention_tier: "local-only".to_string(),
             bridge_bootstrap_hints: Vec::new(),
             bootstrap_bundle_path: None,
             bootstrap_bundle_json: None,
+            high_risk_require_trusted_bundle: false,
+            high_risk_hard_anonymity_gate: true,
+            bootstrap_bundle_trusted_keys: Vec::new(),
         }
     }
 }
@@ -624,6 +645,13 @@ impl Config {
                 matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
         }
 
+        if let Ok(value) = std::env::var("HANDSHACKE_KEEPER_INGEST_TOKEN") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                config.keeper_ingest_token = Some(trimmed.to_string());
+            }
+        }
+
         if let Ok(value) = std::env::var("HANDSHACKE_KEEPER_REPLICATION_ENABLED") {
             config.keeper_replication_enabled =
                 matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
@@ -664,6 +692,24 @@ impl Config {
             }
         }
 
+        if let Ok(value) = std::env::var("HANDSHACKE_HIGH_RISK_REQUIRE_TRUSTED_BUNDLE") {
+            config.high_risk_require_trusted_bundle = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_HIGH_RISK_HARD_ANONYMITY_GATE") {
+            config.high_risk_hard_anonymity_gate = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Ok(value) = std::env::var("HANDSHACKE_BOOTSTRAP_TRUSTED_KEYS") {
+            config.bootstrap_bundle_trusted_keys = parse_bootstrap_trusted_keys(&value);
+        }
+
         config
     }
 
@@ -677,6 +723,46 @@ impl Config {
     pub fn key_rotation_grace_ms(&self) -> u64 {
         self.key_rotation_grace_s.saturating_mul(1000)
     }
+}
+
+fn parse_bootstrap_trusted_keys(raw: &str) -> Vec<BootstrapTrustedKey> {
+    raw.split([';', ','])
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+
+            let (key_id, public_key) = if let Some((key_id, public_key)) = entry.split_once('=') {
+                (
+                    Some(key_id.trim().to_string()),
+                    public_key.trim().to_string(),
+                )
+            } else if let Some((key_id, public_key)) = entry.split_once(':') {
+                if public_key.chars().all(|ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_')
+                }) {
+                    (
+                        Some(key_id.trim().to_string()),
+                        public_key.trim().to_string(),
+                    )
+                } else {
+                    (None, entry.to_string())
+                }
+            } else {
+                (None, entry.to_string())
+            };
+
+            if public_key.is_empty() {
+                return None;
+            }
+
+            Some(BootstrapTrustedKey {
+                key_id: key_id.filter(|value| !value.is_empty()),
+                public_key,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

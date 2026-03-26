@@ -18,6 +18,7 @@ use super::types::{
     KeeperPolicyUpdateRequest,
 };
 use super::{ApiError, ApiState};
+use crate::keeper_client::{KeeperStoreRequest, KeeperStoreResponse};
 use crate::state::{
     EtherSyncStartConfig, EtherSyncStatus, KeeperBackfillResult, SpacePolicySnapshot,
 };
@@ -268,6 +269,23 @@ pub(crate) async fn handle_keeper_backfill(
     let result = state
         .app
         .ethersync_keeper_backfill(req.passphrase, req.max_messages)
+        .await
+        .map_err(|e| ApiError::bad_request(&e.to_string()))?;
+    Ok(Json(result))
+}
+
+pub(crate) async fn handle_keeper_store(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(state): Extension<Arc<ApiState>>,
+    Json(req): Json<KeeperStoreRequest>,
+) -> EtherSyncResult<KeeperStoreResponse> {
+    if !state.app.api_allow(addr.ip(), 1.0).await {
+        return Err(ApiError::bad_request("rate limit"));
+    }
+
+    let result = state
+        .app
+        .ethersync_keeper_store(req)
         .await
         .map_err(|e| ApiError::bad_request(&e.to_string()))?;
     Ok(Json(result))

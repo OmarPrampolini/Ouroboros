@@ -61,6 +61,7 @@ fn parse_orp_target_tag(raw: &str) -> Option<[u8; 8]> {
 #[derive(Debug, Default)]
 struct ConnectCircuitBreaker {
     consecutive_failures: u32,
+    success_count: u32,
     open_until: Option<Instant>,
 }
 
@@ -117,6 +118,7 @@ async fn record_connect_success() {
     let circuit = connect_circuit();
     let mut guard = circuit.lock().await;
     guard.consecutive_failures = 0;
+    guard.success_count = guard.success_count.saturating_add(1);
     guard.open_until = None;
 }
 
@@ -137,7 +139,7 @@ pub(super) async fn get_connect_circuit_status() -> crate::state::CircuitBreaker
     crate::state::CircuitBreakerStatus {
         state,
         failure_count: guard.consecutive_failures,
-        success_count: 0,
+        success_count: guard.success_count,
         next_attempt_in,
     }
 }
@@ -188,8 +190,11 @@ pub(crate) async fn handle_connect(
     }
     let privacy_profile = req.privacy_profile;
     if privacy_profile == PrivacyProfile::HighRisk {
-        let mut details = match app.ethersync_status().await {
-            Ok(status) => serde_json::json!({
+        let cfg = Config::from_env();
+        let local_role = req.local_role.unwrap_or(RoleHint::Client);
+        let ethersync_status = app.ethersync_status().await.ok();
+        let mut details = match ethersync_status.as_ref() {
+            Some(status) => serde_json::json!({
                 "requested_privacy_profile": "high-risk",
                 "available": status.high_risk_available,
                 "gate_reasons": status.high_risk_gate_reasons,
@@ -204,7 +209,7 @@ pub(crate) async fn handle_connect(
                 "routes_status_path": "/v1/routes/status",
                 "interop_path": "/v1/interop",
             }),
-            Err(_) => serde_json::json!({
+            None => serde_json::json!({
                 "requested_privacy_profile": "high-risk",
                 "available": false,
                 "gate_reasons": [
@@ -217,27 +222,43 @@ pub(crate) async fn handle_connect(
         details["requirements"] = serde_json::json!({
             "passphrase_required": true,
             "target_format": "orp:<16-hex>",
+            "target_required": local_role != RoleHint::Host,
             "active_orp_runtime_required": true,
+            "trusted_bootstrap_bundle_required": cfg.high_risk_require_trusted_bundle,
         });
+        if matches!(ethersync_status.as_ref(), Some(status) if !status.high_risk_available) {
+            details["runtime_gate_available_strict"] = serde_json::json!(false);
+            if cfg.high_risk_hard_anonymity_gate {
+                return Err(connect_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "high-risk profile unavailable: runtime gate is not satisfied",
+                )
+                .with_details(details));
+            }
+        }
+        if cfg.high_risk_require_trusted_bundle
+            && (cfg.bootstrap_bundle_path.is_some() || cfg.bootstrap_bundle_json.is_some())
+            && !ethersync_status
+                .as_ref()
+                .map(|status| status.bootstrap_bundle_trusted_for_high_risk)
+                .unwrap_or(false)
+        {
+            details["bootstrap_trust_gate"] = serde_json::json!({
+                "required": true,
+                "satisfied": false,
+                "reason": "bootstrap bundle is configured but not verified-trusted",
+            });
+            return Err(connect_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "high-risk profile requires a verified-trusted bootstrap bundle",
+            )
+            .with_details(details));
+        }
 
-        let Some(passphrase) = req.passphrase.as_deref() else {
+        let Some(passphrase_raw) = req.passphrase.as_deref() else {
             return Err(connect_err(
                 StatusCode::BAD_REQUEST,
-                "high-risk profile requires a passphrase-bound ORP target",
-            )
-            .with_details(details));
-        };
-        let Some(target) = req.target.as_deref() else {
-            return Err(connect_err(
-                StatusCode::BAD_REQUEST,
-                "high-risk profile requires target in orp:<16-hex> form",
-            )
-            .with_details(details));
-        };
-        let Some(target_tag) = parse_orp_target_tag(target) else {
-            return Err(connect_err(
-                StatusCode::BAD_REQUEST,
-                "high-risk profile requires target in orp:<16-hex> form",
+                "high-risk profile requires a passphrase-bound ORP space",
             )
             .with_details(details));
         };
@@ -250,41 +271,276 @@ pub(crate) async fn handle_connect(
             )
             .with_details(details));
         };
+        let passphrase = SecretString::from(passphrase_raw.to_string());
+        let high_risk_gate = orp_node
+            .high_risk_gate_snapshot(passphrase.expose_secret())
+            .await
+            .map_err(|err| {
+                details["planning_error"] = serde_json::json!(err.to_string());
+                connect_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "high-risk profile unavailable: gate snapshot failed",
+                )
+                .with_details(details.clone())
+            })?;
+        let mut gate_reasons = Vec::new();
+        if high_risk_gate.relay_nodes_observed < 64 {
+            gate_reasons.push(format!(
+                "observed relay nodes below hard gate: {} / 64",
+                high_risk_gate.relay_nodes_observed
+            ));
+        }
+        if high_risk_gate.distinct_operator_hints_observed < 16 {
+            gate_reasons.push(format!(
+                "distinct operator identities below hard gate: {} / 16",
+                high_risk_gate.distinct_operator_hints_observed
+            ));
+        }
+        if high_risk_gate.distinct_region_hints_observed < 6 {
+            gate_reasons.push(format!(
+                "distinct region buckets below hard gate: {} / 6",
+                high_risk_gate.distinct_region_hints_observed
+            ));
+        }
+        if high_risk_gate
+            .max_operator_share_observed_pct
+            .unwrap_or(100)
+            > 15
+        {
+            gate_reasons.push(format!(
+                "max operator share above hard gate: {}% / 15%",
+                high_risk_gate
+                    .max_operator_share_observed_pct
+                    .unwrap_or(100)
+            ));
+        }
+        if !high_risk_gate.valid_three_hop_path_observed {
+            gate_reasons.push("no valid three-hop path observed".to_string());
+        }
+        details["high_risk_gate_snapshot"] =
+            serde_json::to_value(&high_risk_gate).unwrap_or_else(|_| serde_json::json!({}));
+        let mut hard_gate_bypassed = false;
+        if !gate_reasons.is_empty() {
+            if cfg.high_risk_hard_anonymity_gate {
+                details["high_risk_gate_reasons"] = serde_json::json!(gate_reasons);
+                return Err(connect_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "high-risk profile unavailable: hard anonymity gate is not satisfied",
+                )
+                .with_details(details));
+            }
+            tracing::warn!(
+                "hard anonymity gate bypassed (HANDSHACKE_HIGH_RISK_HARD_ANONYMITY_GATE=off): {:?}",
+                gate_reasons
+            );
+            details["high_risk_gate_bypassed"] = serde_json::json!(gate_reasons);
+            hard_gate_bypassed = true;
+        }
+        details["gate_bypass_allowed"] = serde_json::json!(!cfg.high_risk_hard_anonymity_gate);
+        details["available_strict"] = serde_json::json!(!hard_gate_bypassed);
+        details["available_effective"] = serde_json::json!(true);
+        details["observed_posture"] = serde_json::json!(if hard_gate_bypassed {
+            "bypassed-hard-gate"
+        } else {
+            "strict-ready"
+        });
+        let params = derive_from_secret(&passphrase).map_err(|e| {
+            tracing::error!("Derivation failed: {:?}", e);
+            connect_err(StatusCode::INTERNAL_SERVER_ERROR, "operation failed")
+        })?;
 
-        match crate::transport::orp_highrisk::prepare_high_risk_connect(
-            orp_node.as_ref(),
-            passphrase,
-            target_tag,
+        let (preparation, io, noise_role, peer_label) = if local_role == RoleHint::Host {
+            if req.target.is_some() {
+                return Err(connect_err(
+                    StatusCode::BAD_REQUEST,
+                    "high-risk host mode does not accept an explicit target",
+                )
+                .with_details(details));
+            }
+            match crate::transport::orp_highrisk::accept_high_risk_inbound_transport(
+                orp_node.clone(),
+                passphrase.expose_secret(),
+                Duration::from_millis(cfg.rendezvous_timeout_ms.max(1)),
+            )
+            .await
+            {
+                Ok((preparation, io)) => {
+                    let peer = format!("circuit:{}", preparation.circuit_id);
+                    (
+                        preparation,
+                        io,
+                        crate::session_noise::NoiseRole::Responder,
+                        peer,
+                    )
+                }
+                Err(err) => {
+                    details["planning_error"] = serde_json::to_value(&err)
+                        .unwrap_or_else(|_| serde_json::json!(err.reason));
+                    return Err(connect_err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "high-risk profile unavailable: no inbound ORP circuit is ready",
+                    )
+                    .with_details(details));
+                }
+            }
+        } else {
+            let Some(target) = req.target.as_deref() else {
+                return Err(connect_err(
+                    StatusCode::BAD_REQUEST,
+                    "high-risk profile requires target in orp:<16-hex> form",
+                )
+                .with_details(details));
+            };
+            let Some(target_tag) = parse_orp_target_tag(target) else {
+                return Err(connect_err(
+                    StatusCode::BAD_REQUEST,
+                    "high-risk profile requires target in orp:<16-hex> form",
+                )
+                .with_details(details));
+            };
+            match crate::transport::orp_highrisk::establish_high_risk_outbound_transport(
+                orp_node.clone(),
+                passphrase.expose_secret(),
+                target_tag,
+            )
+            .await
+            {
+                Ok((preparation, io)) => (
+                    preparation,
+                    io,
+                    crate::session_noise::NoiseRole::Initiator,
+                    format!("orp:{}", hex::encode(target_tag)),
+                ),
+                Err(err) => {
+                    details["planning_error"] = serde_json::to_value(&err)
+                        .unwrap_or_else(|_| serde_json::json!(err.reason));
+                    return Err(connect_err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "high-risk profile unavailable: no eligible three-hop ORP circuit could be prepared",
+                    )
+                    .with_details(details));
+                }
+            }
+        };
+
+        details["prepared_circuit"] = serde_json::to_value(&preparation)
+            .unwrap_or_else(|_| serde_json::json!({"prepared": true}));
+
+        let params_noise = match crate::session_noise::pq_noise_params() {
+            Ok(p) => p,
+            Err(_) => crate::session_noise::classic_noise_params()
+                .map_err(|_| connect_err(StatusCode::BAD_GATEWAY, "operation failed"))?,
+        };
+
+        let session_key = match crate::session_noise::run_noise_upgrade_io(
+            noise_role,
+            {
+                let io = io.clone();
+                move |data: Vec<u8>| {
+                    let io = io.clone();
+                    async move { io.send(data).await }
+                }
+            },
+            {
+                let io = io.clone();
+                move || {
+                    let io = io.clone();
+                    async move { io.recv().await }
+                }
+            },
+            &params.key_enc,
+            params.tag16,
+            params.tag8,
+            params_noise,
+            io.max_packet_limit(),
         )
         .await
         {
-            Ok(preparation) => {
-                let circuit_id = preparation.circuit_id.clone();
-                details["prepared_circuit"] = serde_json::to_value(&preparation)
-                    .unwrap_or_else(|_| serde_json::json!({"prepared": true}));
-                let _ = crate::transport::orp_highrisk::cancel_prepared_high_risk_circuit(
-                    orp_node.as_ref(),
-                    passphrase,
-                    &circuit_id,
-                    1,
-                )
-                .await;
-                return Err(connect_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "high-risk circuit prepared, but the routed session data plane is not active yet",
-                )
-                .with_details(details));
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!("High-risk noise handshake failed: {:?}", e);
+                record_connect_failure("high-risk noise handshake").await;
+                return Err(
+                    connect_err(StatusCode::BAD_GATEWAY, "operation failed").with_details(details)
+                );
             }
-            Err(err) => {
-                details["planning_error"] =
-                    serde_json::to_value(&err).unwrap_or_else(|_| serde_json::json!(err.reason));
-                return Err(connect_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "high-risk profile unavailable: no eligible three-hop ORP circuit could be prepared",
-                )
-                .with_details(details));
-            }
-        }
+        };
+
+        let session_cipher = Arc::new(tokio::sync::RwLock::new(SessionKeyState::new(
+            session_key,
+            params.tag16,
+            params.tag8,
+            cfg.key_rotation_grace_ms(),
+        )));
+        let rotation_policy = cfg.key_rotation_policy();
+        let (tx_out, rx_out) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        app.set_tx_out(tx_out.clone()).await;
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        app.set_stop_tx(stop_tx).await;
+
+        let updated_streams = Streams {
+            tx: streams.tx,
+            rx: streams.rx,
+            tx_out,
+        };
+
+        let rl_duration = Duration::from_secs(cfg.rate_limit_time_window_s.max(1));
+        let rl = RateLimiter::new(
+            cfg.rate_limit_capacity,
+            cfg.rate_limit_max_requests,
+            rl_duration,
+        );
+
+        let stop_rx1 = stop_rx.clone();
+        let _rx_handle = crate::transport::tasks::spawn_receiver_task_with_stop_io(
+            io.clone(),
+            updated_streams.clone(),
+            session_cipher.clone(),
+            rl,
+            stop_rx1,
+        )
+        .await;
+
+        let stop_rx2 = stop_rx.clone();
+        let metrics = app.get_metrics().await;
+        let _tx_handle = crate::transport::tasks::spawn_sender_task_with_stop_io(
+            io,
+            rx_out,
+            stop_rx2,
+            metrics,
+            session_cipher,
+            rotation_policy,
+            match noise_role {
+                crate::session_noise::NoiseRole::Initiator => 0x01,
+                crate::session_noise::NoiseRole::Responder => 0x02,
+            },
+        )
+        .await;
+
+        let effective_mode = if hard_gate_bypassed {
+            "high-risk-bypassed"
+        } else {
+            "high-risk"
+        };
+
+        let mut s = app.get_connection_state().await;
+        s.port = None;
+        s.mode = Some(effective_mode.into());
+        s.status = crate::state::ConnectionStatus::Connected;
+        s.peer_address = Some(peer_label.clone());
+        s.privacy_profile = privacy_profile;
+        app.set_connection_state(s).await;
+        record_connect_success().await;
+
+        return Ok(Json(ConnectionResponse {
+            status: "connected".into(),
+            port: None,
+            mode: effective_mode.into(),
+            peer: Some(peer_label),
+            resume_status: None,
+            privacy_profile,
+        }));
     }
     if req.offer.is_some() && req.passphrase.is_some() {
         return Err(connect_err(

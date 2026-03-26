@@ -16,6 +16,9 @@ use zeroize::Zeroize;
 
 use crate::bootstrap_bundle::{BootstrapBundleSummary, BootstrapBundleValidationReport};
 use crate::config::PrivacyProfile;
+use crate::keeper_client::{KeeperClient, KeeperStoreRequest, KeeperStoreResponse};
+#[path = "keeper_remote.rs"]
+mod keeper_remote;
 
 pub mod connection_manager;
 pub mod metrics;
@@ -168,6 +171,8 @@ pub struct EtherSyncStatus {
     pub bootstrap_bundle_structurally_weak: bool,
     /// Whether the loaded bootstrap bundle is locally considered stale.
     pub bootstrap_bundle_stale: bool,
+    /// Whether the loaded bootstrap bundle is verified-trusted for high-risk routing.
+    pub bootstrap_bundle_trusted_for_high_risk: bool,
     /// Number of bootstrap bundle validation warnings.
     pub bootstrap_bundle_warning_count: usize,
     /// Number of bootstrap bundle validation errors.
@@ -194,6 +199,30 @@ pub struct EtherSyncStatus {
     pub bridge_preferred_space_count: usize,
     /// Number of spaces whose route bias prefers keeper-capable paths.
     pub keeper_preferred_space_count: usize,
+    /// Number of spaces with remote keeper targets or receipts tracked.
+    pub remote_keeper_space_count: usize,
+    /// Number of spaces with at least one confirmed remote keeper receipt.
+    pub remote_keeper_receipted_space_count: usize,
+    /// Total selected remote keeper targets across managed spaces.
+    pub remote_keeper_targets: usize,
+    /// Total selected remote keeper targets with at least one confirmed remote keeper receipt.
+    pub remote_keeper_acknowledged_targets: usize,
+    /// Total confirmed remote keeper receipts across tracked spaces.
+    pub remote_keeper_receipts: usize,
+    /// Total confirmed envelope deliveries against selected remote keeper targets.
+    pub remote_keeper_delivered_envelopes: usize,
+    /// Total envelopes confirmed via real remote round-trips.
+    pub round_trip_confirmed_envelopes: usize,
+    /// Total envelopes still pending transmission or confirmation to selected remote keepers.
+    pub pending_remote_send_envelopes: usize,
+    /// Total envelopes whose last remote send attempt failed.
+    pub failed_remote_send_envelopes: usize,
+    /// Most recent confirmed remote keeper receipt timestamp across tracked spaces.
+    pub last_remote_keeper_receipt_ms: Option<u64>,
+    /// Whether remote keeper delivery is locally projected or round-trip confirmed.
+    pub remote_confirmation_mode: String,
+    /// What kind of remote storage the current keeper receipts actually represent.
+    pub remote_storage_class: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -273,6 +302,9 @@ pub struct SpacePolicySnapshot {
     pub route_bias: String,
     pub pending_keeper_envelopes: usize,
     pub archived_keeper_envelopes: usize,
+    pub remote_keeper_targets: usize,
+    pub remote_keeper_receipts: usize,
+    pub remote_keeper_delivered_envelopes: usize,
     pub keeper_manifest: KeeperSpaceManifest,
 }
 
@@ -283,9 +315,13 @@ pub struct KeeperSpaceManifest {
     pub desired_replica_count: usize,
     pub available_keeper_candidates: usize,
     pub selected_keeper_targets: usize,
+    pub acknowledged_keeper_targets: usize,
     pub candidate_shortfall: usize,
+    pub remote_keeper_receipts: usize,
+    pub remote_delivered_envelopes: usize,
     pub replication_stage: String,
     pub last_local_activity_ms: Option<u64>,
+    pub last_remote_receipt_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,6 +368,8 @@ struct EtherSyncRuntime {
     bootstrap_bundle_validation: Option<BootstrapBundleValidationReport>,
     keeper_envelopes: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
     keeper_archive: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    keeper_remote: Arc<Mutex<keeper_remote::KeeperRemoteLedger>>,
+    keeper_candidates: Vec<keeper_remote::KeeperRemoteTarget>,
     keeper_last_activity: Arc<Mutex<HashMap<String, u64>>>,
     space_policies: Arc<Mutex<HashMap<String, EtherSpacePolicy>>>,
 }
@@ -360,6 +398,12 @@ struct DiscoverySeedReport {
 struct KeeperReplicationFlush {
     moved: usize,
     touched_spaces: usize,
+    remote_receipts: usize,
+    remote_spaces: usize,
+    remote_targets: usize,
+    remote_acknowledged_targets: usize,
+    pending_remote_sends: usize,
+    failed_remote_sends: usize,
 }
 
 const ETHERSYNC_FILE_CHUNK_DEFAULT: usize = 1024;
@@ -614,12 +658,23 @@ impl AppState {
         }
 
         let runtime_cfg = crate::config::Config::from_env();
-        let bootstrap_bundle_validation =
-            crate::bootstrap_bundle::validate_loaded_bootstrap_bundle(&runtime_cfg);
+        let bootstrap_bundle_full = crate::bootstrap_bundle::load_bootstrap_bundle(&runtime_cfg);
+        let bootstrap_bundle_validation = bootstrap_bundle_full
+            .as_ref()
+            .map(|bundle| bundle.validation_report_with_config(&runtime_cfg));
         let bootstrap_bundle = bootstrap_bundle_validation
             .as_ref()
             .map(|report| report.summary.clone())
             .unwrap_or_default();
+        let keeper_candidates = if bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.is_usable && report.trusted_for_runtime_high_risk())
+            .unwrap_or(false)
+        {
+            keeper_remote::keeper_targets_from_bundle(bootstrap_bundle_full.as_ref())
+        } else {
+            Vec::new()
+        };
         let resolved_bootstrap_peers =
             resolve_initial_bootstrap_peers(&runtime_cfg, &cfg.bootstrap_peers);
         let bootstrap_peer_count = resolved_bootstrap_peers.len();
@@ -658,6 +713,7 @@ impl AppState {
         let (events_tx, _) = broadcast::channel(512);
         let keeper_envelopes = Arc::new(Mutex::new(HashMap::new()));
         let keeper_archive = Arc::new(Mutex::new(HashMap::new()));
+        let keeper_remote = Arc::new(Mutex::new(keeper_remote::KeeperRemoteLedger::default()));
         let keeper_last_activity = Arc::new(Mutex::new(HashMap::new()));
         let space_policies = Arc::new(Mutex::new(HashMap::new()));
         let keeper_replication_task = if runtime_cfg.keeper_replication_enabled {
@@ -666,6 +722,9 @@ impl AppState {
                 events_tx.clone(),
                 keeper_envelopes.clone(),
                 keeper_archive.clone(),
+                keeper_remote.clone(),
+                space_policies.clone(),
+                keeper_candidates.clone(),
             ))
         } else {
             None
@@ -707,6 +766,8 @@ impl AppState {
             bootstrap_bundle_validation,
             keeper_envelopes,
             keeper_archive,
+            keeper_remote,
+            keeper_candidates,
             keeper_last_activity,
             space_policies,
         };
@@ -776,6 +837,8 @@ impl AppState {
             operator_region_hint,
             bootstrap_bundle,
             bootstrap_bundle_validation,
+            keeper_remote,
+            keeper_candidates,
             keeper_envelopes,
             keeper_archive,
             keeper_last_activity,
@@ -797,6 +860,8 @@ impl AppState {
                     rt.operator_region_hint.clone(),
                     rt.bootstrap_bundle.clone(),
                     rt.bootstrap_bundle_validation.clone(),
+                    Some(rt.keeper_remote.clone()),
+                    rt.keeper_candidates.clone(),
                     Some(rt.keeper_envelopes.clone()),
                     Some(rt.keeper_archive.clone()),
                     Some(rt.keeper_last_activity.clone()),
@@ -817,6 +882,8 @@ impl AppState {
                     BootstrapBundleSummary::default(),
                     None,
                     None,
+                    Vec::new(),
+                    None,
                     None,
                     None,
                     None,
@@ -832,7 +899,14 @@ impl AppState {
         let high_risk_gate_reasons = default_high_risk_gate_reasons(
             enable_orp,
             keeper_replication_enabled,
+            runtime_cfg.bootstrap_bundle_path.is_some()
+                || runtime_cfg.bootstrap_bundle_json.is_some(),
             bootstrap_bundle.loaded,
+            bootstrap_bundle_validation
+                .as_ref()
+                .map(|report| report.trusted_for_runtime_high_risk())
+                .unwrap_or(false),
+            runtime_cfg.high_risk_require_trusted_bundle,
             bridge_hint_count,
         );
         let (pending_keeper_envelopes, keeper_space_count) =
@@ -862,6 +936,12 @@ impl AppState {
             managed_ready_space_count,
         ) = if let Some(space_policies) = space_policies {
             let guard = space_policies.lock().await;
+            let remote_items = keeper_remote.as_ref().cloned();
+            let remote_guard = if let Some(items) = remote_items.as_ref() {
+                Some(items.lock().await)
+            } else {
+                None
+            };
             let pending_items = keeper_envelopes.as_ref().cloned();
             let pending_guard = if let Some(items) = pending_items.as_ref() {
                 Some(items.lock().await)
@@ -907,12 +987,17 @@ impl AppState {
                 let last_activity_ms = activity_guard
                     .as_ref()
                     .and_then(|items| items.get(space_key).copied());
+                let remote_view = remote_guard
+                    .as_ref()
+                    .map(|items| items.view_for_space(space_key))
+                    .unwrap_or_default();
                 let manifest = build_keeper_space_manifest(
                     policy,
                     pending,
                     archived,
-                    &bootstrap_bundle,
+                    keeper_candidates.len(),
                     last_activity_ms,
+                    &remote_view,
                 );
                 if manifest.managed || pending > 0 || archived > 0 {
                     manifest_spaces += 1;
@@ -939,6 +1024,11 @@ impl AppState {
             keeper_last_activity.lock().await.values().copied().max()
         } else {
             None
+        };
+        let remote_keeper_status = if let Some(keeper_remote) = keeper_remote {
+            keeper_remote.lock().await.aggregate()
+        } else {
+            keeper_remote::KeeperRemoteAggregateStatus::default()
         };
 
         // Collect ORP diagnostics from the route cache.
@@ -976,7 +1066,12 @@ impl AppState {
             bootstrap_peer_count,
             discovery_bootstrap_peer_count: runtime_cfg.discovery_bootstrap_peers.len(),
             bridge_bootstrap_enabled: bridge_hint_count > 0
-                || bootstrap_bundle.bridges > 0
+                || bootstrap_bundle_validation
+                    .as_ref()
+                    .map(|report| {
+                        report.trusted_for_runtime_high_risk() && report.summary.bridges > 0
+                    })
+                    .unwrap_or(false)
                 || !runtime_cfg.assist_relays.is_empty(),
             bridge_hint_count,
             high_risk_available: high_risk_gate_reasons.is_empty(),
@@ -1006,6 +1101,10 @@ impl AppState {
                 .as_ref()
                 .map(|report| report.staleness.is_stale())
                 .unwrap_or(false),
+            bootstrap_bundle_trusted_for_high_risk: bootstrap_bundle_validation
+                .as_ref()
+                .map(|report| report.trusted_for_runtime_high_risk())
+                .unwrap_or(false),
             bootstrap_bundle_warning_count: bootstrap_bundle_validation
                 .as_ref()
                 .map(|report| report.issue_counts.warning)
@@ -1025,6 +1124,31 @@ impl AppState {
             managed_space_count,
             bridge_preferred_space_count,
             keeper_preferred_space_count,
+            remote_keeper_space_count: remote_keeper_status.space_count,
+            remote_keeper_receipted_space_count: remote_keeper_status.acknowledged_space_count,
+            remote_keeper_targets: remote_keeper_status.selected_targets,
+            remote_keeper_acknowledged_targets: remote_keeper_status.acknowledged_targets,
+            remote_keeper_receipts: remote_keeper_status.receipt_count,
+            remote_keeper_delivered_envelopes: remote_keeper_status.delivered_envelopes,
+            round_trip_confirmed_envelopes: remote_keeper_status.delivered_envelopes,
+            pending_remote_send_envelopes: remote_keeper_status.pending_remote_send_envelopes,
+            failed_remote_send_envelopes: remote_keeper_status.failed_remote_send_envelopes,
+            last_remote_keeper_receipt_ms: remote_keeper_status.last_remote_receipt_ms,
+            remote_confirmation_mode: if remote_keeper_status.selected_targets == 0 {
+                "disabled".to_string()
+            } else {
+                match remote_keeper_status.confirmation_mode {
+                    keeper_remote::ConfirmationMode::LocalProjection => {
+                        "local-projection".to_string()
+                    }
+                    keeper_remote::ConfirmationMode::RoundTrip => "round-trip".to_string(),
+                }
+            },
+            remote_storage_class: if remote_keeper_status.selected_targets == 0 {
+                "disabled".to_string()
+            } else {
+                "volatile-runtime-memory".to_string()
+            },
         })
     }
 
@@ -1090,8 +1214,9 @@ impl AppState {
             orp_enabled,
             keeper_envelopes,
             keeper_archive,
+            keeper_remote,
+            keeper_candidates,
             keeper_last_activity,
-            bootstrap_bundle,
             space_policies,
         ) = {
             let inner = self.inner.lock().await;
@@ -1105,8 +1230,9 @@ impl AppState {
                 rt.enable_orp,
                 rt.keeper_envelopes.clone(),
                 rt.keeper_archive.clone(),
+                rt.keeper_remote.clone(),
+                rt.keeper_candidates.clone(),
                 rt.keeper_last_activity.clone(),
-                rt.bootstrap_bundle.clone(),
                 rt.space_policies.clone(),
             )
         };
@@ -1134,18 +1260,28 @@ impl AppState {
             emit_keeper_archive_hint(&events_tx, &keeper_archive, &space_key, &space_id).await;
             if policy_enables_keeper_replication(&applied_policy) {
                 let _ = touch_keeper_activity(&keeper_last_activity, &space_key).await;
+                let _ = reconcile_keeper_remote_state(
+                    &keeper_archive,
+                    &keeper_remote,
+                    &space_policies,
+                    keeper_candidates.as_slice(),
+                    Some(space_key.as_str()),
+                )
+                .await;
                 emit_keeper_manifest_hint(
                     &events_tx,
                     &space_key,
                     &applied_policy,
                     &keeper_envelopes,
                     &keeper_archive,
+                    &keeper_remote,
+                    keeper_candidates.as_slice(),
                     &keeper_last_activity,
-                    &bootstrap_bundle,
                 )
                 .await;
             }
             let last_local_activity_ms = keeper_last_activity.lock().await.get(&space_key).copied();
+            let remote_keeper_view = keeper_remote.lock().await.view_for_space(&space_key);
             let keeper_manifest = build_keeper_space_manifest(
                 &applied_policy,
                 keeper_envelopes
@@ -1160,8 +1296,9 @@ impl AppState {
                     .get(&space_key)
                     .map(|items| items.len())
                     .unwrap_or(0),
-                &bootstrap_bundle,
+                keeper_candidates.len(),
                 last_local_activity_ms,
+                &remote_keeper_view,
             );
             tracing::info!(
                 "ethersync join replayed {} message(s) for existing subscription {} (discovered {} endpoint(s))",
@@ -1305,14 +1442,23 @@ impl AppState {
             emit_keeper_archive_hint(&events_tx, &keeper_archive, &space_key, &space_id).await;
             if policy_enables_keeper_replication(&applied_policy) {
                 let _ = touch_keeper_activity(&keeper_last_activity, &space_key).await;
+                let _ = reconcile_keeper_remote_state(
+                    &keeper_archive,
+                    &keeper_remote,
+                    &space_policies,
+                    keeper_candidates.as_slice(),
+                    Some(space_key.as_str()),
+                )
+                .await;
                 emit_keeper_manifest_hint(
                     &events_tx,
                     &space_key,
                     &applied_policy,
                     &keeper_envelopes,
                     &keeper_archive,
+                    &keeper_remote,
+                    keeper_candidates.as_slice(),
                     &keeper_last_activity,
-                    &bootstrap_bundle,
                 )
                 .await;
             }
@@ -1337,12 +1483,14 @@ impl AppState {
             .map(|items| items.len())
             .unwrap_or(0);
         let last_local_activity_ms = keeper_last_activity.lock().await.get(&space_key).copied();
+        let remote_keeper_view = keeper_remote.lock().await.view_for_space(&space_key);
         let keeper_manifest = build_keeper_space_manifest(
             &applied_policy,
             pending_keeper_envelopes,
             archived_keeper_envelopes,
-            &bootstrap_bundle,
+            keeper_candidates.len(),
             last_local_activity_ms,
+            &remote_keeper_view,
         );
 
         Ok(EtherSyncJoinResult {
@@ -1372,8 +1520,9 @@ impl AppState {
             keeper_enabled_runtime,
             keeper_envelopes,
             keeper_archive,
+            keeper_remote,
+            keeper_candidates,
             keeper_last_activity,
-            bootstrap_bundle,
             space_policies,
         ) = {
             let inner = self.inner.lock().await;
@@ -1386,8 +1535,9 @@ impl AppState {
                 rt.keeper_replication_enabled,
                 rt.keeper_envelopes.clone(),
                 rt.keeper_archive.clone(),
+                rt.keeper_remote.clone(),
+                rt.keeper_candidates.clone(),
                 rt.keeper_last_activity.clone(),
-                rt.bootstrap_bundle.clone(),
                 rt.space_policies.clone(),
             )
         };
@@ -1433,8 +1583,9 @@ impl AppState {
                 &space_policy,
                 &keeper_envelopes,
                 &keeper_archive,
+                &keeper_remote,
+                keeper_candidates.as_slice(),
                 &keeper_last_activity,
-                &bootstrap_bundle,
             )
             .await;
         }
@@ -1491,8 +1642,9 @@ impl AppState {
             keeper_enabled_runtime,
             keeper_envelopes,
             keeper_archive,
+            keeper_remote,
+            keeper_candidates,
             keeper_last_activity,
-            bootstrap_bundle,
             space_policies,
         ) = {
             let inner = self.inner.lock().await;
@@ -1505,8 +1657,9 @@ impl AppState {
                 rt.keeper_replication_enabled,
                 rt.keeper_envelopes.clone(),
                 rt.keeper_archive.clone(),
+                rt.keeper_remote.clone(),
+                rt.keeper_candidates.clone(),
                 rt.keeper_last_activity.clone(),
-                rt.bootstrap_bundle.clone(),
                 rt.space_policies.clone(),
             )
         };
@@ -1613,8 +1766,9 @@ impl AppState {
                 &space_policy,
                 &keeper_envelopes,
                 &keeper_archive,
+                &keeper_remote,
+                keeper_candidates.as_slice(),
                 &keeper_last_activity,
-                &bootstrap_bundle,
             )
             .await;
         }
@@ -1651,8 +1805,9 @@ impl AppState {
             events_tx,
             keeper_envelopes,
             keeper_archive,
+            keeper_remote,
+            keeper_candidates,
             keeper_last_activity,
-            bootstrap_bundle,
             space_policies,
         ) = {
             let inner = self.inner.lock().await;
@@ -1664,8 +1819,9 @@ impl AppState {
                 rt.events_tx.clone(),
                 rt.keeper_envelopes.clone(),
                 rt.keeper_archive.clone(),
+                rt.keeper_remote.clone(),
+                rt.keeper_candidates.clone(),
                 rt.keeper_last_activity.clone(),
-                rt.bootstrap_bundle.clone(),
                 rt.space_policies.clone(),
             )
         };
@@ -1674,6 +1830,9 @@ impl AppState {
         let _ = flush_keeper_pending_envelopes(
             &keeper_envelopes,
             &keeper_archive,
+            &keeper_remote,
+            &space_policies,
+            &keeper_candidates,
             Some(space_id.as_str()),
         )
         .await;
@@ -1716,8 +1875,9 @@ impl AppState {
             &applied_policy,
             &keeper_envelopes,
             &keeper_archive,
+            &keeper_remote,
+            keeper_candidates.as_slice(),
             &keeper_last_activity,
-            &bootstrap_bundle,
         )
         .await;
         let archived_keeper_envelopes = {
@@ -1725,12 +1885,14 @@ impl AppState {
             guard.get(&space_id).map(|items| items.len()).unwrap_or(0)
         };
         let last_local_activity_ms = keeper_last_activity.lock().await.get(&space_id).copied();
+        let remote_keeper_view = keeper_remote.lock().await.view_for_space(&space_id);
         let keeper_manifest = build_keeper_space_manifest(
             &applied_policy,
             remaining_pending,
             archived_keeper_envelopes,
-            &bootstrap_bundle,
+            keeper_candidates.len(),
             last_local_activity_ms,
+            &remote_keeper_view,
         );
 
         emit_ethersync_event(
@@ -1760,13 +1922,90 @@ impl AppState {
         })
     }
 
+    pub async fn ethersync_keeper_store(
+        &self,
+        req: KeeperStoreRequest,
+    ) -> anyhow::Result<KeeperStoreResponse> {
+        if req.space_id.trim().is_empty() {
+            return Err(anyhow::anyhow!("space_id required"));
+        }
+        if req.envelope_digest.trim().is_empty() {
+            return Err(anyhow::anyhow!("envelope_digest required"));
+        }
+
+        let cfg = crate::config::Config::from_env();
+        if !cfg.operator_keeper_capable {
+            return Err(anyhow::anyhow!(
+                "keeper ingest is disabled for this runtime"
+            ));
+        }
+
+        let (keeper_archive, keeper_last_activity) = {
+            let inner = self.inner.lock().await;
+            let Some(rt) = inner.ethersync.as_ref() else {
+                return Err(anyhow::anyhow!("ethersync is not running"));
+            };
+            (rt.keeper_archive.clone(), rt.keeper_last_activity.clone())
+        };
+
+        let message_bytes = general_purpose::STANDARD
+            .decode(req.message_b64.as_bytes())
+            .map_err(|_| anyhow::anyhow!("invalid message_b64"))?;
+        let message = ethersync::EtherMessage::from_bytes(&message_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid keeper envelope: {}", e))?;
+        if message.header.slot_id != req.slot_id {
+            return Err(anyhow::anyhow!(
+                "slot_id mismatch between request and keeper envelope"
+            ));
+        }
+
+        let digest_confirmed = hex::encode(blake3_hash(&message_bytes));
+        if digest_confirmed != req.envelope_digest {
+            return Err(anyhow::anyhow!(
+                "envelope digest mismatch: expected {}, got {}",
+                req.envelope_digest,
+                digest_confirmed
+            ));
+        }
+
+        let mut archive = keeper_archive.lock().await;
+        let entry = archive.entry(req.space_id.clone()).or_default();
+        let exists = entry.iter().any(|existing| {
+            existing.slot_id == req.slot_id
+                && existing.message.encrypted_payload == message.encrypted_payload
+                && existing.message.nonce == message.nonce
+                && existing.message.auth_tag == message.auth_tag
+        });
+        if !exists {
+            entry.push(KeeperEnvelopeRecord {
+                slot_id: req.slot_id,
+                message,
+            });
+            entry.sort_by_key(|record| record.slot_id);
+        }
+        drop(archive);
+
+        let stored_at_ms = touch_keeper_activity(&keeper_last_activity, &req.space_id).await;
+        Ok(KeeperStoreResponse {
+            receipt_id: derive_keeper_store_receipt_id(
+                &req.space_id,
+                req.slot_id,
+                &digest_confirmed,
+                &message_bytes,
+            ),
+            stored_at_ms,
+            digest_confirmed,
+        })
+    }
+
     pub async fn ethersync_list_space_policies(&self) -> anyhow::Result<Vec<SpacePolicySnapshot>> {
         let (
             space_policies,
             keeper_envelopes,
             keeper_archive,
+            keeper_remote,
+            keeper_candidates,
             keeper_last_activity,
-            bootstrap_bundle,
         ) = {
             let inner = self.inner.lock().await;
             let Some(rt) = inner.ethersync.as_ref() else {
@@ -1776,14 +2015,16 @@ impl AppState {
                 rt.space_policies.clone(),
                 rt.keeper_envelopes.clone(),
                 rt.keeper_archive.clone(),
+                rt.keeper_remote.clone(),
+                rt.keeper_candidates.clone(),
                 rt.keeper_last_activity.clone(),
-                rt.bootstrap_bundle.clone(),
             )
         };
 
         let policies = space_policies.lock().await;
         let pending = keeper_envelopes.lock().await;
         let archived = keeper_archive.lock().await;
+        let remote = keeper_remote.lock().await;
         let activity = keeper_last_activity.lock().await;
 
         let mut items = Vec::new();
@@ -1794,12 +2035,14 @@ impl AppState {
                 .get(space_key)
                 .map(|items| items.len())
                 .unwrap_or(0);
+            let remote_keeper_view = remote.view_for_space(space_key);
             let keeper_manifest = build_keeper_space_manifest(
                 policy,
                 pending_keeper_envelopes,
                 archived_keeper_envelopes,
-                &bootstrap_bundle,
+                keeper_candidates.len(),
                 activity.get(space_key).copied(),
+                &remote_keeper_view,
             );
             items.push(SpacePolicySnapshot {
                 space_key: space_key.clone(),
@@ -1808,6 +2051,9 @@ impl AppState {
                 route_bias: policy.route_bias.as_str().to_string(),
                 pending_keeper_envelopes,
                 archived_keeper_envelopes,
+                remote_keeper_targets: remote_keeper_view.selected_targets,
+                remote_keeper_receipts: remote_keeper_view.receipt_count,
+                remote_keeper_delivered_envelopes: remote_keeper_view.delivered_envelopes,
                 keeper_manifest,
             });
         }
@@ -1837,8 +2083,9 @@ impl AppState {
             space_policies,
             keeper_envelopes,
             keeper_archive,
+            keeper_remote,
+            keeper_candidates,
             keeper_last_activity,
-            bootstrap_bundle,
             events_tx,
         ) = {
             let inner = self.inner.lock().await;
@@ -1849,8 +2096,9 @@ impl AppState {
                 rt.space_policies.clone(),
                 rt.keeper_envelopes.clone(),
                 rt.keeper_archive.clone(),
+                rt.keeper_remote.clone(),
+                rt.keeper_candidates.clone(),
                 rt.keeper_last_activity.clone(),
-                rt.bootstrap_bundle.clone(),
                 rt.events_tx.clone(),
             )
         };
@@ -1866,23 +2114,34 @@ impl AppState {
             guard.get(&space_key).map(|items| items.len()).unwrap_or(0)
         };
         let _ = touch_keeper_activity(&keeper_last_activity, &space_key).await;
+        let _ = reconcile_keeper_remote_state(
+            &keeper_archive,
+            &keeper_remote,
+            &space_policies,
+            keeper_candidates.as_slice(),
+            Some(space_key.as_str()),
+        )
+        .await;
         emit_keeper_manifest_hint(
             &events_tx,
             &space_key,
             &applied_policy,
             &keeper_envelopes,
             &keeper_archive,
+            &keeper_remote,
+            keeper_candidates.as_slice(),
             &keeper_last_activity,
-            &bootstrap_bundle,
         )
         .await;
         let last_local_activity_ms = keeper_last_activity.lock().await.get(&space_key).copied();
+        let remote_keeper_view = keeper_remote.lock().await.view_for_space(&space_key);
         let keeper_manifest = build_keeper_space_manifest(
             &applied_policy,
             pending_keeper_envelopes,
             archived_keeper_envelopes,
-            &bootstrap_bundle,
+            keeper_candidates.len(),
             last_local_activity_ms,
+            &remote_keeper_view,
         );
 
         emit_ethersync_event(
@@ -1911,6 +2170,9 @@ impl AppState {
             route_bias: applied_policy.route_bias.as_str().to_string(),
             pending_keeper_envelopes,
             archived_keeper_envelopes,
+            remote_keeper_targets: remote_keeper_view.selected_targets,
+            remote_keeper_receipts: remote_keeper_view.receipt_count,
+            remote_keeper_delivered_envelopes: remote_keeper_view.delivered_envelopes,
             keeper_manifest,
         })
     }
@@ -2055,8 +2317,8 @@ fn resolve_initial_bootstrap_peers(
     }
 
     if let Some(bundle) = crate::bootstrap_bundle::load_bootstrap_bundle(runtime_cfg) {
-        let validation = bundle.validation_report();
-        if validation.is_usable {
+        let validation = bundle.validation_report_with_config(runtime_cfg);
+        if validation.is_usable && validation.trusted_for_runtime_high_risk() {
             for relay in &bundle.relays {
                 if let Some(addr) = crate::discovery::parse_endpoint_hint(&relay.addr) {
                     push_unique_peer(&mut peers, addr);
@@ -2075,11 +2337,31 @@ fn resolve_initial_bootstrap_peers(
                 }
             }
         } else {
-            tracing::warn!(
-                "ignoring unusable bootstrap bundle during initial peer resolution (warnings={}, errors={})",
-                validation.issue_counts.warning,
-                validation.issue_counts.error
-            );
+            if validation.is_usable {
+                for relay in &bundle.relays {
+                    if let Some(addr) = crate::discovery::parse_endpoint_hint(&relay.addr) {
+                        push_unique_peer(&mut peers, addr);
+                    }
+                }
+                for bridge in &bundle.bridges {
+                    if let Some(addr) = crate::discovery::parse_endpoint_hint(&bridge.endpoint) {
+                        push_unique_peer(&mut peers, addr);
+                    }
+                }
+                tracing::warn!(
+                    "using bootstrap bundle only as opaque ingress assist during initial peer resolution because it is not trusted for high-risk/runtime weighting (trusted={} warnings={} errors={})",
+                    validation.trusted_for_runtime_high_risk(),
+                    validation.issue_counts.warning,
+                    validation.issue_counts.error
+                );
+            } else {
+                tracing::warn!(
+                    "ignoring bootstrap bundle during initial peer resolution because it is not usable (trusted={} warnings={} errors={})",
+                    validation.trusted_for_runtime_high_risk(),
+                    validation.issue_counts.warning,
+                    validation.issue_counts.error
+                );
+            }
         }
     }
 
@@ -2120,10 +2402,10 @@ async fn seed_space_from_discovery(
         report.bundle_relay_candidates = bundle.relays.len();
         report.bundle_bridge_candidates = bundle.bridges.len();
         report.bundle_keeper_candidates = bundle.keepers.len();
-        let validation = bundle.validation_report();
+        let validation = bundle.validation_report_with_config(&runtime_cfg);
         report.bundle_usable = validation.is_usable;
         report.bundle_stale = validation.staleness.is_stale();
-        if validation.is_usable {
+        if validation.is_usable && validation.trusted_for_runtime_high_risk() {
             let preference = match policy.route_bias {
                 SpaceRouteBias::BridgePreferred => {
                     crate::discovery::BootstrapEndpointPreference::BridgeFirst
@@ -2143,6 +2425,34 @@ async fn seed_space_from_discovery(
                 ),
             ));
             report.used_bootstrap_bundle = true;
+        } else if validation.is_usable {
+            backends.push(Arc::new(
+                crate::discovery::BootstrapDiscoveryProvider::from_untrusted_bundle_as_opaque_assist(
+                    &bundle,
+                ),
+            ));
+            report.used_bootstrap_bundle = true;
+            emit_ethersync_event(
+                events_tx,
+                EtherSyncEvent {
+                    kind: "space_discovery_bundle_degraded".to_string(),
+                    ts_ms: now_ms(),
+                    space_id: Some(space_id.to_string()),
+                    slot_id: None,
+                    payload_b64: None,
+                    text: None,
+                    info: Some(
+                        "bootstrap bundle is being used only as opaque ingress assist because it is not runtime-trusted"
+                            .to_string(),
+                    ),
+                    error: Some(format!(
+                        "trusted={} warnings={} errors={}",
+                        validation.trusted_for_runtime_high_risk(),
+                        validation.issue_counts.warning,
+                        validation.issue_counts.error
+                    )),
+                },
+            );
         } else {
             emit_ethersync_event(
                 events_tx,
@@ -2154,11 +2464,15 @@ async fn seed_space_from_discovery(
                     payload_b64: None,
                     text: None,
                     info: Some(
-                        "bootstrap bundle skipped because it is locally unusable".to_string(),
+                        "bootstrap bundle skipped because it is not usable for runtime discovery"
+                            .to_string(),
                     ),
                     error: Some(format!(
-                        "warnings={} errors={}",
-                        validation.issue_counts.warning, validation.issue_counts.error
+                        "usable={} trusted={} warnings={} errors={}",
+                        validation.is_usable,
+                        validation.trusted_for_runtime_high_risk(),
+                        validation.issue_counts.warning,
+                        validation.issue_counts.error
                     )),
                 },
             );
@@ -2238,6 +2552,9 @@ fn spawn_keeper_replication_task(
     events_tx: broadcast::Sender<String>,
     keeper_envelopes: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
     keeper_archive: Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    keeper_remote: Arc<Mutex<keeper_remote::KeeperRemoteLedger>>,
+    space_policies: Arc<Mutex<HashMap<String, EtherSpacePolicy>>>,
+    keeper_candidates: Vec<keeper_remote::KeeperRemoteTarget>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(1500));
@@ -2253,9 +2570,12 @@ fn spawn_keeper_replication_task(
                     let flush = flush_keeper_pending_envelopes(
                         &keeper_envelopes,
                         &keeper_archive,
+                        &keeper_remote,
+                        &space_policies,
+                        keeper_candidates.as_slice(),
                         None,
                     ).await;
-                    if flush.moved > 0 {
+                    if flush.moved > 0 || flush.remote_receipts > 0 {
                         emit_ethersync_event(
                             &events_tx,
                             EtherSyncEvent {
@@ -2266,9 +2586,15 @@ fn spawn_keeper_replication_task(
                                 payload_b64: None,
                                 text: None,
                                 info: Some(format!(
-                                    "replicated {} envelope(s) across {} space(s)",
+                                    "archived {} envelope(s) across {} space(s); confirmed {} remote receipt(s) across {} space(s) with {} selected target(s), {} acknowledged target(s), {} pending send(s), and {} failed send(s)",
                                     flush.moved,
-                                    flush.touched_spaces
+                                    flush.touched_spaces,
+                                    flush.remote_receipts,
+                                    flush.remote_spaces,
+                                    flush.remote_targets,
+                                    flush.remote_acknowledged_targets,
+                                    flush.pending_remote_sends,
+                                    flush.failed_remote_sends
                                 )),
                                 error: None,
                             },
@@ -2278,8 +2604,16 @@ fn spawn_keeper_replication_task(
             }
         }
 
-        let flush = flush_keeper_pending_envelopes(&keeper_envelopes, &keeper_archive, None).await;
-        if flush.moved > 0 {
+        let flush = flush_keeper_pending_envelopes(
+            &keeper_envelopes,
+            &keeper_archive,
+            &keeper_remote,
+            &space_policies,
+            keeper_candidates.as_slice(),
+            None,
+        )
+        .await;
+        if flush.moved > 0 || flush.remote_receipts > 0 {
             emit_ethersync_event(
                 &events_tx,
                 EtherSyncEvent {
@@ -2290,8 +2624,15 @@ fn spawn_keeper_replication_task(
                     payload_b64: None,
                     text: None,
                     info: Some(format!(
-                        "replicated {} envelope(s) across {} space(s) during shutdown",
-                        flush.moved, flush.touched_spaces
+                        "archived {} envelope(s) across {} space(s); confirmed {} remote receipt(s) across {} space(s) with {} selected target(s), {} acknowledged target(s), {} pending send(s), and {} failed send(s) during shutdown",
+                        flush.moved,
+                        flush.touched_spaces,
+                        flush.remote_receipts,
+                        flush.remote_spaces,
+                        flush.remote_targets,
+                        flush.remote_acknowledged_targets,
+                        flush.pending_remote_sends,
+                        flush.failed_remote_sends
                     )),
                     error: None,
                 },
@@ -2303,6 +2644,9 @@ fn spawn_keeper_replication_task(
 async fn flush_keeper_pending_envelopes(
     keeper_envelopes: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
     keeper_archive: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    keeper_remote: &Arc<Mutex<keeper_remote::KeeperRemoteLedger>>,
+    space_policies: &Arc<Mutex<HashMap<String, EtherSpacePolicy>>>,
+    keeper_candidates: &[keeper_remote::KeeperRemoteTarget],
     only_space: Option<&str>,
 ) -> KeeperReplicationFlush {
     let drained = {
@@ -2375,10 +2719,171 @@ async fn flush_keeper_pending_envelopes(
         entry.sort_by_key(|record| record.slot_id);
     }
 
+    let remote = reconcile_keeper_remote_state(
+        keeper_archive,
+        keeper_remote,
+        space_policies,
+        keeper_candidates,
+        only_space,
+    )
+    .await;
+
     KeeperReplicationFlush {
         moved,
         touched_spaces,
+        remote_receipts: remote.remote_receipts,
+        remote_spaces: remote.remote_spaces,
+        remote_targets: remote.remote_targets,
+        remote_acknowledged_targets: remote.remote_acknowledged_targets,
+        pending_remote_sends: remote.pending_remote_sends,
+        failed_remote_sends: remote.failed_remote_sends,
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct KeeperRemoteFlush {
+    remote_receipts: usize,
+    remote_spaces: usize,
+    remote_targets: usize,
+    remote_acknowledged_targets: usize,
+    pending_remote_sends: usize,
+    failed_remote_sends: usize,
+}
+
+async fn reconcile_keeper_remote_state(
+    keeper_archive: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    keeper_remote: &Arc<Mutex<keeper_remote::KeeperRemoteLedger>>,
+    space_policies: &Arc<Mutex<HashMap<String, EtherSpacePolicy>>>,
+    keeper_candidates: &[keeper_remote::KeeperRemoteTarget],
+    only_space: Option<&str>,
+) -> KeeperRemoteFlush {
+    let archived_snapshot = {
+        let guard = keeper_archive.lock().await;
+        let mut items = HashMap::new();
+        for (space_id, records) in guard.iter() {
+            if only_space.is_some_and(|target| target != space_id) {
+                continue;
+            }
+            items.insert(
+                space_id.clone(),
+                records
+                    .iter()
+                    .map(|record| keeper_remote::KeeperRemoteEnvelopeRecord {
+                        slot_id: record.slot_id,
+                        message_digest_hex: hex::encode(blake3_hash(&record.message.to_bytes())),
+                        message_bytes: record.message.to_bytes(),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        items
+    };
+    let policies_snapshot = {
+        let guard = space_policies.lock().await;
+        guard.clone()
+    };
+
+    let mut spaces = if let Some(space_id) = only_space {
+        vec![space_id.to_string()]
+    } else {
+        let mut set = archived_snapshot.keys().cloned().collect::<HashSet<_>>();
+        set.extend(policies_snapshot.keys().cloned());
+        set.into_iter().collect::<Vec<_>>()
+    };
+    spaces.sort();
+
+    let mut summary = KeeperRemoteFlush::default();
+    let observed_at_ms = now_ms();
+    let keeper_ingest_token = crate::config::Config::from_env()
+        .keeper_ingest_token
+        .or_else(|| std::env::var("HANDSHACKE_API_TOKEN").ok());
+    let client = KeeperClient::new(Duration::from_secs(10), keeper_ingest_token);
+
+    for space_id in spaces {
+        let policy = policies_snapshot
+            .get(&space_id)
+            .cloned()
+            .unwrap_or_else(default_space_policy);
+        let desired_replica_count = if policy_enables_keeper_replication(&policy) {
+            policy.replication_factor
+        } else {
+            0
+        };
+        let archived = archived_snapshot
+            .get(&space_id)
+            .cloned()
+            .unwrap_or_default();
+        let plan = {
+            let mut ledger = keeper_remote.lock().await;
+            ledger.plan_space_reconcile(
+                &space_id,
+                keeper_candidates,
+                desired_replica_count,
+                archived.as_slice(),
+                observed_at_ms,
+            )
+        };
+        let mut results = Vec::new();
+        for pending in plan.pending_sends {
+            let send_result = match client
+                .store_envelope(
+                    &pending.target.endpoint,
+                    &space_id,
+                    pending.envelope.slot_id,
+                    &pending.envelope.message_digest_hex,
+                    &pending.envelope.message_bytes,
+                )
+                .await
+            {
+                Ok(receipt) => keeper_remote::KeeperRemoteSendResult::confirmed(
+                    pending.target.clone(),
+                    pending.envelope.clone(),
+                    receipt.receipt_id,
+                    receipt.stored_at_ms,
+                    receipt.digest_confirmed,
+                ),
+                Err(err) => keeper_remote::KeeperRemoteSendResult::failed(
+                    pending.target.clone(),
+                    pending.envelope.clone(),
+                    err.to_string(),
+                ),
+            };
+            results.push(send_result);
+        }
+        let reconcile = {
+            let mut ledger = keeper_remote.lock().await;
+            ledger.apply_space_results(
+                &space_id,
+                desired_replica_count,
+                archived.as_slice(),
+                results.as_slice(),
+                observed_at_ms,
+            )
+        };
+        if reconcile.selected_targets > 0
+            || reconcile.acknowledged_targets > 0
+            || reconcile.new_receipts > 0
+        {
+            summary.remote_spaces = summary.remote_spaces.saturating_add(1);
+        }
+        summary.remote_receipts = summary
+            .remote_receipts
+            .saturating_add(reconcile.new_receipts);
+        summary.remote_targets = summary
+            .remote_targets
+            .saturating_add(reconcile.selected_targets);
+        summary.remote_acknowledged_targets = summary
+            .remote_acknowledged_targets
+            .saturating_add(reconcile.acknowledged_targets);
+        summary.pending_remote_sends = summary
+            .pending_remote_sends
+            .saturating_add(reconcile.pending_remote_send_envelopes);
+        summary.failed_remote_sends = summary
+            .failed_remote_sends
+            .saturating_add(reconcile.failed_remote_send_envelopes);
+    }
+
+    summary
 }
 
 async fn emit_keeper_pending_hint(
@@ -2490,6 +2995,21 @@ fn derive_transfer_id(filename: &str, total_bytes: usize, ts_ms: u64) -> String 
     hex::encode(&hash[..10])
 }
 
+fn derive_keeper_store_receipt_id(
+    space_id: &str,
+    slot_id: u64,
+    digest_confirmed: &str,
+    message_bytes: &[u8],
+) -> String {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(space_id.as_bytes());
+    seed.extend_from_slice(&slot_id.to_le_bytes());
+    seed.extend_from_slice(digest_confirmed.as_bytes());
+    seed.extend_from_slice(message_bytes);
+    let hash = blake3_hash(&seed);
+    hex::encode(&hash[..10])
+}
+
 async fn enqueue_keeper_envelope(
     keeper_envelopes: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
     space_id: &str,
@@ -2577,8 +3097,9 @@ fn build_keeper_space_manifest(
     policy: &EtherSpacePolicy,
     pending_keeper_envelopes: usize,
     archived_keeper_envelopes: usize,
-    bootstrap_bundle: &BootstrapBundleSummary,
+    available_keeper_candidates: usize,
     last_local_activity_ms: Option<u64>,
+    remote_view: &keeper_remote::KeeperRemoteSpaceView,
 ) -> KeeperSpaceManifest {
     let managed = policy_enables_keeper_replication(policy);
     let desired_replica_count = if managed {
@@ -2586,11 +3107,28 @@ fn build_keeper_space_manifest(
     } else {
         0
     };
-    let available_keeper_candidates = if managed { bootstrap_bundle.keepers } else { 0 };
-    let selected_keeper_targets = desired_replica_count.min(available_keeper_candidates);
+    let available_keeper_candidates = if managed {
+        available_keeper_candidates
+    } else {
+        0
+    };
+    let selected_keeper_targets = if remote_view.selected_targets > 0 {
+        remote_view.selected_targets
+    } else {
+        desired_replica_count.min(available_keeper_candidates)
+    };
     let candidate_shortfall = desired_replica_count.saturating_sub(available_keeper_candidates);
     let replication_stage = if !managed {
         "local-only"
+    } else if pending_keeper_envelopes > 0
+        && archived_keeper_envelopes > 0
+        && remote_view.selected_targets > 0
+    {
+        "replicating-and-backfillable"
+    } else if remote_view.selected_targets > 0 && !remote_view.delivery_state.is_empty() {
+        remote_view.delivery_state.as_str()
+    } else if archived_keeper_envelopes > 0 && selected_keeper_targets > 0 {
+        "pending-replication"
     } else if archived_keeper_envelopes > 0 && pending_keeper_envelopes > 0 {
         "staged-and-backfillable"
     } else if archived_keeper_envelopes > 0 {
@@ -2611,9 +3149,13 @@ fn build_keeper_space_manifest(
         desired_replica_count,
         available_keeper_candidates,
         selected_keeper_targets,
+        acknowledged_keeper_targets: remote_view.acknowledged_targets,
         candidate_shortfall,
+        remote_keeper_receipts: remote_view.receipt_count,
+        remote_delivered_envelopes: remote_view.delivered_envelopes,
         replication_stage: replication_stage.to_string(),
         last_local_activity_ms,
+        last_remote_receipt_ms: remote_view.last_remote_receipt_ms,
     }
 }
 
@@ -2635,8 +3177,9 @@ async fn emit_keeper_manifest_hint(
     policy: &EtherSpacePolicy,
     keeper_envelopes: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
     keeper_archive: &Arc<Mutex<HashMap<String, Vec<KeeperEnvelopeRecord>>>>,
+    keeper_remote: &Arc<Mutex<keeper_remote::KeeperRemoteLedger>>,
+    keeper_candidates: &[keeper_remote::KeeperRemoteTarget],
     keeper_last_activity: &Arc<Mutex<HashMap<String, u64>>>,
-    bootstrap_bundle: &BootstrapBundleSummary,
 ) {
     let pending_keeper_envelopes = keeper_envelopes
         .lock()
@@ -2651,12 +3194,14 @@ async fn emit_keeper_manifest_hint(
         .map(|items| items.len())
         .unwrap_or(0);
     let last_local_activity_ms = keeper_last_activity.lock().await.get(space_id).copied();
+    let remote_keeper_view = keeper_remote.lock().await.view_for_space(space_id);
     let manifest = build_keeper_space_manifest(
         policy,
         pending_keeper_envelopes,
         archived_keeper_envelopes,
-        bootstrap_bundle,
+        keeper_candidates.len(),
         last_local_activity_ms,
+        &remote_keeper_view,
     );
 
     emit_ethersync_event(
@@ -2669,12 +3214,14 @@ async fn emit_keeper_manifest_hint(
             payload_b64: None,
             text: None,
             info: Some(format!(
-                "managed={} stage={} desired_targets={} selected_targets={} candidate_shortfall={} route_intent={}",
+                "managed={} stage={} desired_targets={} selected_targets={} acknowledged_targets={} candidate_shortfall={} remote_receipts={} route_intent={}",
                 manifest.managed,
                 manifest.replication_stage,
                 manifest.desired_replica_count,
                 manifest.selected_keeper_targets,
+                manifest.acknowledged_keeper_targets,
                 manifest.candidate_shortfall,
+                manifest.remote_keeper_receipts,
                 manifest.keeper_route_intent
             )),
             error: None,
@@ -2689,22 +3236,27 @@ fn policy_enables_keeper_replication(policy: &EtherSpacePolicy) -> bool {
 fn default_high_risk_gate_reasons(
     orp_enabled: bool,
     keeper_replication_enabled: bool,
-    bootstrap_bundle_loaded: bool,
+    bootstrap_bundle_configured: bool,
+    _bootstrap_bundle_loaded: bool,
+    bootstrap_bundle_trusted_for_high_risk: bool,
+    high_risk_require_trusted_bundle: bool,
     bridge_hint_count: usize,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     if !orp_enabled {
         reasons.push("ORP runtime is not enabled for this EtherSync node".to_string());
     }
-    reasons.push(
-        "ORP-HighRisk circuit planning is available, but the routed session data plane is not active yet"
-            .to_string(),
-    );
-    if bridge_hint_count == 0 && !bootstrap_bundle_loaded {
+    if bridge_hint_count == 0 && !bootstrap_bundle_trusted_for_high_risk {
         reasons.push("bridge bootstrap attestation is not available yet".to_string());
     }
     if !keeper_replication_enabled {
         reasons.push("keeper-backed replicated retention is not available yet".to_string());
+    }
+    if high_risk_require_trusted_bundle
+        && bootstrap_bundle_configured
+        && !bootstrap_bundle_trusted_for_high_risk
+    {
+        reasons.push("high-risk profile requires a verified-trusted bootstrap bundle".to_string());
     }
     reasons
 }
@@ -2720,7 +3272,13 @@ fn default_ethersync_status() -> EtherSyncStatus {
     let high_risk_gate_reasons = default_high_risk_gate_reasons(
         false,
         runtime_cfg.keeper_replication_enabled,
+        runtime_cfg.bootstrap_bundle_path.is_some() || runtime_cfg.bootstrap_bundle_json.is_some(),
         bootstrap_bundle.loaded,
+        bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.trusted_for_runtime_high_risk())
+            .unwrap_or(false),
+        runtime_cfg.high_risk_require_trusted_bundle,
         runtime_cfg.bridge_bootstrap_hints.len(),
     );
 
@@ -2742,7 +3300,10 @@ fn default_ethersync_status() -> EtherSyncStatus {
         bootstrap_peer_count: 0,
         discovery_bootstrap_peer_count: runtime_cfg.discovery_bootstrap_peers.len(),
         bridge_bootstrap_enabled: !runtime_cfg.bridge_bootstrap_hints.is_empty()
-            || bootstrap_bundle.bridges > 0
+            || bootstrap_bundle_validation
+                .as_ref()
+                .map(|report| report.trusted_for_runtime_high_risk() && report.summary.bridges > 0)
+                .unwrap_or(false)
             || !runtime_cfg.assist_relays.is_empty(),
         bridge_hint_count: runtime_cfg.bridge_bootstrap_hints.len(),
         high_risk_available: false,
@@ -2772,6 +3333,10 @@ fn default_ethersync_status() -> EtherSyncStatus {
             .as_ref()
             .map(|report| report.staleness.is_stale())
             .unwrap_or(false),
+        bootstrap_bundle_trusted_for_high_risk: bootstrap_bundle_validation
+            .as_ref()
+            .map(|report| report.trusted_for_runtime_high_risk())
+            .unwrap_or(false),
         bootstrap_bundle_warning_count: bootstrap_bundle_validation
             .as_ref()
             .map(|report| report.issue_counts.warning)
@@ -2791,6 +3356,18 @@ fn default_ethersync_status() -> EtherSyncStatus {
         managed_space_count: 0,
         bridge_preferred_space_count: 0,
         keeper_preferred_space_count: 0,
+        remote_keeper_space_count: 0,
+        remote_keeper_receipted_space_count: 0,
+        remote_keeper_targets: 0,
+        remote_keeper_acknowledged_targets: 0,
+        remote_keeper_receipts: 0,
+        remote_keeper_delivered_envelopes: 0,
+        round_trip_confirmed_envelopes: 0,
+        pending_remote_send_envelopes: 0,
+        failed_remote_send_envelopes: 0,
+        last_remote_keeper_receipt_ms: None,
+        remote_confirmation_mode: "disabled".to_string(),
+        remote_storage_class: "disabled".to_string(),
     }
 }
 

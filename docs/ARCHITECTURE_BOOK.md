@@ -77,12 +77,13 @@ Today:
 - ORP is target-aware and space-scoped
 - ORP feeds the transport stack before Tor
 - ORP inspection surfaces can expose ranked target candidates, route classes, operator hints, region hints, and lookup provenance
-- ORP-HighRisk now has circuit-planning and control-frame observability scaffolding, but the routed session data plane is not active and not claimed
+- ORP-HighRisk now has a routed session data plane in the runtime, with per-hop sealed setup capsules and rotating announcement onion keys, but it is still not presented as an audited anonymity guarantee
 
 End-state:
 
 - ORP-Standard provides production-grade private overlay routing
 - ORP-HighRisk provides multi-hop onion circuits, padding, cover traffic, and hard anonymity gating
+- untrusted bootstrap bundles may be used as opaque ingress assist, but they must not be treated as trusted routing truth
 
 ## Privacy Tiers
 
@@ -179,13 +180,15 @@ ORP currently formalizes these frame families:
 - `Lookup`
 - `Offer`
 - `Forward`
-- `Ack`
+- `DeliveryNotice`
 - `CircuitOpen`
 - `CircuitExtend`
 - `CircuitClose`
 - `Cover`
 
-The last four exist as the future ORP-HighRisk wire contract and must not be marketed as active anonymity features until the runtime enforces them.
+The full high-risk frame family now exists in the runtime and interop surface, but it must not be marketed as an audited anonymity feature until hardening and audit gates are passed.
+
+The `/v1` namespace is mostly authenticated local control-plane surface. The deliberate exception is `POST /v1/keeper/store`, which is a bearer-protected network-facing operator ingress route and must be treated as such in docs and diagnostics.
 
 ## Transport Strategy
 
@@ -217,7 +220,8 @@ Current truth:
 - backfill can restore archived encrypted envelopes into local replay storage
 - retention and route bias can now be expressed per joined space
 - ORP-Standard ranking now reacts to operator posture, bundle posture, and region diversity hints
-- multi-node keeper-backed retention is not active yet
+- remote keeper selection, round-trip store receipts, and managed replication posture now exist in the runtime
+- fully independent multi-operator keeper replication is still a next-stage hardening task
 
 This distinction must remain explicit in product language and in API surfaces.
 

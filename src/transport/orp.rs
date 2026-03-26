@@ -57,6 +57,22 @@ struct CandidatePosture {
     ranking_hints: Vec<String>,
 }
 
+fn trusted_bundle_for_runtime(cfg: &Config) -> Option<crate::bootstrap_bundle::BootstrapBundle> {
+    let validation = crate::bootstrap_bundle::validate_loaded_bootstrap_bundle(cfg)?;
+    if validation.is_usable && validation.trusted_for_runtime_high_risk() {
+        crate::bootstrap_bundle::load_bootstrap_bundle(cfg)
+    } else {
+        None
+    }
+}
+
+fn bundle_loaded_but_untrusted(cfg: &Config) -> bool {
+    matches!(
+        crate::bootstrap_bundle::validate_loaded_bootstrap_bundle(cfg),
+        Some(report) if report.is_usable && !report.trusted_for_runtime_high_risk()
+    )
+}
+
 fn score_with_bias(
     base_score: u16,
     cfg: &Config,
@@ -66,6 +82,8 @@ fn score_with_bias(
 ) -> CandidatePosture {
     let mut bonus = 0i32;
     let mut ranking_hints = Vec::new();
+    let trusted_bundle = trusted_bundle_for_runtime(cfg);
+    let bundle_untrusted = bundle_loaded_but_untrusted(cfg);
 
     let operator = announcement.frame.operator_id_hint.trim();
     let region = announcement.frame.region_hint.trim();
@@ -92,7 +110,10 @@ fn score_with_bias(
         RouteClass::Bridge
             if announcement.frame.capabilities.bridge_capable
                 && (!cfg.bridge_bootstrap_hints.is_empty()
-                    || crate::bootstrap_bundle::summarize_bootstrap_bundle(cfg).bridges > 0) =>
+                    || trusted_bundle
+                        .as_ref()
+                        .map(|bundle| !bundle.bridges.is_empty())
+                        .unwrap_or(false)) =>
         {
             bonus += 420;
             ranking_hints.push("bridge-capable-bundle-posture".to_string());
@@ -116,7 +137,8 @@ fn score_with_bias(
         _ => {}
     }
 
-    if let Some(bundle) = crate::bootstrap_bundle::load_bootstrap_bundle(cfg) {
+    if let Some(bundle) = trusted_bundle.as_ref() {
+        ranking_hints.push("bundle-trust-verified".to_string());
         if bundle.relays.iter().any(|relay| {
             relay
                 .operator_id
@@ -162,6 +184,8 @@ fn score_with_bias(
             bonus += 160;
             ranking_hints.push("bundle-keeper-match".to_string());
         }
+    } else if bundle_untrusted {
+        ranking_hints.push("bundle-untrusted-ignored".to_string());
     }
 
     if announcement.frame.capabilities.tor_capable && cfg.wan_mode != crate::config::WanMode::Direct

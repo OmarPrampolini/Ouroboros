@@ -83,6 +83,7 @@ pub enum BootstrapEndpointPreference {
     BridgeFirst,
     KeeperFirst,
     RelayFirst,
+    OpaqueAssist,
 }
 
 /// Abstraction layer for discovery backends (LAN cache, relay index, DHT/Kademlia).
@@ -322,6 +323,12 @@ impl BootstrapDiscoveryProvider {
         Self::from_bundle_with_preference(bundle, BootstrapEndpointPreference::Balanced)
     }
 
+    pub fn from_untrusted_bundle_as_opaque_assist(
+        bundle: &crate::bootstrap_bundle::BootstrapBundle,
+    ) -> Self {
+        Self::from_bundle_with_preference(bundle, BootstrapEndpointPreference::OpaqueAssist)
+    }
+
     pub fn from_bundle_with_preference(
         bundle: &crate::bootstrap_bundle::BootstrapBundle,
         preference: BootstrapEndpointPreference,
@@ -337,8 +344,17 @@ impl BootstrapDiscoveryProvider {
                     endpoints.push(BootstrapEndpointRecord {
                         addr,
                         class: BootstrapEndpointClass::Relay,
-                        operator_id_hint: relay.operator_id.clone().unwrap_or_default(),
-                        region_hint: relay.region.clone().unwrap_or_default(),
+                        operator_id_hint: if preference == BootstrapEndpointPreference::OpaqueAssist
+                        {
+                            String::new()
+                        } else {
+                            relay.operator_id.clone().unwrap_or_default()
+                        },
+                        region_hint: if preference == BootstrapEndpointPreference::OpaqueAssist {
+                            String::new()
+                        } else {
+                            relay.region.clone().unwrap_or_default()
+                        },
                     });
                 }
             }
@@ -352,24 +368,35 @@ impl BootstrapDiscoveryProvider {
                     endpoints.push(BootstrapEndpointRecord {
                         addr,
                         class: BootstrapEndpointClass::Bridge,
-                        operator_id_hint: bridge.operator_id.clone().unwrap_or_default(),
-                        region_hint: bridge.region.clone().unwrap_or_default(),
+                        operator_id_hint: if preference == BootstrapEndpointPreference::OpaqueAssist
+                        {
+                            String::new()
+                        } else {
+                            bridge.operator_id.clone().unwrap_or_default()
+                        },
+                        region_hint: if preference == BootstrapEndpointPreference::OpaqueAssist {
+                            String::new()
+                        } else {
+                            bridge.region.clone().unwrap_or_default()
+                        },
                     });
                 }
             }
         }
-        for keeper in &bundle.keepers {
-            if let Some(addr) = parse_endpoint_hint(&keeper.endpoint) {
-                if !endpoints
-                    .iter()
-                    .any(|entry: &BootstrapEndpointRecord| entry.addr == addr)
-                {
-                    endpoints.push(BootstrapEndpointRecord {
-                        addr,
-                        class: BootstrapEndpointClass::Keeper,
-                        operator_id_hint: keeper.operator_id.clone().unwrap_or_default(),
-                        region_hint: keeper.region.clone().unwrap_or_default(),
-                    });
+        if preference != BootstrapEndpointPreference::OpaqueAssist {
+            for keeper in &bundle.keepers {
+                if let Some(addr) = parse_endpoint_hint(&keeper.endpoint) {
+                    if !endpoints
+                        .iter()
+                        .any(|entry: &BootstrapEndpointRecord| entry.addr == addr)
+                    {
+                        endpoints.push(BootstrapEndpointRecord {
+                            addr,
+                            class: BootstrapEndpointClass::Keeper,
+                            operator_id_hint: keeper.operator_id.clone().unwrap_or_default(),
+                            region_hint: keeper.region.clone().unwrap_or_default(),
+                        });
+                    }
                 }
             }
         }
@@ -398,6 +425,11 @@ fn bootstrap_preference_rank(
     class: BootstrapEndpointClass,
 ) -> u8 {
     match preference {
+        BootstrapEndpointPreference::OpaqueAssist => match class {
+            BootstrapEndpointClass::Bridge => 0,
+            BootstrapEndpointClass::Relay => 1,
+            BootstrapEndpointClass::Keeper => 2,
+        },
         BootstrapEndpointPreference::Balanced | BootstrapEndpointPreference::RelayFirst => {
             match class {
                 BootstrapEndpointClass::Relay => 0,
@@ -423,6 +455,9 @@ fn bootstrap_operator_policy_rank(
     cfg: &Config,
     entry: &BootstrapEndpointRecord,
 ) -> u8 {
+    if preference == BootstrapEndpointPreference::OpaqueAssist {
+        return 0;
+    }
     let operator = entry.operator_id_hint.trim();
     let is_local_operator =
         !operator.is_empty() && operator.eq_ignore_ascii_case(cfg.operator_id.trim());
@@ -467,6 +502,9 @@ fn bootstrap_region_policy_rank(
     cfg: &Config,
     entry: &BootstrapEndpointRecord,
 ) -> u8 {
+    if preference == BootstrapEndpointPreference::OpaqueAssist {
+        return 0;
+    }
     let region = entry.region_hint.trim();
     let is_local_region =
         !region.is_empty() && region.eq_ignore_ascii_case(cfg.operator_region.trim());
