@@ -1247,7 +1247,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
  "xxhash-rust",
+ "zeroize",
 ]
 
 [[package]]
@@ -1599,6 +1601,7 @@ dependencies = [
  "rand 0.8.5",
  "rcgen 0.12.1",
  "reqwest",
+ "ring",
  "rustls",
  "scopeguard",
  "secrecy",
