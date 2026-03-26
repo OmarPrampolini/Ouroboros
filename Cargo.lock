@@ -1239,7 +1239,7 @@ dependencies = [
  "lz4",
  "metrics",
  "ouroboros-crypto",
- "quinn 0.11.10",
+ "quinn",
  "reed-solomon-erasure",
  "rusqlite",
  "serde",
@@ -1595,7 +1595,7 @@ dependencies = [
  "pqcrypto-mlkem",
  "pqcrypto-traits",
  "proptest",
- "quinn 0.11.10",
+ "quinn",
  "rand 0.8.5",
  "rcgen 0.12.1",
  "reqwest",
@@ -2502,7 +2502,7 @@ dependencies = [
  "libp2p-core",
  "libp2p-identity",
  "libp2p-tls",
- "quinn 0.11.9",
+ "quinn",
  "rand 0.8.5",
  "ring",
  "rustls",
@@ -3516,53 +3516,13 @@ dependencies = [
  "cfg_aliases",
  "futures-io",
  "pin-project-lite",
- "quinn-proto 0.11.13",
- "quinn-udp 0.5.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "quinn-proto",
+ "quinn-udp",
  "rustc-hash",
  "rustls",
  "socket2 0.5.10",
  "thiserror 2.0.17",
  "tokio",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "quinn"
-version = "0.11.10"
-source = "git+https://github.com/quinn-rs/quinn?rev=a2ab220#a2ab2208bd3ac61a72e4edb1eea184c190d9f3c7"
-dependencies = [
- "bytes",
- "cfg_aliases",
- "pin-project-lite",
- "quinn-proto 0.11.14",
- "quinn-udp 0.5.14 (git+https://github.com/quinn-rs/quinn?rev=a2ab220)",
- "rustc-hash",
- "rustls",
- "socket2 0.5.10",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "quinn-proto"
-version = "0.11.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
-dependencies = [
- "bytes",
- "getrandom 0.3.4",
- "lru-slab",
- "rand 0.9.2",
- "ring",
- "rustc-hash",
- "rustls",
- "rustls-pki-types",
- "slab",
- "thiserror 2.0.17",
- "tinyvec",
  "tracing",
  "web-time",
 ]
@@ -3570,7 +3530,8 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.14"
-source = "git+https://github.com/quinn-rs/quinn?rev=a2ab220#a2ab2208bd3ac61a72e4edb1eea184c190d9f3c7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "bytes",
  "fastbloom",
@@ -3601,19 +3562,6 @@ dependencies = [
  "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "quinn-udp"
-version = "0.5.14"
-source = "git+https://github.com/quinn-rs/quinn?rev=a2ab220#a2ab2208bd3ac61a72e4edb1eea184c190d9f3c7"
-dependencies = [
- "cfg_aliases",
- "libc",
- "once_cell",
- "socket2 0.5.10",
- "tracing",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3815,7 +3763,7 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
- "quinn 0.11.9",
+ "quinn",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -4027,9 +3975,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.8"
+version = "0.103.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ffdfa2f5286e2247234e03f680868ac2815974dc39e00ea15adc445d0aafe52"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "aws-lc-rs",
  "ring",
