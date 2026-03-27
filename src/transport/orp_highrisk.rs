@@ -105,7 +105,7 @@ impl OrpHighRiskTransport {
 
 impl TransportIo for OrpHighRiskTransport {
     fn max_packet_limit(&self) -> u64 {
-        MAX_TCP_FRAME_BYTES as u64
+        MAX_TCP_FRAME_BYTES
     }
 
     fn rate_limit_addr(&self) -> std::net::SocketAddr {

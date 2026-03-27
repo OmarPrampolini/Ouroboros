@@ -23,6 +23,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive_ext: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
 
     steps:
       - uses: actions/checkout@v4

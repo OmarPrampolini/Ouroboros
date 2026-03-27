@@ -884,7 +884,7 @@ fn decode_material(raw: &str) -> Result<Vec<u8>, String> {
         return Err("empty material".to_owned());
     }
 
-    if trimmed.len() % 2 == 0 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if trimmed.len().is_multiple_of(2) && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return hex::decode(trimmed).map_err(|err| err.to_string());
     }
 

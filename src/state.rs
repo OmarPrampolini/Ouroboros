@@ -2336,32 +2336,30 @@ fn resolve_initial_bootstrap_peers(
                     }
                 }
             }
-        } else {
-            if validation.is_usable {
-                for relay in &bundle.relays {
-                    if let Some(addr) = crate::discovery::parse_endpoint_hint(&relay.addr) {
-                        push_unique_peer(&mut peers, addr);
-                    }
+        } else if validation.is_usable {
+            for relay in &bundle.relays {
+                if let Some(addr) = crate::discovery::parse_endpoint_hint(&relay.addr) {
+                    push_unique_peer(&mut peers, addr);
                 }
-                for bridge in &bundle.bridges {
-                    if let Some(addr) = crate::discovery::parse_endpoint_hint(&bridge.endpoint) {
-                        push_unique_peer(&mut peers, addr);
-                    }
-                }
-                tracing::warn!(
-                    "using bootstrap bundle only as opaque ingress assist during initial peer resolution because it is not trusted for high-risk/runtime weighting (trusted={} warnings={} errors={})",
-                    validation.trusted_for_runtime_high_risk(),
-                    validation.issue_counts.warning,
-                    validation.issue_counts.error
-                );
-            } else {
-                tracing::warn!(
-                    "ignoring bootstrap bundle during initial peer resolution because it is not usable (trusted={} warnings={} errors={})",
-                    validation.trusted_for_runtime_high_risk(),
-                    validation.issue_counts.warning,
-                    validation.issue_counts.error
-                );
             }
+            for bridge in &bundle.bridges {
+                if let Some(addr) = crate::discovery::parse_endpoint_hint(&bridge.endpoint) {
+                    push_unique_peer(&mut peers, addr);
+                }
+            }
+            tracing::warn!(
+                "using bootstrap bundle only as opaque ingress assist during initial peer resolution because it is not trusted for high-risk/runtime weighting (trusted={} warnings={} errors={})",
+                validation.trusted_for_runtime_high_risk(),
+                validation.issue_counts.warning,
+                validation.issue_counts.error
+            );
+        } else {
+            tracing::warn!(
+                "ignoring bootstrap bundle during initial peer resolution because it is not usable (trusted={} warnings={} errors={})",
+                validation.trusted_for_runtime_high_risk(),
+                validation.issue_counts.warning,
+                validation.issue_counts.error
+            );
         }
     }
 
@@ -3171,6 +3169,7 @@ async fn touch_keeper_activity(
     ts
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_keeper_manifest_hint(
     events_tx: &broadcast::Sender<String>,
     space_id: &str,

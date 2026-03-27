@@ -3,17 +3,12 @@ use ouroboros_crypto::hash::blake3_hash;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConfirmationMode {
+    #[default]
     LocalProjection,
     RoundTrip,
-}
-
-impl Default for ConfirmationMode {
-    fn default() -> Self {
-        Self::LocalProjection
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -78,8 +73,6 @@ pub struct KeeperRemoteAggregateStatus {
 
 #[derive(Debug, Clone, Default)]
 pub struct KeeperRemoteReconcilePlan {
-    pub selected_targets: usize,
-    pub acknowledged_targets: usize,
     pub pending_sends: Vec<KeeperRemoteSendPlan>,
 }
 
@@ -145,12 +138,8 @@ pub struct KeeperRemoteReconcile {
     pub selected_targets: usize,
     pub acknowledged_targets: usize,
     pub new_receipts: usize,
-    pub delivered_envelopes: usize,
     pub pending_remote_send_envelopes: usize,
     pub failed_remote_send_envelopes: usize,
-    pub last_remote_receipt_ms: Option<u64>,
-    pub delivery_state: String,
-    pub confirmation_mode: ConfirmationMode,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -212,11 +201,7 @@ impl KeeperRemoteLedger {
         state.inflight_envelopes = pending_sends.len();
         state.pending_remote_send_envelopes = pending_sends.len();
 
-        KeeperRemoteReconcilePlan {
-            selected_targets: selected.len(),
-            acknowledged_targets: count_acknowledged_targets(state),
-            pending_sends,
-        }
+        KeeperRemoteReconcilePlan { pending_sends }
     }
 
     pub fn apply_space_results(
@@ -350,12 +335,8 @@ impl KeeperRemoteLedger {
             selected_targets: state.targets.len(),
             acknowledged_targets: counts.acknowledged_targets,
             new_receipts,
-            delivered_envelopes: counts.delivered_envelopes,
             pending_remote_send_envelopes: counts.pending_remote_send_envelopes,
             failed_remote_send_envelopes: counts.failed_remote_send_envelopes,
-            last_remote_receipt_ms: state.last_remote_receipt_ms,
-            delivery_state: state.delivery_state.clone(),
-            confirmation_mode: state.confirmation_mode,
         }
     }
 
@@ -387,7 +368,7 @@ impl KeeperRemoteLedger {
         let mut aggregate = KeeperRemoteAggregateStatus::default();
         let mut saw_space = false;
         let mut all_round_trip = true;
-        for (space_id, _) in &self.spaces {
+        for space_id in self.spaces.keys() {
             let view = self.view_for_space(space_id);
             if view.selected_targets == 0
                 && view.receipt_count == 0

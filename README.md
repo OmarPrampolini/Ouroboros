@@ -23,6 +23,36 @@ From that idea the system grows into three planes:
 Repository: [github.com/OmarPrampolini/Ouroboros](https://github.com/OmarPrampolini/Ouroboros)  
 License: MIT
 
+## Install
+
+The runtime ships as two binaries:
+
+- `handshacke` for the API/runtime process
+- `hs-cli` for local control, hosting, joining, and diagnostics
+
+One-line install using the latest GitHub release:
+
+Linux/macOS (arm64 macOS supported by the current release pipeline):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OmarPrampolini/Ouroboros/main/scripts/install.sh | sh
+```
+
+Windows:
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/OmarPrampolini/Ouroboros/main/scripts/install.ps1 | iex"
+```
+
+After install:
+
+```bash
+handshacke
+hs-cli doctor
+```
+
+`hs-cli doctor` checks the local API reachability, auth posture, EtherSync state, ORP posture, and keeper replication surfaces so the install loop ends in an actual runtime verdict instead of a blind binary drop.
+
 ## What Ouroboros Is
 
 Ouroboros is a deterministic private communications platform for people who want more than "encrypted chat".
