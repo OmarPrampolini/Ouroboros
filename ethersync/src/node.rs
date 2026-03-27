@@ -693,7 +693,7 @@ impl EtherNode {
                             )
                             .await;
                             let hop = HopContext {
-                                onion_secret_key: &*router_onion_secret_key,
+                                onion_secret_key: &router_onion_secret_key,
                                 node_id: router_node_id,
                                 circuit_id: open.circuit_id,
                                 space_prefix,
@@ -735,7 +735,7 @@ impl EtherNode {
                             )
                             .await;
                             let hop = HopContext {
-                                onion_secret_key: &*router_onion_secret_key,
+                                onion_secret_key: &router_onion_secret_key,
                                 node_id: router_node_id,
                                 circuit_id: extend.circuit_id,
                                 space_prefix,
@@ -1586,7 +1586,7 @@ impl EtherNode {
 
         let entry_session_key = Zeroizing::new(
             derive_onion_session_key(
-                &*entry_secret,
+                &entry_secret,
                 &descriptor.entry.onion_pubkey,
                 &descriptor.circuit_id,
             )
@@ -1594,7 +1594,7 @@ impl EtherNode {
         );
         let middle_session_key = Zeroizing::new(
             derive_onion_session_key(
-                &*middle_secret,
+                &middle_secret,
                 &descriptor.middle.onion_pubkey,
                 &descriptor.circuit_id,
             )
@@ -1602,7 +1602,7 @@ impl EtherNode {
         );
         let exit_session_key = Zeroizing::new(
             derive_onion_session_key(
-                &*exit_secret,
+                &exit_secret,
                 &descriptor.exit.onion_pubkey,
                 &descriptor.circuit_id,
             )
@@ -1610,7 +1610,7 @@ impl EtherNode {
         );
         let reply_entry_session_key = Zeroizing::new(
             derive_onion_session_key(
-                &*reply_entry_secret,
+                &reply_entry_secret,
                 &descriptor.entry.onion_pubkey,
                 &descriptor.circuit_id,
             )
@@ -1618,7 +1618,7 @@ impl EtherNode {
         );
         let reply_middle_session_key = Zeroizing::new(
             derive_onion_session_key(
-                &*reply_middle_secret,
+                &reply_middle_secret,
                 &descriptor.middle.onion_pubkey,
                 &descriptor.circuit_id,
             )
@@ -1626,7 +1626,7 @@ impl EtherNode {
         );
         let reply_exit_session_key = Zeroizing::new(
             derive_onion_session_key(
-                &*reply_exit_secret,
+                &reply_exit_secret,
                 &descriptor.exit.onion_pubkey,
                 &descriptor.circuit_id,
             )
@@ -1634,11 +1634,11 @@ impl EtherNode {
         );
 
         let entry_payload = serialize_hop_handshake(HopHandshake {
-            origin_ephemeral_pubkey: derive_onion_public_key(&*entry_secret),
+            origin_ephemeral_pubkey: derive_onion_public_key(&entry_secret),
             onion_epoch_slot: descriptor.entry.onion_epoch_slot,
             onion_salt: descriptor.entry.onion_salt,
             sealed_capsule: seal_hop_capsule(
-                &*entry_session_key,
+                &entry_session_key,
                 &descriptor.circuit_id,
                 &HighRiskHopCapsule {
                     descriptor: build_minimal_high_risk_descriptor(
@@ -1646,18 +1646,18 @@ impl EtherNode {
                         HighRiskLocalRole::Entry,
                     ),
                     local_role_code: high_risk_local_role_code(HighRiskLocalRole::Entry),
-                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&*reply_entry_secret),
+                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&reply_entry_secret),
                 },
             )
             .map_err(map_onion_error)?,
             reply_layers_ciphertext: Vec::new(),
         })?;
         let middle_payload = serialize_hop_handshake(HopHandshake {
-            origin_ephemeral_pubkey: derive_onion_public_key(&*middle_secret),
+            origin_ephemeral_pubkey: derive_onion_public_key(&middle_secret),
             onion_epoch_slot: descriptor.middle.onion_epoch_slot,
             onion_salt: descriptor.middle.onion_salt,
             sealed_capsule: seal_hop_capsule(
-                &*middle_session_key,
+                &middle_session_key,
                 &descriptor.circuit_id,
                 &HighRiskHopCapsule {
                     descriptor: build_minimal_high_risk_descriptor(
@@ -1665,7 +1665,7 @@ impl EtherNode {
                         HighRiskLocalRole::Middle,
                     ),
                     local_role_code: high_risk_local_role_code(HighRiskLocalRole::Middle),
-                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&*reply_middle_secret),
+                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&reply_middle_secret),
                 },
             )
             .map_err(map_onion_error)?,
@@ -1686,11 +1686,11 @@ impl EtherNode {
             },
         ];
         let exit_payload = serialize_hop_handshake(HopHandshake {
-            origin_ephemeral_pubkey: derive_onion_public_key(&*exit_secret),
+            origin_ephemeral_pubkey: derive_onion_public_key(&exit_secret),
             onion_epoch_slot: descriptor.exit.onion_epoch_slot,
             onion_salt: descriptor.exit.onion_salt,
             sealed_capsule: seal_hop_capsule(
-                &*exit_session_key,
+                &exit_session_key,
                 &descriptor.circuit_id,
                 &HighRiskHopCapsule {
                     descriptor: build_minimal_high_risk_descriptor(
@@ -1698,12 +1698,12 @@ impl EtherNode {
                         HighRiskLocalRole::Exit,
                     ),
                     local_role_code: high_risk_local_role_code(HighRiskLocalRole::Exit),
-                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&*reply_exit_secret),
+                    reply_origin_ephemeral_pubkey: derive_onion_public_key(&reply_exit_secret),
                 },
             )
             .map_err(map_onion_error)?,
             reply_layers_ciphertext: encrypt_reply_layers(
-                &*reply_exit_session_key,
+                &reply_exit_session_key,
                 &descriptor.circuit_id,
                 &reply_layers,
             )
