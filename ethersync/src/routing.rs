@@ -19,10 +19,12 @@
 //! - `11`: circuit ready       (`SUBSPACE_CIRCUIT_READY`)
 
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::onion::is_valid_onion_public_key;
 use crate::EtherSyncError;
@@ -185,6 +187,38 @@ pub struct RouteAnnouncement {
     pub measured_rtt_ms: Option<u16>,
     /// Slot after which this announcement should be discarded.
     pub expires_at_slot: u64,
+    /// Public key for the ORP identity that attests this announcement.
+    #[serde(default)]
+    pub identity_pubkey: [u8; 32],
+    /// Ed25519 signature over the canonical announcement payload for this space.
+    #[serde(
+        default = "default_attestation_sig",
+        serialize_with = "serialize_attestation_sig",
+        deserialize_with = "deserialize_attestation_sig"
+    )]
+    pub attestation_sig: [u8; 64],
+}
+
+fn default_attestation_sig() -> [u8; 64] {
+    [0u8; 64]
+}
+
+fn serialize_attestation_sig<S>(sig: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_bytes(sig)
+}
+
+fn deserialize_attestation_sig<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let bytes = <Vec<u8>>::deserialize(deserializer)?;
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| serde::de::Error::invalid_length(len, &"64-byte Ed25519 signature"))
 }
 
 /// Request to locate a peer by its assist_tag.
@@ -325,6 +359,7 @@ pub struct CachedAnnouncement {
 pub struct CachedOffer {
     pub frame: RouteOffer,
     pub last_seen: Instant,
+    pub space_prefix: [u8; 8],
 }
 
 /// In-memory route cache for ORP control-plane state.
@@ -393,6 +428,105 @@ pub struct HighRiskPlannerError {
     pub gate: HighRiskGateSnapshot,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RouteAnnouncementSigningPayload {
+    space_prefix: [u8; 8],
+    version: u8,
+    slot: u64,
+    node_id: [u8; 16],
+    onion_pubkey: [u8; 32],
+    onion_epoch_slot: u64,
+    onion_salt: [u8; 16],
+    capabilities: RouteCapabilities,
+    reachable_udp: Vec<SocketAddr>,
+    assist_tag: [u8; 8],
+    route_class: RouteClass,
+    operator_id_hint: String,
+    region_hint: String,
+    measured_rtt_ms: Option<u16>,
+    expires_at_slot: u64,
+}
+
+pub fn derive_route_node_id(identity_pubkey: &[u8; 32]) -> [u8; 16] {
+    let digest = blake3::hash(identity_pubkey);
+    let mut node_id = [0u8; 16];
+    node_id.copy_from_slice(&digest.as_bytes()[..16]);
+    node_id
+}
+
+pub fn derive_route_assist_tag(identity_pubkey: &[u8; 32]) -> [u8; 8] {
+    let digest = blake3::hash(identity_pubkey);
+    let mut assist_tag = [0u8; 8];
+    assist_tag.copy_from_slice(&digest.as_bytes()[..8]);
+    assist_tag
+}
+
+fn route_announcement_signing_payload(
+    frame: &RouteAnnouncement,
+    space_prefix: &[u8; 8],
+) -> Result<Vec<u8>, EtherSyncError> {
+    bincode::serialize(&RouteAnnouncementSigningPayload {
+        space_prefix: *space_prefix,
+        version: frame.version,
+        slot: frame.slot,
+        node_id: frame.node_id,
+        onion_pubkey: frame.onion_pubkey,
+        onion_epoch_slot: frame.onion_epoch_slot,
+        onion_salt: frame.onion_salt,
+        capabilities: frame.capabilities,
+        reachable_udp: frame.reachable_udp.clone(),
+        assist_tag: frame.assist_tag,
+        route_class: frame.route_class,
+        operator_id_hint: frame.operator_id_hint.clone(),
+        region_hint: frame.region_hint.clone(),
+        measured_rtt_ms: frame.measured_rtt_ms,
+        expires_at_slot: frame.expires_at_slot,
+    })
+    .map_err(|e| {
+        EtherSyncError::NetworkError(format!(
+            "ORP announcement signing payload encode failed: {e}"
+        ))
+    })
+}
+
+pub fn sign_route_announcement(
+    frame: &mut RouteAnnouncement,
+    signing_key: &SigningKey,
+    space_prefix: &[u8; 8],
+) -> Result<(), EtherSyncError> {
+    frame.identity_pubkey = signing_key.verifying_key().to_bytes();
+    frame.node_id = derive_route_node_id(&frame.identity_pubkey);
+    frame.assist_tag = derive_route_assist_tag(&frame.identity_pubkey);
+    let payload = route_announcement_signing_payload(frame, space_prefix)?;
+    frame.attestation_sig = signing_key.sign(&payload).to_bytes();
+    Ok(())
+}
+
+pub fn verify_route_announcement(frame: &RouteAnnouncement, space_prefix: &[u8; 8]) -> bool {
+    if frame.identity_pubkey.iter().all(|byte| *byte == 0) {
+        return false;
+    }
+    if frame.attestation_sig.iter().all(|byte| *byte == 0) {
+        return false;
+    }
+    if frame.node_id != derive_route_node_id(&frame.identity_pubkey) {
+        return false;
+    }
+    if frame.assist_tag != derive_route_assist_tag(&frame.identity_pubkey) {
+        return false;
+    }
+    let verifying_key = match VerifyingKey::from_bytes(&frame.identity_pubkey) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+    let signature = Signature::from_bytes(&frame.attestation_sig);
+    let payload = match route_announcement_signing_payload(frame, space_prefix) {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+    verifying_key.verify(&payload, &signature).is_ok()
+}
+
 impl RouteCache {
     pub fn new() -> Self {
         Self::default()
@@ -419,6 +553,10 @@ impl RouteCache {
 
         let mut space_prefix = [0u8; 8];
         space_prefix.copy_from_slice(&space_hash[..8]);
+
+        if !verify_route_announcement(&frame, &space_prefix) {
+            return false;
+        }
 
         let key = RouteKey {
             space_prefix,
@@ -449,7 +587,34 @@ impl RouteCache {
     }
 
     /// Insert a route offer, capping at `MAX_OFFERS_PER_LOOKUP` per lookup_id.
-    pub fn insert_offer(&mut self, frame: RouteOffer) {
+    pub fn insert_offer(
+        &mut self,
+        frame: RouteOffer,
+        current_slot: u64,
+        space_hash: &[u8; 32],
+    ) -> bool {
+        let mut space_prefix = [0u8; 8];
+        space_prefix.copy_from_slice(&space_hash[..8]);
+        let Some(announcement) =
+            self.announcement_for_node(&space_prefix, &frame.responder_id, current_slot)
+        else {
+            return false;
+        };
+        let offer_matches_announcement = match &frame.next_hop {
+            RouteHop::Direct { addr } => {
+                announcement.frame.capabilities.direct_udp
+                    && announcement.frame.reachable_udp.contains(addr)
+            }
+            RouteHop::Relay { relay_addr, .. } => {
+                announcement.frame.capabilities.can_relay
+                    && announcement.frame.reachable_udp.contains(relay_addr)
+            }
+            RouteHop::Tor { .. } => announcement.frame.capabilities.tor_capable,
+        };
+        if !offer_matches_announcement {
+            return false;
+        }
+
         let entry = self.offers.entry(frame.lookup_id).or_default();
         if entry.len() >= MAX_OFFERS_PER_LOOKUP {
             // Drop the lowest-scored offer to make room.
@@ -462,14 +627,16 @@ impl RouteCache {
                 if entry[worst_idx].frame.score < frame.score {
                     entry.remove(worst_idx);
                 } else {
-                    return; // New offer is worse than all cached; discard.
+                    return false; // New offer is worse than all cached; discard.
                 }
             }
         }
         entry.push(CachedOffer {
             frame,
             last_seen: Instant::now(),
+            space_prefix,
         });
+        true
     }
 
     /// Return all announcements for the given space prefix and slot range.
@@ -520,10 +687,16 @@ impl RouteCache {
     }
 
     /// Return the best scored offer for a lookup id (highest score wins).
-    pub fn best_offer(&self, lookup_id: &[u8; 16], current_slot: u64) -> Option<&CachedOffer> {
+    pub fn best_offer(
+        &self,
+        space_prefix: &[u8; 8],
+        lookup_id: &[u8; 16],
+        current_slot: u64,
+    ) -> Option<&CachedOffer> {
         self.offers
             .get(lookup_id)?
             .iter()
+            .filter(|offer| offer.space_prefix == *space_prefix)
             .max_by_key(|o| score_offer(o, current_slot))
     }
 
@@ -843,29 +1016,46 @@ pub fn score_announcement(announcement: &CachedAnnouncement, current_slot: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use std::net::SocketAddr;
 
     fn dummy_addr() -> SocketAddr {
         "127.0.0.1:4000".parse().unwrap()
     }
 
-    fn make_announcement(slot: u64, node_id: [u8; 16], tag: [u8; 8]) -> RouteAnnouncement {
-        RouteAnnouncement {
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn make_announcement(slot: u64, identity_seed: u8) -> RouteAnnouncement {
+        let mut announcement = RouteAnnouncement {
             version: 1,
             slot,
-            node_id,
+            node_id: [0u8; 16],
             onion_pubkey: [7u8; 32],
             onion_epoch_slot: slot,
             onion_salt: [9u8; 16],
-            capabilities: RouteCapabilities::default(),
+            capabilities: RouteCapabilities {
+                direct_udp: true,
+                ..RouteCapabilities::default()
+            },
             reachable_udp: vec![dummy_addr()],
-            assist_tag: tag,
+            assist_tag: [0u8; 8],
             route_class: RouteClass::Direct,
             operator_id_hint: "local-node".to_string(),
             region_hint: "unknown".to_string(),
             measured_rtt_ms: None,
             expires_at_slot: slot + 4,
-        }
+            identity_pubkey: [0u8; 32],
+            attestation_sig: [0u8; 64],
+        };
+        sign_route_announcement(
+            &mut announcement,
+            &signing_key(identity_seed),
+            &space_prefix(),
+        )
+        .unwrap();
+        announcement
     }
 
     fn space_hash() -> [u8; 32] {
@@ -878,7 +1068,7 @@ mod tests {
 
     #[test]
     fn orp_frame_roundtrip_announce() {
-        let ann = make_announcement(100, [1u8; 16], [2u8; 8]);
+        let ann = make_announcement(100, 1);
         let frame = OrpFrame::Announce(ann.clone());
         let bytes = encode_orp_frame(&frame).unwrap();
         let decoded = decode_orp_frame(&bytes).unwrap();
@@ -917,22 +1107,25 @@ mod tests {
     #[test]
     fn route_cache_insert_and_find() {
         let mut cache = RouteCache::new();
-        let ann = make_announcement(50, [3u8; 16], [5u8; 8]);
+        let ann = make_announcement(50, 3);
+        let node_id = ann.node_id;
+        let tag = ann.assist_tag;
         let sh = space_hash();
 
         assert!(cache.insert_announcement(ann.clone(), dummy_addr(), 50, &sh));
 
         let prefix = space_prefix();
-        let found = cache.find_by_tag(&prefix, &[5u8; 8], 50);
+        let found = cache.find_by_tag(&prefix, &tag, 50);
         assert!(found.is_some());
-        assert_eq!(found.unwrap().frame.node_id, [3u8; 16]);
+        assert_eq!(found.unwrap().frame.node_id, node_id);
     }
 
     #[test]
     fn route_cache_rejects_expired_announcement() {
         let mut cache = RouteCache::new();
-        let mut ann = make_announcement(10, [1u8; 16], [1u8; 8]);
+        let mut ann = make_announcement(10, 1);
         ann.expires_at_slot = 11; // expires at slot 11
+        sign_route_announcement(&mut ann, &signing_key(1), &space_prefix()).unwrap();
         let sh = space_hash();
 
         // current_slot = 20, announcement expired at 11 → should be rejected
@@ -943,7 +1136,7 @@ mod tests {
     fn route_cache_rejects_old_slot() {
         let mut cache = RouteCache::new();
         // Announcement from slot 5, current is 100 → too far back
-        let ann = make_announcement(5, [2u8; 16], [2u8; 8]);
+        let ann = make_announcement(5, 2);
         let sh = space_hash();
 
         assert!(!cache.insert_announcement(ann, dummy_addr(), 100, &sh));
@@ -953,18 +1146,26 @@ mod tests {
     fn route_cache_best_offer_highest_score() {
         let mut cache = RouteCache::new();
         let lookup_id = [42u8; 16];
+        let sh = space_hash();
+        let announcement = make_announcement(50, 9);
+        let responder_id = announcement.node_id;
+        assert!(cache.insert_announcement(announcement, dummy_addr(), 50, &sh));
 
         for score in [100u16, 500, 200] {
-            cache.insert_offer(RouteOffer {
-                version: 1,
-                lookup_id,
-                responder_id: [0u8; 16],
-                next_hop: RouteHop::Direct { addr: dummy_addr() },
-                score,
-            });
+            assert!(cache.insert_offer(
+                RouteOffer {
+                    version: 1,
+                    lookup_id,
+                    responder_id,
+                    next_hop: RouteHop::Direct { addr: dummy_addr() },
+                    score,
+                },
+                50,
+                &sh,
+            ));
         }
 
-        let best = cache.best_offer(&lookup_id, 50).unwrap();
+        let best = cache.best_offer(&space_prefix(), &lookup_id, 50).unwrap();
         assert_eq!(best.frame.score, 500);
     }
 
@@ -972,7 +1173,7 @@ mod tests {
     fn route_cache_evicts_stale_entries() {
         let mut cache = RouteCache::new();
         let sh = space_hash();
-        let ann = make_announcement(50, [4u8; 16], [6u8; 8]);
+        let ann = make_announcement(50, 4);
         cache.insert_announcement(ann, dummy_addr(), 50, &sh);
 
         // Evict with max_age = 0 seconds (everything is stale immediately)
@@ -987,24 +1188,9 @@ mod tests {
         let sh = space_hash();
         let prefix = space_prefix();
 
-        cache.insert_announcement(
-            make_announcement(10, [1u8; 16], [1u8; 8]),
-            dummy_addr(),
-            10,
-            &sh,
-        );
-        cache.insert_announcement(
-            make_announcement(10, [2u8; 16], [2u8; 8]),
-            dummy_addr(),
-            10,
-            &sh,
-        );
-        cache.insert_announcement(
-            make_announcement(11, [3u8; 16], [3u8; 8]),
-            dummy_addr(),
-            11,
-            &sh,
-        );
+        cache.insert_announcement(make_announcement(10, 1), dummy_addr(), 10, &sh);
+        cache.insert_announcement(make_announcement(10, 2), dummy_addr(), 10, &sh);
+        cache.insert_announcement(make_announcement(11, 3), dummy_addr(), 11, &sh);
 
         let slot10 = cache.announcements_for_slot(&prefix, 10);
         assert_eq!(slot10.len(), 2);
@@ -1036,10 +1222,9 @@ mod tests {
     #[test]
     fn no_cross_space_cache_leakage() {
         let mut cache = RouteCache::new();
-        let space_a = [0xAAu8; 32];
-        let tag = [5u8; 8];
-
-        let ann = make_announcement(50, [1u8; 16], tag);
+        let space_a = space_hash();
+        let ann = make_announcement(50, 5);
+        let tag = ann.assist_tag;
         cache.insert_announcement(ann, dummy_addr(), 50, &space_a);
 
         // Lookup with space_b prefix should find nothing
@@ -1047,7 +1232,7 @@ mod tests {
         assert!(cache.find_by_tag(&prefix_b, &tag, 50).is_none());
 
         // Lookup with space_a prefix should find it
-        let prefix_a = [0xAAu8; 8];
+        let prefix_a = space_prefix();
         assert!(cache.find_by_tag(&prefix_a, &tag, 50).is_some());
     }
 
@@ -1117,22 +1302,26 @@ mod tests {
     fn lookup_produces_offer_via_cache() {
         let mut cache = RouteCache::new();
         let lookup_id = [0xCC; 16];
+        let sh = space_hash();
+        let announcement = make_announcement(50, 10);
+        let responder_id = announcement.node_id;
+        assert!(cache.insert_announcement(announcement, dummy_addr(), 50, &sh));
 
         // Simulate: a lookup targeting our tag produced an offer
         let offer = RouteOffer {
             version: 1,
             lookup_id,
-            responder_id: [10u8; 16],
+            responder_id,
             next_hop: RouteHop::Direct { addr: dummy_addr() },
             score: 5000,
         };
-        cache.insert_offer(offer);
+        assert!(cache.insert_offer(offer, 50, &sh));
 
-        let best = cache.best_offer(&lookup_id, 50);
+        let best = cache.best_offer(&space_prefix(), &lookup_id, 50);
         assert!(best.is_some());
         let best = best.unwrap();
         assert_eq!(best.frame.score, 5000);
-        assert_eq!(best.frame.responder_id, [10u8; 16]);
+        assert_eq!(best.frame.responder_id, responder_id);
         match &best.frame.next_hop {
             RouteHop::Direct { addr } => assert_eq!(*addr, dummy_addr()),
             _ => panic!("expected Direct hop"),

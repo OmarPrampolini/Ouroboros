@@ -3,8 +3,9 @@ use base64::{engine::general_purpose, Engine as _};
 use clap::{Parser, Subcommand};
 use rand::RngCore;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 
 const DEFAULT_API: &str = "http://127.0.0.1:3000";
 
@@ -193,6 +194,9 @@ struct DoctorKeeperStatus {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(warning) = remote_http_api_warning(&args.api) {
+        eprintln!("Warning: {}", warning);
+    }
     let token = resolve_api_token(&args)?;
     let mut headers = HeaderMap::new();
     if let Some(token) = &token {
@@ -494,8 +498,28 @@ fn truncate_for_display(value: &str, max_chars: usize) -> String {
 
 fn random_passphrase() -> String {
     let mut buf = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rngs::OsRng.fill_bytes(&mut buf);
     general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+fn remote_http_api_warning(api: &str) -> Option<String> {
+    let url = Url::parse(api).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    if let Ok(addr) = host.parse::<IpAddr>() {
+        if addr.is_loopback() || addr.is_unspecified() {
+            return None;
+        }
+    }
+    Some(format!(
+        "--api points to remote plain HTTP at {}; bearer tokens and control traffic are not protected by TLS",
+        api
+    ))
 }
 
 fn resolve_api_token(args: &Args) -> Result<Option<String>> {

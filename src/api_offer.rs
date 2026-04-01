@@ -427,18 +427,18 @@ async fn discover_wan_endpoint(
 
 fn random_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rngs::OsRng.fill_bytes(&mut key);
     key
 }
 
 fn random_tag16() -> u16 {
     let mut buf = [0u8; 2];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rngs::OsRng.fill_bytes(&mut buf);
     u16::from_be_bytes(buf)
 }
 
 fn random_port() -> u16 {
     let mut buf = [0u8; 2];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rngs::OsRng.fill_bytes(&mut buf);
     MIN_EPHEMERAL_PORT + (u16::from_be_bytes(buf) % (MAX_PORT - MIN_EPHEMERAL_PORT))
 }

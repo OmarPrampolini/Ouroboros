@@ -1,7 +1,7 @@
 use crate::security::RateLimiter;
 use base64::{engine::general_purpose, Engine as _};
 use ethersync::coordinate::LOOKBACK_SLOTS;
-use ethersync::{EtherCoordinate, EtherNode, NodeConfig};
+use ethersync::{EtherCoordinate, EtherNode, NodeConfig, SubscriptionHandle};
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
 use serde::{Deserialize, Serialize};
@@ -234,6 +234,13 @@ pub struct EtherSyncJoinResult {
     pub keeper_manifest: KeeperSpaceManifest,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EtherSyncLeaveResult {
+    pub space_id: String,
+    pub unsubscribed: bool,
+    pub orp_stopped: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SpaceRouteBias {
     Balanced,
@@ -353,7 +360,7 @@ struct EtherSyncRuntime {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     run_task: JoinHandle<()>,
     keeper_replication_task: Option<JoinHandle<()>>,
-    subscriptions: HashMap<String, JoinHandle<()>>,
+    subscriptions: HashMap<String, EtherSyncSubscriptionState>,
     events_tx: broadcast::Sender<String>,
     /// Whether ORP was enabled when this runtime was started.
     enable_orp: bool,
@@ -372,6 +379,13 @@ struct EtherSyncRuntime {
     keeper_candidates: Vec<keeper_remote::KeeperRemoteTarget>,
     keeper_last_activity: Arc<Mutex<HashMap<String, u64>>>,
     space_policies: Arc<Mutex<HashMap<String, EtherSpacePolicy>>>,
+}
+
+struct EtherSyncSubscriptionState {
+    task: JoinHandle<()>,
+    node_subscription_id: u64,
+    space_key: String,
+    space_prefix: [u8; 8],
 }
 
 #[derive(Debug, Clone)]
@@ -805,8 +819,12 @@ impl AppState {
         );
 
         let _ = runtime.shutdown_tx.send(true);
-        for (_, handle) in runtime.subscriptions.drain() {
-            handle.abort();
+        for (_, subscription) in runtime.subscriptions.drain() {
+            subscription.task.abort();
+            let _ = runtime
+                .node
+                .unsubscribe(subscription.node_subscription_id)
+                .await;
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), async {
             let _ = runtime.run_task.await;
@@ -1315,10 +1333,14 @@ impl AppState {
             });
         }
 
-        let mut rx = node
+        let SubscriptionHandle {
+            id: node_subscription_id,
+            receiver: mut rx,
+        } = node
             .subscribe(&passphrase)
             .await
             .map_err(|e| anyhow::anyhow!("failed to subscribe ethersync space: {}", e))?;
+        let space_prefix = derive_space_prefix(&passphrase);
 
         if orp_enabled {
             node.start_orp_for_space(&passphrase).await;
@@ -1409,12 +1431,23 @@ impl AppState {
         });
 
         let mut inserted = false;
+        let mut should_unsubscribe_duplicate = false;
+        let mut stopped_before_insert = false;
         let mut inner = self.inner.lock().await;
         if let Some(rt) = inner.ethersync.as_mut() {
             if rt.subscriptions.contains_key(&space_id) {
                 task.abort();
+                should_unsubscribe_duplicate = true;
             } else {
-                rt.subscriptions.insert(space_id.clone(), task);
+                rt.subscriptions.insert(
+                    space_id.clone(),
+                    EtherSyncSubscriptionState {
+                        task,
+                        node_subscription_id,
+                        space_key: space_key.clone(),
+                        space_prefix,
+                    },
+                );
                 emit_ethersync_event(
                     &rt.events_tx,
                     EtherSyncEvent {
@@ -1432,9 +1465,16 @@ impl AppState {
             }
         } else {
             task.abort();
-            return Err(anyhow::anyhow!("ethersync was stopped"));
+            stopped_before_insert = true;
         }
         drop(inner);
+
+        if should_unsubscribe_duplicate || stopped_before_insert {
+            let _ = node.unsubscribe(node_subscription_id).await;
+        }
+        if stopped_before_insert {
+            return Err(anyhow::anyhow!("ethersync was stopped"));
+        }
 
         if inserted {
             let replayed = replay_space_backlog(&node, &events_tx, &passphrase, &space_id).await;
@@ -1499,6 +1539,75 @@ impl AppState {
             replication_factor: applied_policy.replication_factor,
             route_bias: applied_policy.route_bias.as_str().to_string(),
             keeper_manifest,
+        })
+    }
+
+    pub async fn ethersync_leave_space(
+        &self,
+        passphrase: String,
+        label: Option<String>,
+    ) -> anyhow::Result<EtherSyncLeaveResult> {
+        if passphrase.trim().is_empty() {
+            return Err(anyhow::anyhow!("passphrase required"));
+        }
+
+        let space_id = derive_space_id(&passphrase, label.as_deref());
+        let space_key = derive_space_key(&passphrase);
+        let (node, events_tx, orp_enabled, removed, same_space_still_active) = {
+            let mut inner = self.inner.lock().await;
+            let Some(rt) = inner.ethersync.as_mut() else {
+                return Err(anyhow::anyhow!("ethersync is not running"));
+            };
+            let removed = rt.subscriptions.remove(&space_id);
+            let same_space_still_active = rt
+                .subscriptions
+                .values()
+                .any(|subscription| subscription.space_key == space_key);
+            (
+                rt.node.clone(),
+                rt.events_tx.clone(),
+                rt.enable_orp,
+                removed,
+                same_space_still_active,
+            )
+        };
+
+        let Some(subscription) = removed else {
+            return Ok(EtherSyncLeaveResult {
+                space_id,
+                unsubscribed: false,
+                orp_stopped: false,
+            });
+        };
+
+        subscription.task.abort();
+        let unsubscribed = node.unsubscribe(subscription.node_subscription_id).await;
+        let orp_stopped = orp_enabled && !same_space_still_active;
+        if orp_stopped {
+            node.stop_orp_for_prefix(subscription.space_prefix).await;
+        }
+
+        emit_ethersync_event(
+            &events_tx,
+            EtherSyncEvent {
+                kind: "space_left".to_string(),
+                ts_ms: now_ms(),
+                space_id: Some(space_id.clone()),
+                slot_id: None,
+                payload_b64: None,
+                text: None,
+                info: Some(format!(
+                    "space subscription stopped (orp_stopped={})",
+                    orp_stopped
+                )),
+                error: None,
+            },
+        );
+
+        Ok(EtherSyncLeaveResult {
+            space_id,
+            unsubscribed,
+            orp_stopped,
         })
     }
 
@@ -2966,6 +3075,14 @@ fn derive_space_id(passphrase: &str, label: Option<&str>) -> String {
         }
     }
     base
+}
+
+fn derive_space_prefix(passphrase: &str) -> [u8; 8] {
+    let canonical = canonicalize_passphrase(passphrase);
+    let hash = blake3_hash(&canonical);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&hash[..8]);
+    prefix
 }
 
 fn derive_space_key(passphrase: &str) -> String {

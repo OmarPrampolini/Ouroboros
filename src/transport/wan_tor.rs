@@ -8,7 +8,8 @@ use crate::onion::parse_onion_addr;
 use base64::Engine;
 use rand::RngCore;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_socks::tcp::Socks5Stream;
 use tracing::debug;
@@ -117,6 +118,13 @@ pub async fn try_tor_connect(
 
 /// Configure Tor daemon to use obfs4 bridge
 async fn configure_tor_bridge(socks_addr: &str, bridge: &TorBridge) -> Result<()> {
+    if !bridge.transport.eq_ignore_ascii_case("obfs4") {
+        return Err(WanTorError::TorControlUnavailable(format!(
+            "unsupported Tor bridge transport: {}",
+            bridge.transport
+        )));
+    }
+
     // Connect to Tor control port (derive from SOCKS address)
     let control_addr = socks_addr
         .rsplit_once(':')
@@ -126,25 +134,128 @@ async fn configure_tor_bridge(socks_addr: &str, bridge: &TorBridge) -> Result<()
         .await
         .map_err(|e| WanTorError::TorControlUnavailable(e.to_string()))?;
 
-    // Authenticate with Tor control
-    control_conn.write_all(b"AUTHENTICATE\r\n").await?;
+    authenticate_tor_control(&mut control_conn).await?;
 
-    // Set bridge line
     let bridge_line = format!(
-        "BRIDGE obfs4 {}:{} {} iat-mode={}\r\n",
-        bridge.ip, bridge.port, bridge.cert, bridge.iat_mode
+        "{} {}:{} cert={} iat-mode={}",
+        bridge.transport, bridge.ip, bridge.port, bridge.cert, bridge.iat_mode
     );
-    control_conn.write_all(bridge_line.as_bytes()).await?;
-
-    // Signal newnym to use bridge
-    control_conn.write_all(b"SIGNAL NEWNYM\r\n").await?;
-
-    control_conn.flush().await?;
+    send_control_command(&mut control_conn, "SETCONF UseBridges=1\r\n").await?;
+    send_control_command(
+        &mut control_conn,
+        &format!(
+            "SETCONF Bridge=\"{}\"\r\n",
+            escape_control_value(&bridge_line)
+        ),
+    )
+    .await?;
+    send_control_command(&mut control_conn, "SIGNAL NEWNYM\r\n").await?;
 
     // Close control connection
     control_conn.shutdown().await?;
 
     Ok(())
+}
+
+async fn authenticate_tor_control(control_conn: &mut TcpStream) -> Result<()> {
+    if let Ok(cookie_path) = std::env::var("HANDSHACKE_TOR_CONTROL_COOKIE_FILE") {
+        let cookie = fs::read(&cookie_path)
+            .await
+            .map_err(|e| WanTorError::TorControlUnavailable(e.to_string()))?;
+        return send_control_command(
+            control_conn,
+            &format!("AUTHENTICATE {}\r\n", hex::encode(cookie)),
+        )
+        .await
+        .map(|_| ());
+    }
+
+    if let Ok(password) = std::env::var("HANDSHACKE_TOR_CONTROL_PASSWORD") {
+        let trimmed = password.trim();
+        if !trimmed.is_empty() {
+            return send_control_command(
+                control_conn,
+                &format!("AUTHENTICATE \"{}\"\r\n", escape_control_value(trimmed)),
+            )
+            .await
+            .map(|_| ());
+        }
+    }
+
+    Err(WanTorError::TorControlUnavailable(
+        "missing Tor control auth; set HANDSHACKE_TOR_CONTROL_COOKIE_FILE or HANDSHACKE_TOR_CONTROL_PASSWORD".to_string(),
+    ))
+}
+
+async fn send_control_command(control_conn: &mut TcpStream, command: &str) -> Result<Vec<String>> {
+    control_conn.write_all(command.as_bytes()).await?;
+    control_conn.flush().await?;
+    let (status, lines) = read_control_reply(control_conn).await?;
+    if status == 250 {
+        Ok(lines)
+    } else {
+        Err(WanTorError::TorControlUnavailable(format!(
+            "Tor control command failed: {}",
+            lines.join(" | ")
+        )))
+    }
+}
+
+async fn read_control_reply(control_conn: &mut TcpStream) -> Result<(u16, Vec<String>)> {
+    let mut lines = Vec::new();
+    loop {
+        let line = read_control_line(control_conn).await?;
+        if line.len() < 4 {
+            return Err(WanTorError::TorControlUnavailable(
+                "malformed Tor control response".to_string(),
+            ));
+        }
+        let status = line[..3].parse::<u16>().map_err(|_| {
+            WanTorError::TorControlUnavailable("invalid Tor status code".to_string())
+        })?;
+        let separator = line.as_bytes()[3] as char;
+        lines.push(line.clone());
+
+        if separator == '+' {
+            loop {
+                let data_line = read_control_line(control_conn).await?;
+                let done = data_line == ".";
+                lines.push(data_line);
+                if done {
+                    break;
+                }
+            }
+        }
+
+        if separator == ' ' {
+            return Ok((status, lines));
+        }
+    }
+}
+
+async fn read_control_line(control_conn: &mut TcpStream) -> Result<String> {
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = control_conn.read(&mut byte).await?;
+        if n == 0 {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.len() >= 2 && buf[buf.len() - 2] == b'\r' && buf[buf.len() - 1] == b'\n' {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        return Err(WanTorError::TorControlUnavailable(
+            "Tor control connection closed unexpectedly".to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&buf).trim().to_string())
+}
+
+fn escape_control_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Host: listen for incoming connections on local address

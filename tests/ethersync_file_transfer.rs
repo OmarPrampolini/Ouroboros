@@ -30,8 +30,10 @@ fn build_payload(len: usize) -> Vec<u8> {
 }
 
 async fn start_node(app: &AppState) -> anyhow::Result<()> {
-    let mut cfg = EtherSyncStartConfig::default();
-    cfg.bind_addr = "127.0.0.1:0".to_string();
+    let cfg = EtherSyncStartConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EtherSyncStartConfig::default()
+    };
     app.ethersync_start(cfg).await?;
     Ok(())
 }

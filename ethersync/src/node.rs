@@ -13,11 +13,12 @@ use crate::{
         HighRiskHopCapsule, HopHandshake, OnionCodec, OnionLayer,
     },
     routing::{
-        encode_orp_frame, CircuitClose, CircuitExtend, CircuitOpen, CircuitReady, CoverPacket,
-        DeliveryReceipt, ForwardDeliveryNotice, HighRiskCircuitHop, HighRiskCircuitPlan,
-        HighRiskGateSnapshot, HighRiskRouteDescriptor, OrpFrame, RouteAnnouncement, RouteCache,
-        RouteCapabilities, RouteClass, RouteDirection, RouteForward, RouteHop, RouteLookup,
-        RouteOffer, SUBSPACE_CIRCUIT_CLOSE, SUBSPACE_CIRCUIT_EXTEND, SUBSPACE_CIRCUIT_OPEN,
+        derive_route_node_id, encode_orp_frame, sign_route_announcement, CircuitClose,
+        CircuitExtend, CircuitOpen, CircuitReady, CoverPacket, DeliveryReceipt,
+        ForwardDeliveryNotice, HighRiskCircuitHop, HighRiskCircuitPlan, HighRiskGateSnapshot,
+        HighRiskRouteDescriptor, OrpFrame, RouteAnnouncement, RouteCache, RouteCapabilities,
+        RouteClass, RouteDirection, RouteForward, RouteHop, RouteLookup, RouteOffer,
+        SUBSPACE_CIRCUIT_CLOSE, SUBSPACE_CIRCUIT_EXTEND, SUBSPACE_CIRCUIT_OPEN,
         SUBSPACE_CIRCUIT_READY, SUBSPACE_COVER_TRAFFIC, SUBSPACE_DELIVERY_NOTICE,
         SUBSPACE_ROUTE_ANNOUNCE, SUBSPACE_ROUTE_FORWARD, SUBSPACE_ROUTE_LOOKUP,
         SUBSPACE_ROUTE_OFFER, SUBSPACE_USER,
@@ -25,13 +26,14 @@ use crate::{
     storage::EtherStorage,
     EtherSyncError,
 };
+use ed25519_dalek::SigningKey;
 use ouroboros_crypto::derive::canonicalize_passphrase;
 use ouroboros_crypto::hash::blake3_hash;
 use ouroboros_crypto::random::fill_random;
 use serde::Serialize;
 use std::collections::{HashMap as StdHashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -123,6 +125,8 @@ struct RouterContext<'a> {
 /// Subscription state for a passphrase
 #[derive(Debug)]
 struct Subscription {
+    /// Stable identifier for explicit unsubscribe.
+    id: u64,
     /// Passphrase for this subscription
     _passphrase: String,
     /// Sender channel for incoming messages
@@ -131,6 +135,12 @@ struct Subscription {
     _space_hash: [u8; 32],
     /// Last scanned slot
     _last_slot: RwLock<u64>,
+}
+
+#[derive(Debug)]
+pub struct SubscriptionHandle {
+    pub id: u64,
+    pub receiver: mpsc::Receiver<EtherMessage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -294,14 +304,18 @@ pub struct EtherNode {
     peers: Arc<PeerManager>,
     /// Active subscriptions
     subscriptions: Arc<RwLock<Vec<Subscription>>>,
+    /// Monotonic identifier source for explicit subscription cleanup.
+    next_subscription_id: AtomicU64,
     /// Recently forwarded messages (deduplication)
     seen_messages: Arc<RwLock<HashSet<[u8; 32]>>>,
     /// Max seen cache size
     max_seen_cache: usize,
     /// ORP route cache (shared across tasks)
     route_cache: Arc<Mutex<RouteCache>>,
-    /// Ephemeral node id for the current session (random 16 bytes)
+    /// ORP node id for the current session, derived from the announcement identity key.
     node_id: [u8; 16],
+    /// ORP identity key used to attest route announcements.
+    orp_identity_secret_key: [u8; 32],
     /// Static onion secret for per-hop DH session derivation.
     onion_secret_key: [u8; 32],
     /// Active ORP spaces: maps space_prefix (first 8 bytes of space_hash)
@@ -372,10 +386,15 @@ impl EtherNode {
             Arc::clone(&socket),
         ))));
 
-        // Generate ephemeral node id for this session
-        let mut node_id = [0u8; 16];
-        fill_random(&mut node_id)
-            .map_err(|_| EtherSyncError::NetworkError("failed to generate node id".to_string()))?;
+        let mut orp_identity_secret_key = [0u8; 32];
+        fill_random(&mut orp_identity_secret_key).map_err(|_| {
+            EtherSyncError::NetworkError("failed to generate ORP identity key".to_string())
+        })?;
+        let node_id = derive_route_node_id(
+            &SigningKey::from_bytes(&orp_identity_secret_key)
+                .verifying_key()
+                .to_bytes(),
+        );
         let mut onion_secret_key = [0u8; 32];
         fill_random(&mut onion_secret_key).map_err(|_| {
             EtherSyncError::NetworkError("failed to generate onion secret key".to_string())
@@ -388,10 +407,12 @@ impl EtherNode {
             gossip_engine,
             peers,
             subscriptions: Arc::new(RwLock::new(Vec::new())),
+            next_subscription_id: AtomicU64::new(1),
             seen_messages: Arc::new(RwLock::new(HashSet::new())),
             max_seen_cache: 10000,
             route_cache: Arc::new(Mutex::new(RouteCache::new())),
             node_id,
+            orp_identity_secret_key,
             onion_secret_key,
             orp_spaces: Arc::new(RwLock::new(StdHashMap::new())),
             orp_announce_tasks: Arc::new(Mutex::new(StdHashMap::new())),
@@ -473,11 +494,9 @@ impl EtherNode {
     /// Subscribe to messages for a passphrase
     ///
     /// Returns a receiver channel that yields messages for this passphrase
-    pub async fn subscribe(
-        &self,
-        passphrase: &str,
-    ) -> Result<mpsc::Receiver<EtherMessage>, EtherSyncError> {
+    pub async fn subscribe(&self, passphrase: &str) -> Result<SubscriptionHandle, EtherSyncError> {
         let (tx, rx) = mpsc::channel(100);
+        let subscription_id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
 
         // Derive space hash from passphrase (use same canonicalization as message)
         let passphrase_bytes = canonicalize_passphrase(passphrase);
@@ -485,6 +504,7 @@ impl EtherNode {
 
         // Create subscription
         let subscription = Subscription {
+            id: subscription_id,
             _passphrase: passphrase.to_string(),
             sender: tx,
             _space_hash: space_hash,
@@ -503,7 +523,26 @@ impl EtherNode {
             self.subscriptions.read().await.len()
         );
 
-        Ok(rx)
+        Ok(SubscriptionHandle {
+            id: subscription_id,
+            receiver: rx,
+        })
+    }
+
+    /// Remove an active subscription by id.
+    pub async fn unsubscribe(&self, subscription_id: u64) -> bool {
+        let mut subs = self.subscriptions.write().await;
+        let original_len = subs.len();
+        subs.retain(|subscription| subscription.id != subscription_id);
+        let removed = subs.len() != original_len;
+        if removed {
+            info!(
+                "Unsubscribed EtherSync subscription {} ({} active subscriptions)",
+                subscription_id,
+                subs.len()
+            );
+        }
+        removed
     }
 
     /// Sweep a slot for messages matching subscriptions
@@ -643,7 +682,7 @@ impl EtherNode {
                             cache.insert_announcement(ann, dummy_src, current_slot, &space_hash);
                         }
                         OrpFrame::Offer(offer) => {
-                            cache.insert_offer(offer);
+                            cache.insert_offer(offer, current_slot, &space_hash);
                         }
                         OrpFrame::Forward(forward) => {
                             drop(cache);
@@ -1026,6 +1065,7 @@ impl EtherNode {
     /// Spawn peer cleanup task
     fn spawn_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
         let peers = Arc::clone(&self.peers);
+        let socket = Arc::clone(&self.socket);
 
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(60));
@@ -1033,6 +1073,7 @@ impl EtherNode {
             loop {
                 ticker.tick().await;
                 peers.cleanup().await;
+                socket.cleanup_rate_limiter().await;
                 trace!("Cleaned up peers, {} remaining", peers.peer_count().await);
             }
         })
@@ -1156,15 +1197,13 @@ impl EtherNode {
     pub async fn publish_route_announcement(&self, passphrase: &str) -> Result<(), EtherSyncError> {
         let slot = EtherCoordinate::current_slot();
         let local_addr = self.socket.local_addr();
+        let passphrase_bytes = canonicalize_passphrase(passphrase);
+        let space_hash = blake3_hash(&passphrase_bytes);
+        let mut space_prefix = [0u8; 8];
+        space_prefix.copy_from_slice(&space_hash[..8]);
         let (onion_pubkey, onion_salt) =
             derive_rotating_announcement_onion_key(&self.onion_secret_key, passphrase, slot)?;
-
-        // Build assist_tag: first 8 bytes of blake3(node_id)
-        let mut assist_tag = [0u8; 8];
-        let tag_hash = blake3_hash(&self.node_id);
-        assist_tag.copy_from_slice(&tag_hash[..8]);
-
-        let announcement = RouteAnnouncement {
+        let mut announcement = RouteAnnouncement {
             version: 1,
             slot,
             node_id: self.node_id,
@@ -1184,13 +1223,20 @@ impl EtherNode {
             } else {
                 vec![local_addr]
             },
-            assist_tag,
+            assist_tag: [0u8; 8],
             route_class: Self::route_class_for_config(&self.config),
             operator_id_hint: self.config.orp_operator_id_hint.clone(),
             region_hint: self.config.orp_region_hint.clone(),
             measured_rtt_ms: None,
             expires_at_slot: slot + 4,
+            identity_pubkey: [0u8; 32],
+            attestation_sig: [0u8; 64],
         };
+        sign_route_announcement(
+            &mut announcement,
+            &SigningKey::from_bytes(&self.orp_identity_secret_key),
+            &space_prefix,
+        )?;
 
         self.publish_orp_frame(
             passphrase,
@@ -1841,13 +1887,61 @@ impl EtherNode {
     /// Return the best cached route offer for the given lookup id, if any.
     pub async fn best_route(
         &self,
-        _passphrase: &str,
+        passphrase: &str,
         lookup_id: [u8; 16],
     ) -> Result<Option<RouteOffer>, EtherSyncError> {
+        let passphrase_bytes = canonicalize_passphrase(passphrase);
+        let space_hash = blake3_hash(&passphrase_bytes);
+        let mut space_prefix = [0u8; 8];
+        space_prefix.copy_from_slice(&space_hash[..8]);
         let cache = self.route_cache.lock().await;
         Ok(cache
-            .best_offer(&lookup_id, EtherCoordinate::current_slot())
+            .best_offer(&space_prefix, &lookup_id, EtherCoordinate::current_slot())
             .map(|co| co.frame.clone()))
+    }
+
+    /// Deactivate ORP for a specific space prefix and discard its local routing state.
+    pub async fn stop_orp_for_prefix(&self, prefix: [u8; 8]) {
+        if let Some(handle) = self.orp_announce_tasks.lock().await.remove(&prefix) {
+            handle.abort();
+        }
+        self.orp_spaces.write().await.remove(&prefix);
+        {
+            let mut cache = self.route_cache.lock().await;
+            cache
+                .announcements
+                .retain(|key, _| key.space_prefix != prefix);
+            cache.offers.retain(|_, offers| {
+                offers.retain(|offer| offer.space_prefix != prefix);
+                !offers.is_empty()
+            });
+        }
+        self.pending_high_risk_accepts.lock().await.remove(&prefix);
+        self.high_risk_circuits
+            .lock()
+            .await
+            .retain(|_, record| record.space_prefix != prefix);
+        let removed_circuit_ids = {
+            let mut routes = self.high_risk_routes.lock().await;
+            let removed = routes
+                .iter()
+                .filter_map(|(circuit_id, binding)| {
+                    (binding.descriptor.space_prefix == prefix).then_some(*circuit_id)
+                })
+                .collect::<Vec<_>>();
+            routes.retain(|_, binding| binding.descriptor.space_prefix != prefix);
+            removed
+        };
+        if !removed_circuit_ids.is_empty() {
+            self.pending_high_risk_acks
+                .lock()
+                .await
+                .retain(|key, _| !removed_circuit_ids.contains(&key.circuit_id));
+            self.high_risk_forward_seen
+                .lock()
+                .await
+                .retain(|key, _| !removed_circuit_ids.contains(&key.circuit_id));
+        }
     }
 
     /// Return active ORP spaces with their passphrases.
@@ -1982,6 +2076,7 @@ impl EtherNode {
         let route_cache = Arc::clone(&self.route_cache);
         let socket = Arc::clone(&self.socket);
         let node_id = self.node_id;
+        let orp_identity_secret_key = Zeroizing::new(self.orp_identity_secret_key);
         let onion_secret_key = Zeroizing::new(self.onion_secret_key);
         let max_seen_cache = self.max_seen_cache;
         let orp_can_relay = self.config.orp_can_relay;
@@ -2015,11 +2110,12 @@ impl EtherNode {
                     }
                 };
 
-                let mut assist_tag = [0u8; 8];
-                let tag_hash = blake3_hash(&node_id);
-                assist_tag.copy_from_slice(&tag_hash[..8]);
+                let passphrase_bytes = canonicalize_passphrase(&passphrase);
+                let space_hash = blake3_hash(&passphrase_bytes);
+                let mut space_prefix = [0u8; 8];
+                space_prefix.copy_from_slice(&space_hash[..8]);
 
-                let announcement = RouteAnnouncement {
+                let mut announcement = RouteAnnouncement {
                     version: 1,
                     slot,
                     node_id,
@@ -2039,13 +2135,23 @@ impl EtherNode {
                     } else {
                         vec![local_addr]
                     },
-                    assist_tag,
+                    assist_tag: [0u8; 8],
                     route_class,
                     operator_id_hint: orp_operator_id_hint.clone(),
                     region_hint: orp_region_hint.clone(),
                     measured_rtt_ms: None,
                     expires_at_slot: slot + 4,
+                    identity_pubkey: [0u8; 32],
+                    attestation_sig: [0u8; 64],
                 };
+                if let Err(err) = sign_route_announcement(
+                    &mut announcement,
+                    &SigningKey::from_bytes(&orp_identity_secret_key),
+                    &space_prefix,
+                ) {
+                    warn!("ORP announcement signing error in announce task: {:?}", err);
+                    continue;
+                }
 
                 let frame = OrpFrame::Announce(announcement);
                 let payload = match encode_orp_frame(&frame) {
@@ -3280,6 +3386,7 @@ fn decode_inbound_high_risk_payload(
 
 impl Drop for EtherNode {
     fn drop(&mut self) {
+        self.orp_identity_secret_key.zeroize();
         self.onion_secret_key.zeroize();
     }
 }
@@ -3318,13 +3425,13 @@ mod tests {
         let config = NodeConfig::default();
         let node = EtherNode::new(config).await.unwrap();
 
-        let rx = node.subscribe("test-pass").await.unwrap();
+        let subscription = node.subscribe("test-pass").await.unwrap();
 
         // Subscription should be active
         assert_eq!(node.subscription_count().await, 1);
 
         // Channel should be open (not closed)
-        assert!(!rx.is_closed());
+        assert!(!subscription.receiver.is_closed());
     }
 
     #[tokio::test]

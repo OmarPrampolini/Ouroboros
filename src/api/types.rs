@@ -194,6 +194,12 @@ pub(crate) struct EtherSyncJoinRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct EtherSyncLeaveRequest {
+    pub passphrase: String,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct EtherSyncPublishRequest {
     pub passphrase: String,
     pub payload_b64: Option<String>,

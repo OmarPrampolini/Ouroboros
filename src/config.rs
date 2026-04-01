@@ -270,7 +270,7 @@ impl Config {
             bridge_bootstrap_hints: Vec::new(),
             bootstrap_bundle_path: None,
             bootstrap_bundle_json: None,
-            high_risk_require_trusted_bundle: false,
+            high_risk_require_trusted_bundle: true,
             high_risk_hard_anonymity_gate: true,
             bootstrap_bundle_trusted_keys: Vec::new(),
         }

@@ -510,15 +510,7 @@ async fn resolve_orp_candidates(
                                     posture.ranking_hints,
                                 )
                             } else {
-                                (
-                                    offer.score,
-                                    format!("lookup={} direct-offer", hex::encode(lookup_id)),
-                                    None,
-                                    String::new(),
-                                    String::new(),
-                                    "lookup-direct-offer".to_string(),
-                                    vec!["lookup-direct-offer".to_string()],
-                                )
+                                continue;
                             }
                         };
                         push_candidate(

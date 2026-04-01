@@ -86,7 +86,8 @@ verify_checksum() {
     return
   fi
 
-  echo "Warning: no sha256 verifier found; skipping checksum verification" >&2
+  echo "Missing required checksum verifier (sha256sum or shasum); aborting install" >&2
+  exit 1
 }
 
 download() {

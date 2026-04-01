@@ -22,7 +22,7 @@ use crate::{
         wan::{wan_direct, wan_tor},
     },
 };
-use rand::Rng;
+use rand::{Rng, RngCore};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,7 +148,8 @@ async fn coordinate_with_relay(
     let (mut c_reader, mut c_writer) = c_stream.into_split();
 
     // 1. Prepara AssistRequest
-    let request_id = rand::thread_rng().gen::<[u8; 8]>();
+    let mut request_id = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
     let my_udp_candidates = gather_udp_candidates(params.port).await?;
     let ttl_ms = cfg.wan_connect_timeout_ms.min(10000) as u16;
     let (control, request_id) = if cfg.assist_obfuscation_v5 {

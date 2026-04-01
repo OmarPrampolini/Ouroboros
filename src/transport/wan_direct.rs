@@ -211,7 +211,7 @@ pub async fn pcp_map(port: u16) -> Result<(IpAddr, u16)> {
 
     // MAP request data (24 bytes)
     let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
     request.extend_from_slice(&nonce); // Mapping nonce
 
     request.push(PCP_PROTOCOL_UDP); // Protocol

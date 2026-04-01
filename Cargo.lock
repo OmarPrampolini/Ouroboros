@@ -1235,6 +1235,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "ed25519-dalek",
  "hex",
  "lz4",
  "metrics",

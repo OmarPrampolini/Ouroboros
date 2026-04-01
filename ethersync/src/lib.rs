@@ -13,7 +13,7 @@ pub use message::EtherMessage;
 pub use network::{EtherUdpSocket, FrameCodec, RateLimiter};
 pub use node::{
     DeliveryOutcome, EtherNode, HighRiskCircuitSnapshot, HighRiskCircuitStats, HighRiskLocalRole,
-    HighRiskTransportSession, NodeConfig,
+    HighRiskTransportSession, NodeConfig, SubscriptionHandle,
 };
 pub use onion::{HopHandshake, OnionCodec, OnionError, OnionLayer};
 pub use routing::{

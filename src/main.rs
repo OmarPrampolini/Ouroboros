@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
                 let mut bytes = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut bytes);
+                rand::rngs::OsRng.fill_bytes(&mut bytes);
                 hex::encode(bytes)
             });
         tracing::info!("API auth enabled (bearer token required)");

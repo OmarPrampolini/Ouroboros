@@ -142,6 +142,10 @@ fn build_router(state: Arc<ApiState>, api_token: Option<String>) -> Router {
             post(ethersync::handle_join_space),
         )
         .route(
+            "/v1/ethersync/spaces/leave",
+            post(ethersync::handle_leave_space),
+        )
+        .route(
             "/v1/ethersync/spaces/publish",
             post(ethersync::handle_publish),
         )

@@ -231,6 +231,6 @@ fn runtime_base_dir() -> Result<PathBuf> {
 
 fn random_session_id() -> String {
     let mut bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

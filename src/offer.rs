@@ -320,7 +320,7 @@ fn encrypt_tor_endpoint(
 
     let cipher = ChaCha20Poly1305::new((&key).into());
     let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
 
     let ciphertext = cipher
         .encrypt(&nonce.into(), onion.as_bytes())

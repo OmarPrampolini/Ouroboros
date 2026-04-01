@@ -13,14 +13,15 @@ use tokio::sync::broadcast;
 use tokio::time::interval;
 
 use super::types::{
-    EtherSyncJoinRequest, EtherSyncPeerAddRequest, EtherSyncPublishFileRequest,
-    EtherSyncPublishRequest, EtherSyncStartRequest, KeeperBackfillRequest,
-    KeeperPolicyUpdateRequest,
+    EtherSyncJoinRequest, EtherSyncLeaveRequest, EtherSyncPeerAddRequest,
+    EtherSyncPublishFileRequest, EtherSyncPublishRequest, EtherSyncStartRequest,
+    KeeperBackfillRequest, KeeperPolicyUpdateRequest,
 };
 use super::{ApiError, ApiState};
 use crate::keeper_client::{KeeperStoreRequest, KeeperStoreResponse};
 use crate::state::{
-    EtherSyncStartConfig, EtherSyncStatus, KeeperBackfillResult, SpacePolicySnapshot,
+    EtherSyncLeaveResult, EtherSyncStartConfig, EtherSyncStatus, KeeperBackfillResult,
+    SpacePolicySnapshot,
 };
 
 type EtherSyncResult<T> = Result<Json<T>, ApiError>;
@@ -141,6 +142,23 @@ pub(crate) async fn handle_join_space(
         )
             .into_response(),
     }
+}
+
+pub(crate) async fn handle_leave_space(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(state): Extension<Arc<ApiState>>,
+    Json(req): Json<EtherSyncLeaveRequest>,
+) -> EtherSyncResult<EtherSyncLeaveResult> {
+    if !state.app.api_allow(addr.ip(), 1.0).await {
+        return Err(ApiError::bad_request("rate limit"));
+    }
+
+    let result = state
+        .app
+        .ethersync_leave_space(req.passphrase, req.label)
+        .await
+        .map_err(|e| ApiError::bad_request(&e.to_string()))?;
+    Ok(Json(result))
 }
 
 pub(crate) async fn handle_publish(
